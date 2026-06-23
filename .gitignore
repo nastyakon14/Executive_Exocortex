@@ -2,3 +2,8 @@
 .venv/
 telegram_bot/__pycache__/
 .DS_Store
+voice_*.ogg
+voice_*.wav
+telegram_bot/handlers/__pycache__/
+telegram_bot/db/__pycache__/
+__pycache__/

@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from telegram_bot.db.db_connect import update_history_messages, create_database, create_tables
 import telegram_bot.texts as texts
+import telegram_bot.handlers.asr as asr
 
 load_dotenv()
 # создаем базу данных и таблицы postgres
@@ -243,12 +244,13 @@ async def artifact_text_message(message: Message, state: FSMContext):
     # БЕЗ await
     update_history_messages(message.from_user.id, message.message_id, message.text, message.date, 'text_artifact', bot_answer)
 
-
 # обработка файлов/документов (всегда добавление в артефакты, независимо от состояния)
 @dp.message(F.document)
 async def document_message(message: Message, state: FSMContext):
+    
     doc_id = message.document.file_id
     doc_name = message.document.file_name
+    
     bot_answer = f'📋 Файл <b>{doc_name}</b> обработан и добавлен в базу знаний.'
     
     current_state = await state.get_state()
@@ -257,27 +259,65 @@ async def document_message(message: Message, state: FSMContext):
     
     await message.answer(bot_answer, parse_mode="HTML", reply_markup=markup)
     
-    # БЕЗ await
+    # логируем сообщение в историю сообщений
     update_history_messages(message.from_user.id, message.message_id, f"[Документ: {doc_name}]", message.date, 'document', bot_answer)
 
 
 # обработка голосового сообщения (всегда добавление в артефакты, независимо от состояния)
 @dp.message(F.voice)    
-async def voice_message(message: Message, state: FSMContext):
-    # сохранить содержимое голосового сообщения в векторную базу данных
+async def voice_message(message: Message, bot: Bot, state: FSMContext):
+    
+    msg = await message.answer("⏳ <i>Распознаю аудио...</i>", parse_mode="HTML")
+    
     voice_file_id = message.voice.file_id
-    voice_placeholder = f"[Голосовое сообщение, ID: {voice_file_id}]"
     
-    bot_answer = '🎤 Голосовое сообщение обработано и записано в базу знаний.'
+    # Пути для сохранения файлов
+    ogg_path = f"voice_{voice_file_id}.ogg"
+    wav_path = f"voice_{voice_file_id}.wav"
     
-    current_state = await state.get_state()
-    # Даем возможность отменить добавление
-    markup = cancel_and_undo_kb if current_state == BotStates.waiting_for_artifact.state else main_kb
+    try:
+        # скачиваем голосовое сообщение в формате ogg
+        file = await bot.get_file(voice_file_id)
+        await bot.download_file(file.file_path, ogg_path)
+        
+        #  конвертация из ogg в wav
+        process = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-i', ogg_path, wav_path, '-y',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process.communicate()
+        
+        # распознаем текст из голосового сообщения
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, asr.recognize_audio, wav_path)
+        
+        # 4. Формируем финальный текст ответа
+        bot_answer = f'🎤 Голосовое сообщение обработано и записано в базу:\n\n<i>"{text}"</i>'
+        log_text = f"[Голос]: {text}" # Текст для сохранения в лог
+        
+        # Определяем, какую клавиатуру показать
+        current_state = await state.get_state()
+        markup = cancel_and_undo_kb if current_state == BotStates.waiting_for_artifact.state else main_kb
+        
+        await msg.edit_text(bot_answer, parse_mode="HTML", reply_markup=markup)
+        
+        # логируем сообщение в историю
+        update_history_messages(message.from_user.id, message.message_id, log_text, message.date, 'voice', bot_answer)
+                
+    except Exception as e:
+        # В случае ошибки выводим её пользователю
+        bot_answer = f"Ошибка обработки аудио: {e}"
+        await msg.edit_text(bot_answer, parse_mode="HTML", reply_markup=main_kb)
+        print(f"Ошибка распознавания: {e}") # Вывод в консоль сервера
+    
+    finally:
+        # удаляем файлы с диска сервера, чтобы не закончилась память
+        if os.path.exists(ogg_path):
+            os.remove(ogg_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
-    await message.answer(bot_answer, parse_mode="HTML", reply_markup=markup)
-
-    # логируем сообщение в историю сообщений (БЕЗ await)
-    update_history_messages(message.from_user.id, message.message_id, voice_placeholder, message.date, 'voice', bot_answer)
 
 
 # обработка текстового сообщения (без кнопок и состояний)
@@ -293,7 +333,7 @@ async def unprompted_text_message(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# обработка нажатия на кнопку "📥 Добавить как артефакт" (уточняющее меню)
+# обработка нvoiceажатия на кнопку "📥 Добавить как артефакт" (уточняющее меню)
 @dp.callback_query(BotStates.clarifying_text, F.data == "action_add_artifact")
 async def process_clarify_add(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
