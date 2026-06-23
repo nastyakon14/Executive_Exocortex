@@ -24,13 +24,12 @@ def create_database():
     '''Создание базы данных (подключение к системной БД postgres)'''
     conn = None
     try:
-        # 1. Сначала подключаемся к стандартной базе 'postgres'
+        #  подключаемся к postgresу
         conn = psycopg2.connect(dbname='postgres', user=user, password=password, host=host, port=port)
-        # 2. Обязательно включаем автокоммит (CREATE DATABASE нельзя делать в транзакции)
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         
         with conn.cursor() as cursor:
-            # 3. Проверяем, существует ли наша база
+            # проверяем, существует ли база данных
             cursor.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{db_name}'")
             exists = cursor.fetchone()
             
@@ -53,7 +52,6 @@ def create_tables():
     '''Создание таблиц'''
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            # Используем BIGINT для Telegram ID, так как INT может переполниться
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS history_messages (
                     id SERIAL PRIMARY KEY,
