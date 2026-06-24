@@ -1,3 +1,8 @@
 aiogram
 python-dotenv
 psycopg2
+speech_recognition
+pandas
+pytesseract
+pdfplumber
+tabulate

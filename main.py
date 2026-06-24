@@ -8,10 +8,15 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
 
 from telegram_bot.db.db_connect import update_history_messages, create_database, create_tables
 import telegram_bot.texts as texts
 import telegram_bot.handlers.asr as asr
+from telegram_bot.handlers.txt_reader import read_txt
+from telegram_bot.handlers.pdf_reader import read_pdf
+
+
 
 load_dotenv()
 # создаем базу данных и таблицы postgres
@@ -25,18 +30,18 @@ dp = Dispatcher()
 
 #  Состояния 
 class BotStates(StatesGroup):
-    waiting_for_artifact = State()  # состояние ожидания добавления артефакта   
+    waiting_for_artifact = State()  # состояние ожидания добавления заметки   
     waiting_for_search = State()  # состояние ожидания поиска мыслей по запросу
-    clarifying_text = State()  # состояние ожидания уточнения текста (добавление как артефакт или поиск по контексту)
-    waiting_for_delete_query = State()  # состояние ожидания поиска артефактов на удаление
+    clarifying_text = State()  # состояние ожидания уточнения текста (добавление как заметку или поиск по контексту)
+    waiting_for_delete_query = State()  # состояние ожидания поиска заметок на удаление
 
 # Клавиатуры
 main_kb = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text='➕ Добавить новый артефакт', callback_data='main_add')],
+        [InlineKeyboardButton(text='➕ Добавить новую заметку', callback_data='main_add')],
         [InlineKeyboardButton(text='🔍 Поиск мыслей по запросу', callback_data='main_search')],
         [InlineKeyboardButton(text='💡 Посмотреть базу знаний', callback_data='main_view')],
-        [InlineKeyboardButton(text='🗑 Удалить артефакт/знание', callback_data='main_delete')]
+        [InlineKeyboardButton(text='🗑 Удалить заметку', callback_data='main_delete')]
     ]
 )
 
@@ -49,21 +54,21 @@ cancel_kb = InlineKeyboardMarkup(
 # клавиатура отмена действия + назад на главное меню
 cancel_and_undo_kb = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text='🗑 Отменить/Удалить добавленный артефакт', callback_data='undo_artifact_add')],
+        [InlineKeyboardButton(text='🗑 Отменить/Удалить добавленную заметку', callback_data='undo_artifact_add')],
         [InlineKeyboardButton(text='🔙 Назад на главное меню', callback_data='main_menu')]
     ]
 )
 
-# клавиатура уточнения текста (добавление как артефакт или поиск по контексту)
+# клавиатура уточнения текста (добавление как заметка или поиск по контексту)
 def get_clarify_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Добавить как артефакт", callback_data="action_add_artifact")],
+            [InlineKeyboardButton(text="📥 Добавить заметку", callback_data="action_add_artifact")],
             [InlineKeyboardButton(text="🔍 Найти мысли по контексту", callback_data="action_search_context")]
         ]
     )
 
-# динамическая клавиатура для выбора артефактов для удаления
+# динамическая клавиатура для выбора заметок для удаления
 # по дефолту обрабатывает до 5 элементов
 def get_delete_selection_kb(num_items: int = 5):
     # Ограничиваем максимум до 5
@@ -101,7 +106,10 @@ async def start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == 'main_menu')
 async def cancel_action(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с кнопкой
+    try:
+        await callback.message.delete() # удаляем сообщение с кнопкой
+    except TelegramBadRequest:
+        pass
     await state.clear()
     await callback.message.answer(texts.main_screen_text, reply_markup=main_kb, parse_mode="HTML")
 
@@ -110,7 +118,10 @@ async def cancel_action(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == 'main_view')
 async def view_knowledge_base(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с кнопками
+    try:
+        await callback.message.delete() # удаляем сообщение с кнопками
+    except TelegramBadRequest:
+        pass
     
     # Очищаем состояние, чтобы следующий отправленный текст вызвал уточняющее меню
     await state.clear() 
@@ -125,11 +136,14 @@ async def view_knowledge_base(callback: types.CallbackQuery, state: FSMContext):
     update_history_messages(callback.from_user.id, callback.message.message_id, "Кнопка: Посмотреть базу", callback.message.date, 'action', bot_answer)
 
 
-# обработка нажатия на кнопку "➕ Добавить новый артефакт"
+# обработка нажатия на кнопку "➕ Добавить новую заметку"
 @dp.callback_query(F.data == 'main_add')
 async def btn_add_artifact(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с главным меню
+    try:
+        await callback.message.delete() # удаляем сообщение с главным меню
+    except TelegramBadRequest:
+        pass
     await state.set_state(BotStates.waiting_for_artifact)
     await callback.message.answer(
         'Отправьте текстовое или голосовое сообщение или приложите файл (doc, pdf, txt), чтобы записать мысли в базу данных.\n\n<i>Можете отправлять их по очереди, я всё сохраню.</i>',
@@ -137,12 +151,12 @@ async def btn_add_artifact(callback: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
-# обработка отмены (удаления) только что добавленного артефакта
+# обработка отмены (удаления) только что добавленной заметки
 @dp.callback_query(F.data == 'undo_artifact_add')
 async def undo_artifact_addition(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     # Здесь в будущем будет логика удаления конкретного ID из векторной БД
-    bot_answer = "🗑 <i>Последний добавленный артефакт был успешно удален (отменен).</i>\n\nМожете продолжить добавление или вернуться в меню."
+    bot_answer = "🗑 <i>Последняя добавленная заметка была успешно удалена (отменена).</i>\n\nМожете продолжить добавление или вернуться в меню."
     
     # Изменяем текущее сообщение, чтобы убрать кнопку отмены (чтобы нельзя было нажать дважды)
     await callback.message.edit_text(bot_answer, parse_mode="HTML", reply_markup=cancel_kb)
@@ -152,7 +166,10 @@ async def undo_artifact_addition(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(F.data == 'main_search')
 async def btn_search_context(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с главным меню
+    try:
+        await callback.message.delete() # удаляем сообщение с главным меню
+    except TelegramBadRequest:
+        pass
     await state.set_state(BotStates.waiting_for_search)
     await callback.message.answer(
         'Введите ваш запрос для поиска по базе знаний:\n\n<i>Можете делать несколько запросов подряд.</i>',
@@ -172,14 +189,17 @@ async def process_search_query(message: Message, state: FSMContext):
     update_history_messages(message.from_user.id, message.message_id, message.text, message.date, 'search_query', bot_answer)
 
 
-# обработка нажатия на кнопку "🗑 Удалить артефакт/знание"
+# обработка нажатия на кнопку "🗑 Удалить заметку/знание"
 @dp.callback_query(F.data == 'main_delete')
 async def btn_delete_artifact(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с главным меню
+    try:
+        await callback.message.delete() # удаляем сообщение с главным меню
+    except TelegramBadRequest:
+        pass
     await state.set_state(BotStates.waiting_for_delete_query)
     await callback.message.answer(
-        'Напишите, какое знание вы хотите удалить, или опишите, о чем оно:\n\n<i>Я найду до 5 самых подходящих артефактов для удаления.</i>',
+        'Напишите, какое знание вы хотите удалить, или опишите, о чем оно:\n\n<i>Я найду до 5 самых подходящих заметок для удаления.</i>',
         reply_markup=cancel_kb,
         parse_mode="HTML"
     )
@@ -202,13 +222,13 @@ async def process_delete_search_query(message: Message, state: FSMContext):
     
     # Динамически формируем текст ответа
     text_lines = [
-        f"<i>[Заглушка RAG] Найдено {found_count} артефактов для удаления по запросу:</i> <b>{message.text}</b>\n"
+        f"<i>[Заглушка RAG] Найдено {found_count} заметок для удаления по запросу:</i> <b>{message.text}</b>\n"
     ]
     
     for i, artifact in enumerate(found_artifacts, start=1):
         text_lines.append(f"{i}. [{artifact}...]")
         
-    text_lines.append("\n👇 <b>Выберите номер артефакта для удаления:</b>")
+    text_lines.append("\n👇 <b>Выберите номер заметки для удаления:</b>")
     bot_answer = "\n".join(text_lines)
     
     # Отвечаем, предоставляя динамическую клавиатуру
@@ -223,9 +243,12 @@ async def confirm_item_deletion(callback: types.CallbackQuery, state: FSMContext
     await callback.answer()
     item_num = callback.data.split('_')[-1] # получаем номер из callback_data
     
-    await callback.message.delete() # удаляем сообщение с выбором списка
+    try:
+        await callback.message.delete() # удаляем сообщение с выбором списка
+    except TelegramBadRequest:
+        pass
     
-    bot_answer = f"🗑 <b>Артефакт №{item_num} успешно удален</b> из векторной базы знаний."
+    bot_answer = f"🗑 <b>Заметка №{item_num} успешно удалена</b> из векторной базы знаний."
     
     # Сообщаем об успехе, оставляем возможность вернуться назад
     await callback.message.answer(bot_answer, parse_mode="HTML", reply_markup=cancel_kb)
@@ -233,7 +256,7 @@ async def confirm_item_deletion(callback: types.CallbackQuery, state: FSMContext
 
 # обработка контента: Текст, Голос, Файлы
 
-# если прислали текст в режиме добавления артефакта
+# если прислали текст в режиме добавления заметки
 @dp.message(BotStates.waiting_for_artifact, F.text)
 async def artifact_text_message(message: Message, state: FSMContext):
     bot_answer = '🌍 Информация успешно записана в базу знаний.'
@@ -244,26 +267,75 @@ async def artifact_text_message(message: Message, state: FSMContext):
     # БЕЗ await
     update_history_messages(message.from_user.id, message.message_id, message.text, message.date, 'text_artifact', bot_answer)
 
-# обработка файлов/документов (всегда добавление в артефакты, независимо от состояния)
+# обработка файлов/документов (всегда добавление в заметки, независимо от состояния)
 @dp.message(F.document)
-async def document_message(message: Message, state: FSMContext):
+async def document_message(message: Message, bot: Bot, state: FSMContext):
+    
+    # Отправляемой промежуточное статусное сообщение об обработке
+    status_msg = await message.answer("⏳ <i>Выполняется обработка файла...</i>", parse_mode="HTML")
     
     doc_id = message.document.file_id
     doc_name = message.document.file_name
     
-    bot_answer = f'📋 Файл <b>{doc_name}</b> обработан и добавлен в базу знаний.'
+    # Определяем расширение файла для выбора логики обработки
+    _, ext = os.path.splitext(doc_name.lower())
+    local_path = f"doc_{doc_id}{ext}"
+    extracted_text = ""
     
-    current_state = await state.get_state()
-    # Даем возможность отменить добавление, если мы в режиме добавления, иначе просто возвращаем в меню
-    markup = cancel_and_undo_kb if current_state == BotStates.waiting_for_artifact.state else main_kb
-    
-    await message.answer(bot_answer, parse_mode="HTML", reply_markup=markup)
-    
-    # логируем сообщение в историю сообщений
-    update_history_messages(message.from_user.id, message.message_id, f"[Документ: {doc_name}]", message.date, 'document', bot_answer)
+    try:
+        # Проверяем, поддерживается ли файл ридерами
+        if ext not in ['.pdf', '.txt']:
+            bot_answer = f'📋 Файл <b>{doc_name}</b> не поддерживается. <i>Поддерживаются только файлы .pdf и .txt.</i>'
+            await status_msg.edit_text(bot_answer, parse_mode="HTML", reply_markup=main_kb)
+            return  # Прерываем выполнение функции, чтобы не идти к коду ниже
+
+        # Скачиваем файл на сервер только если расширение верное
+        file = await bot.get_file(doc_id)
+        await bot.download_file(file.file_path, local_path)
+        
+        if ext == '.pdf':
+            document_type = 'PDF'
+            # Читаем PDF (возвращает словарь номер страницы: текст)
+            pdf_data = read_pdf(local_path)
+            # Объединяем полученные страницы в читаемый текст для логирования
+            extracted_text = "\n".join([f"--- Страница {page + 1} ---\n{text}" for page, text in pdf_data.items()])
+
+        elif ext == '.txt':
+            document_type = 'TXT'
+            # Читаем текстовый файл (возвращает строку)
+            extracted_text = read_txt(local_path)
+            
+        bot_answer = f'📋 Файл <b>{doc_name}</b> обработан и добавлен в базу знаний.'
+        
+        current_state = await state.get_state()
+        # Даем возможность отменить добавление, если мы в режиме добавления, иначе просто возвращаем в меню
+        markup = cancel_and_undo_kb if current_state == BotStates.waiting_for_artifact.state else main_kb
+        
+        # Обновляем статусное сообщение на финальный результат
+        await status_msg.edit_text(bot_answer, parse_mode="HTML", reply_markup=markup)
+        
+        # если текст извлечен, сохраняем его в историю
+        if extracted_text:
+            log_text = f"[Документ: {doc_name}]\nСодержимое:\n{extracted_text}"
+        else:
+            log_text = f"[Документ: {doc_name}]"
+        
+        # логируем сообщение в историю сообщений
+        update_history_messages(message.from_user.id, message.message_id, log_text, message.date, document_type, bot_answer)
+        
+    except Exception as e:
+        # В случае ошибки сообщаем пользователю и выводим в консоль
+        bot_answer = f"Ошибка обработки файла: {e}"
+        await status_msg.edit_text(bot_answer, parse_mode="HTML", reply_markup=main_kb)
+        print(f"Ошибка обработки документа {doc_name}: {e}")
+
+    finally:
+        # удаляем временные файлы с диска сервера, чтобы не закончилась память
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
 
-# обработка голосового сообщения (всегда добавление в артефакты, независимо от состояния)
+# обработка голосового сообщения (всегда добавление в заметки, независимо от состояния)
 @dp.message(F.voice)    
 async def voice_message(message: Message, bot: Bot, state: FSMContext):
     
@@ -319,7 +391,6 @@ async def voice_message(message: Message, bot: Bot, state: FSMContext):
             os.remove(wav_path)
 
 
-
 # обработка текстового сообщения (без кнопок и состояний)
 @dp.message(F.text)
 async def unprompted_text_message(message: Message, state: FSMContext):
@@ -333,16 +404,19 @@ async def unprompted_text_message(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# обработка нvoiceажатия на кнопку "📥 Добавить как артефакт" (уточняющее меню)
+# обработка нажатия на кнопку "📥 Добавить заметку" (уточняющее меню)
 @dp.callback_query(BotStates.clarifying_text, F.data == "action_add_artifact")
 async def process_clarify_add(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с вопросом
+    try:
+        await callback.message.delete() # удаляем сообщение с вопросом
+    except TelegramBadRequest:
+        pass
     
     data = await state.get_data()
     saved_text = data.get("pending_text", "")
     
-    # Переводим пользователя в режим добавления артефактов
+    # Переводим пользователя в режим добавления заметок
     await state.set_state(BotStates.waiting_for_artifact)
     
     bot_answer = '🌍 Информация успешно записана в базу знаний.\n\n<i>Можете отправлять их по очереди, я всё сохраню.</i>'
@@ -357,7 +431,10 @@ async def process_clarify_add(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(BotStates.clarifying_text, F.data == "action_search_context")
 async def process_clarify_search(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.delete() # удаляем сообщение с вопросом
+    try:
+        await callback.message.delete() # удаляем сообщение с вопросом
+    except TelegramBadRequest:
+        pass
     
     data = await state.get_data()
     saved_text = data.get("pending_text", "")
