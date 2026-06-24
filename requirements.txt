@@ -1,8 +1,14 @@
 aiogram
+pandas
 python-dotenv
 psycopg2
+
 speech_recognition
-pandas
 pytesseract
 pdfplumber
 tabulate
+
+langchain-openai
+langchain
+langchain-core 
+langchain-community

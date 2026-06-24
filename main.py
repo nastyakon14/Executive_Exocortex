@@ -10,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
-from telegram_bot.db.db_connect import update_history_messages, create_database, create_tables
+from storage.postgres.db_connect import update_history_messages, create_database, create_tables
 import telegram_bot.texts as texts
 import telegram_bot.handlers.asr as asr
 from telegram_bot.handlers.txt_reader import read_txt
