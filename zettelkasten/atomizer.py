@@ -1,5 +1,5 @@
-# Декомпозиция заметки на атомарные мысли (Zettel-карточки)
-# Метод Zettelkasten — одна мысль = одна карточка
+# декомпозиция заметки на атомарные мысли (zettel-карточки)
+# метод zettelkasten: одна мысль = одна карточка
 
 import os
 import uuid
@@ -18,17 +18,17 @@ from config.settings import settings
 
 load_dotenv()
 
-# structured_output with pydatic schemas for LLM
+# pydantic-схемы для structured output llm
 class ThoughtType(str, Enum):
-    # типы мыслей: факт, решение, задача, риск, идея или контекст
-    FACT = "fact"         # Информация, данные, метрики
-    DECISION = "decision" # Принятые решения
-    ACTION = "action"     # Задачи, поручения, todo
-    RISK = "risk"         # Проблемы, риски, угрозы
-    IDEA = "idea"         # Гипотезы, инициативы, предложения
-    QUESTION = "question" # Открытые вопросы, факапы, требующие разбора
-    CONTEXT = "context"   # Фоновое окружение, важные условия
-    OTHER = "other"       # Информация, не подошедшая ни под один из критериев выше
+    # типы мыслей: факт, решение, задача, риск, идея, контекст, вопрос
+    FACT = "fact"         # информация, данные, метрики
+    DECISION = "decision" # принятые решения
+    ACTION = "action"     # задачи, поручения, todo
+    RISK = "risk"         # проблемы, риски, угрозы
+    IDEA = "idea"         # гипотезы, инициативы, предложения
+    QUESTION = "question" # открытые вопросы, требующие разбора
+    CONTEXT = "context"   # фоновое окружение, важные условия
+    OTHER = "other"       # прочее
 
 
 
@@ -98,8 +98,8 @@ class ZettelCard(BaseModel):
 
 
 class ZettelIdGenerator:
-    """Генератор идентификаторов по методу Лумана"""
-    # генерировать уникальные идентификаторы для каждой мысли в зависимости от её типа и родителя
+    """Генератор идентификаторов по методу лумана."""
+    
     @staticmethod
     def get_next_id(parent_luhmann_id: Optional[str], existing_sibling_ids: list[str], current_max_root: int = 0) -> str:
         if not parent_luhmann_id:
@@ -137,7 +137,6 @@ class NoteAtomizer:
 
     def __init__(
         self,
-        # из конфига
         model_name: str = settings.zettel_atomizer_model_name,
         temperature: float = settings.zettel_atomizer_temperature,
         system_prompt: str = settings.zettel_atomizer_prompt,
@@ -172,9 +171,9 @@ class NoteAtomizer:
         if not text:
             return ("Пустой текст заметки")
         try:
-            raw_result: AtomicThoughtList = self._invoke_llm(text) # вызов LLM для извлечения атомарных мыслей
-            cards = self._build_cards(raw_result.thoughts, current_db_max_root_id) # построение Zettel-карточек из атомарных мыслей
-            cards = self._validate_and_fix(cards) # валидация и исправление Zettel-карточек
+            raw_result: AtomicThoughtList = self._invoke_llm(text)
+            cards = self._build_cards(raw_result.thoughts, current_db_max_root_id)
+            cards = self._validate_and_fix(cards)
             return cards
         except Exception as e:
             return (f"Ошибка при извлечении атомарных мыслей (atomizer.atomize) --> {e}")
@@ -193,14 +192,14 @@ class NoteAtomizer:
         thoughts: list[AtomicThought],
         current_db_max_root_id: int = 0
     ) -> list[ZettelCard]:
-        '''Построение Zettel-карточек из атомарных мыслей'''
+        """Строит zettel-карточки: назначает uuid, luhmann id и связи parent_hint."""
         cards = []
-        content_to_uuid = {}          # Сопоставление: текст мысли -> её новый UUID
-        content_to_luhmann = {}       # Сопоставление: текст мысли -> её новый Луман-ID
-        children_registry = defaultdict(list) 
+        content_to_uuid = {}          # текст мысли → uuid
+        content_to_luhmann = {}       # текст мысли → luhmann id
+        children_registry = defaultdict(list)  # parent luhmann id → список детей
         root_luhmann_ids = []
 
-        for thought in thoughts: # построение Zettel-карточек из атомарных мыслей
+        for thought in thoughts:
             current_uuid = str(uuid.uuid4())
             content_to_uuid[thought.content] = current_uuid
             
@@ -208,6 +207,7 @@ class NoteAtomizer:
             parent_luhmann = None
 
             if not thought.is_root_topic and thought.parent_hint:
+                # parent_hint — дословная цитата родительской мысли из этого же списка
                 parent_uuid = content_to_uuid.get(thought.parent_hint)
                 parent_luhmann = content_to_luhmann.get(thought.parent_hint)
 
@@ -224,17 +224,17 @@ class NoteAtomizer:
                 root_luhmann_ids.append(current_luhmann)
 
             card = ZettelCard(
-                zettel_id=current_uuid,             # уникальный идентификатор карточки
-                luhmann_id=current_luhmann,         # идентификатор по методу Лумана
-                parent_id=parent_uuid,              # UUID родительской карточки
-                parent_luhmann_id=parent_luhmann,   # Луман-ID родительской карточки        
-                content=self._clean_content(thought.content),# очистка контента
-                thought_type=thought.thought_type,  # тип мысли
-                tags=self._normalize_tags(thought.tags),# нормализация тегов
-                parent_hint=thought.parent_hint,    # может быть None — всё ок
-                is_root_topic=thought.is_root_topic,# признак корневой мысли
+                zettel_id=current_uuid,
+                luhmann_id=current_luhmann,
+                parent_id=parent_uuid,
+                parent_luhmann_id=parent_luhmann,
+                content=self._clean_content(thought.content),
+                thought_type=thought.thought_type,
+                tags=self._normalize_tags(thought.tags),
+                parent_hint=thought.parent_hint,
+                is_root_topic=thought.is_root_topic,
             )
-            cards.append(card) # добавление Zettel-карточки в список
+            cards.append(card)
         return cards
 
     def _clean_content(self, content: str) -> str:
@@ -256,16 +256,15 @@ class NoteAtomizer:
         return normalized[:5]  # ограничение на первые 5 тегов
 
     def _validate_and_fix(self, cards: list[ZettelCard]) -> list[ZettelCard]:
-        # Удаляем пустые
+        """Пост-валидация: убираем пустые карточки и чиним битые parent_hint."""
         cards = [c for c in cards if c.content.strip()]
 
-        # Проверяем parent_hint — должен совпадать с content одной из карточек
         contents = {c.content for c in cards}
         for card in cards:
             if card.parent_hint and card.parent_hint not in contents:
                 card.parent_hint = None
 
-        # Если ни одна не помечена как корневая — первую делаем корневой
+        # если llm не пометила ни одну корневую — первая становится корнем
         if cards and not any(c.is_root_topic for c in cards):
             cards[0].is_root_topic = True
 

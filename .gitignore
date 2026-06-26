@@ -1,9 +1,35 @@
+# Environment
 .env
 .venv/
-telegram_bot/__pycache__/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# macOS
 .DS_Store
+
+# Temporary files
 voice_*.ogg
 voice_*.wav
-telegram_bot/handlers/__pycache__/
-telegram_bot/db/__pycache__/
-__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Database data (keep structure, ignore data)
+storage/neo4j/data/
+storage/neo4j/logs/
+storage/chromadb/data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model cache (downloaded models)
+.cache/

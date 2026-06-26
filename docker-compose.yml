@@ -1,13 +1,44 @@
 version: "3.9"
 
 services:
+  # neo4j — основное хранилище графа знаний
+  neo4j:
+    image: neo4j:5.26-community  # версия с поддержкой vector index
+    container_name: exocortex_neo4j
+    env_file:
+      - .env
+    ports:
+      - "${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt protocol (для драйвера)
+      - "${NEO4J_HTTP_PORT:-7474}:7474"   # http (neo4j browser)
+    volumes:
+      - ./storage/neo4j/data:/data
+      - ./storage/neo4j/logs:/logs
+    environment:
+      # начальный пароль задаётся в .env (NEO4J_PASSWORD)
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-password}
+      # разрешаем удалённые подключения
+      - NEO4J_dbms_connector_bolt_listen__address=0.0.0.0:7687
+      - NEO4J_dbms_connector_http_listen__address=0.0.0.0:7474
+      # настройки памяти (подстройте под машину)
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # chromadb — устаревшее хранилище (профиль legacy)
   chromadb:
     image: chromadb/chroma:latest
     container_name: exocortex_chroma
+    profiles:
+      - legacy  # docker compose --profile legacy up
     ports:
       - "${CHROMA_PORT:-8000}:8000"
     volumes:
-      # Данные базы будут лежать локально в этой папке, чтобы не потеряться при удалении контейнера
       - ./storage/chromadb/data:/chroma/chroma
     environment:
       - IS_PERSISTENT=TRUE

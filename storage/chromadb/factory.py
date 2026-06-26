@@ -23,7 +23,7 @@ def get_chroma_client() -> Union[chromadb.Client, chromadb.HttpClient]:
             client.heartbeat()
             print("[ChromaDB] Сервер доступен!")
         except Exception as e:
-            raise ConnectionError(f"[ChromaDB] Сервер недоступен. Ошибка: {e}")
+            raise ConnectionError(f"[ChromaDB] Сервер недоступен. Убедитесь, что запущен docker-compose. Ошибка: {e}")
         
         return client
 

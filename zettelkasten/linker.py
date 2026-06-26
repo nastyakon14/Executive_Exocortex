@@ -1,19 +1,20 @@
-# Линкер — встраивает новые Zettel-карточки в существующий граф
+# линкер — встраивает новые zettel-карточки в граф знаний (neo4j)
+# изоляция по user_id: у каждого пользователя свой граф
+
 import os
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from enum import Enum
-from datetime import datetime, timezone
 from dataclasses import dataclass
 
 import torch
-from sentence_transformers import SentenceTransformer  # HuggingFace embeddings
+from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,733 +22,487 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
-from storage.chromadb.factory import get_chroma_client # ДОБАВЛЕНО: импорт фабрики
-from zettelkasten.atomizer import (
-    NoteAtomizer,
-    ZettelCard,
-    ZettelIdGenerator,
-    ThoughtType,
-)
+from storage.neo4j.client import get_neo4j_client
+from storage.neo4j.schema import init_schema
+from storage.neo4j.repository import ZettelRepository, ZettelNode, GraphContext
+from zettelkasten.atomizer import ZettelCard
 
 load_dotenv()
 
 
+# локальная модель эмбеддингов (multilingual-e5)
+
 class LocalEmbeddingModel:
     """
-    intfloat/multilingual-e5-base обучена с префиксами:
-      - "query: текст"   — для поискового запроса (новая карточка)
-      - "passage: текст" — для индексируемых документов (карточки в базе)
-    """
-
-    # Название модели — можно переопределить при создании объекта
-    DEFAULT_MODEL_NAME = settings.embedding_model_name
+    Локальная модель эмбеддингов (intfloat/multilingual-e5-base).
     
-    # ИСПРАВЛЕНО: type hint исправлен на str
+    E5 модели обучены с префиксами:
+    - "query: ..." для поисковых запросов
+    - "passage: ..." для индексируемых документов
+    """
+    
     def __init__(self, model_name: str = settings.embedding_model_name):
         self.model_name = model_name
+        
         if torch.cuda.is_available():
             self.device = "cuda"
         elif torch.backends.mps.is_available():
             self.device = "mps"
         else:
             self.device = "cpu"
-
+        
         start = time.time()
-
         self.model = SentenceTransformer(
             model_name_or_path=self.model_name,
             device=self.device,
         )
-
         elapsed = time.time() - start
-        print(f"[LocalEmbeddingModel] Модель {self.model_name} загружена за {elapsed:.1f}с. "
-              f"Размерность вектора: {self.model.get_sentence_embedding_dimension()}")
-
+        
+        print(f"[EmbeddingModel] {self.model_name} загружена за {elapsed:.1f}с "
+              f"(dim={self.embedding_dimension}, device={self.device})")
+    
     def embed_passage(self, text: str) -> List[float]:
-        """
-        Генерирует эмбеддинг для документа (карточки в базе).
-        Добавляет префикс "passage: "
-        """    
-        # Префикс "passage:" - это требование модели e5 для индексируемых документов
+        """Эмбеддинг для документа (карточки в базе)."""
         prefixed = f"passage: {text}"
-        
-        # encode() возвращает numpy array, .tolist() конвертирует в list[float]
-        # normalize_embeddings=True → нормализуем вектор (длина = 1)
-        # Это ускоряет косинусное сходство и делает его эквивалентным скалярному произведению
-        vector = self.model.encode(
-            prefixed,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        vector = self.model.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
         return vector.tolist()
-
+    
     def embed_query(self, text: str) -> List[float]:
-        """
-        Генерирует эмбеддинг для поискового запроса (новая карточка).
-        Добавляет префикс "query: "
-        """
-        # Префикс "query:" - это требование модели e5 для поисковых запросов
+        """Эмбеддинг для поискового запроса."""
         prefixed = f"query: {text}"
-        
-        vector = self.model.encode(
-            prefixed,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        vector = self.model.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
         return vector.tolist()
-
+    
     def embed_passages_batch(self, texts: List[str]) -> List[List[float]]:
-        """
-        Batch-генерация эмбеддингов для нескольких документов сразу.
-        Значительно быстрее, чем вызывать embed_passage() в цикле,
-        потому что модель обрабатывает все тексты параллельно на GPU/CPU
-        """
+        """Batch-генерация эмбеддингов."""
         prefixed = [f"passage: {t}" for t in texts]
-        
-        # batch_size=32 - обрабатываем по 32 текста за раз
-        vectors = self.model.encode(
-            prefixed,
-            normalize_embeddings=True,
-            batch_size=32,
-            show_progress_bar=len(texts) > 10,  # Прогресс-бар если текстов много
-        )
+        vectors = self.model.encode(prefixed, normalize_embeddings=True, batch_size=32, show_progress_bar=len(texts) > 10)
         return [v.tolist() for v in vectors]
-
+    
     @property
     def embedding_dimension(self) -> int:
-        """Размерность вектора эмбеддинга (768 для e5-base)"""
         return self.model.get_sentence_embedding_dimension()
 
-# llm linker schema
+
+# pydantic-схемы решений линкера
+
 class LinkAction(str, Enum):
-    """
-    Три возможных решения линкера для каждой новой карточки:
-    NEW_ROOT  — карточка начинает совершенно новую тему
-    CHILD_OF  — карточка развивает/уточняет существующую карточку из базы
-    UPDATE_OF — карточка изменяет/перезаписывает факт в существующей карточке
-    """
-    NEW_ROOT  = "new_root"
-    CHILD_OF  = "child_of"
-    UPDATE_OF = "update_of"
+    """Три возможных решения линкера."""
+    NEW_ROOT = "new_root"    # Новая независимая тема
+    CHILD_OF = "child_of"    # Развивает существующую карточку
+    UPDATE_OF = "update_of"  # Перезаписывает факт в существующей карточке
 
 
 class LinkDecision(BaseModel):
-    """Структурированный ответ LLM о связи новой мысли со старыми."""
-    
+    """Структурированный ответ LLM."""
     action: LinkAction = Field(
         description=(
             "Тип связи: "
             "'new_root' — новая независимая тема; "
-            "'child_of' — развивает/уточняет существующую карточку; "
-            "'update_of' — изменяет/перезаписывает факт в существующей карточке."
+            "'child_of' — развивает существующую карточку; "
+            "'update_of' — перезаписывает факт в существующей карточке."
         )
     )
     target_zettel_id: Optional[str] = Field(
         default=None,
-        description=(
-            "UUID карточки из базы, к которой привязываемся. "
-            "Обязателен для 'child_of' и 'update_of'. "
-            "None для 'new_root'."
-        )
+        description="UUID карточки-цели. Обязателен для 'child_of' и 'update_of'. None для 'new_root'."
     )
     reasoning: str = Field(
         description="Краткое объяснение (1-2 предложения): почему выбрано именно это действие."
     )
 
 
-# helper dataclass
-
 @dataclass
 class LinkResult:
-    """Результат встраивания одной карточки в граф"""
-    card: ZettelCard                        # Итоговая карточка (с обновлёнными ID)
-    action: LinkAction                      # Что сделал линкер (new_root, child_of, update_of)
-    reasoning: str                          # Почему именно так
-    candidates_found: int = 0              # Сколько кандидатов нашёл векторный поиск
-    target_zettel_id: Optional[str] = None # ID карточки-цели (для child_of или update_of)
+    """Результат встраивания одной карточки."""
+    card: ZettelNode
+    action: LinkAction
+    reasoning: str
+    candidates_found: int = 0
+    target_zettel_id: Optional[str] = None
 
 
-# vector database (chromadb + huggingface embeddings)
-class ZettelVectorDB:
-    """
-    Хранилище Zettel-карточек с векторным поиском
-    """
+# генератор luhmann id по правилам метода зеттелькастен
 
-    def __init__(
-        self,
-        embedding_model: LocalEmbeddingModel,
-    ):
-        # ИСПРАВЛЕНО: Вызываем фабрику для получения клиента (поддерживает Docker HTTP)
-        self.chroma_client = get_chroma_client()
-
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=settings.chroma_collection_name,
-            # cosine: 1.0 = идентичные векторы, 0.0 = несвязанные
-            metadata={"hnsw:space": "cosine"}
-        )
-
-        self.embedding_model = embedding_model
-
-        # local cache of cards
-        # ChromaDB хранит id + вектор + текст + метаданные
-        self.cards_store: Dict[str, ZettelCard] = {}
-
-        # максимальный числовой luhman-ID среди корневых карточек
-        self.current_max_root_id: int = 0
+class ZettelIdGenerator:
+    """Генератор идентификаторов по методу Лумана."""
+    
+    @staticmethod
+    def get_next_id(
+        parent_luhmann_id: Optional[str],
+        existing_sibling_ids: List[str],
+        current_max_root: int = 0
+    ) -> str:
+        """
+        Генерирует следующий Luhmann ID.
         
-        # ДОБАВЛЕНО: Важно для Telegram-бота! Восстанавливает память после перезапуска скрипта из Docker-БД
-        self._restore_cache_from_db()
-
-        print(f"[ZettelVectorDB] Инициализирована. "
-              f"Карточек в коллекции: {self.collection.count()}")
-
-    def _restore_cache_from_db(self) -> None:
+        Правила:
+        - Корни: 1, 2, 3, ...
+        - Дочерние от числа: 1.1, 1.2, ...
+        - Дочерние от точки+числа: 1.1a, 1.1b, ...
+        - Дочерние от буквы: 1.1a1, 1.1a2, ...
         """
-        При старте подгружает все существующие карточки из ChromaDB в локальный кэш (cards_store).
-        Необходимо, чтобы после перезапуска бота граф знаний не ломался.
-        """
-        try:
-            all_data = self.collection.get(include=["documents", "metadatas"])
-        except Exception:
-            return
-
-        if not all_data or not all_data.get("ids"):
-            return
-
-        for doc_id, document, meta in zip(all_data["ids"], all_data["documents"], all_data["metadatas"]):
-            card = ZettelCard(
-                zettel_id=doc_id,
-                luhmann_id=meta.get("luhmann_id", "0"),
-                parent_luhmann_id=meta.get("parent_luhmann_id") or None,
-                content=document,
-                thought_type=meta.get("thought_type", "other"),
-                tags=meta.get("tags", "").split(",") if meta.get("tags") else [],
-                is_root_topic=meta.get("is_root_topic", "False") == "True",
-            )
-            self.cards_store[doc_id] = card
-
-            if card.luhmann_id.isdigit():
-                self.current_max_root_id = max(self.current_max_root_id, int(card.luhmann_id))
-
-    # add one card
-    def add_card(self, card: ZettelCard) -> None:
-        """
-        генерирует эмбеддинг и сохраняет карточку в chromadb
-        """
-        # embed_passage добавляет "passage: " перед текстом
-        vector: List[float] = self.embedding_model.embed_passage(card.content)
-        card.embedding = vector
-
-        # сохраняем в chromadb
-        self.collection.add(
-            ids=[card.zettel_id],
-            embeddings=[vector],
-            documents=[card.content],
-            metadatas=[{
-                "luhmann_id":        card.luhmann_id,
-                "parent_luhmann_id": card.parent_luhmann_id or "",
-                "thought_type":      str(card.thought_type),
-                "tags":              ",".join(card.tags),
-                "is_root_topic":     str(card.is_root_topic),
-            }]
-        )
-
-        # Сохраняем в кэш
-        self.cards_store[card.zettel_id] = card
-
-        # Обновляем счётчик корней
-        if card.luhmann_id.isdigit():
-            self.current_max_root_id = max(
-                self.current_max_root_id,
-                int(card.luhmann_id)
-            )
-
-        print(f"  [DB] Добавлена [{card.luhmann_id}]: {card.content[:65]}...")
-
-    def add_cards_batch(self, cards: List[ZettelCard]) -> None:
-        """
-        Batch-добавление нескольких карточек за один вызов модели.
-        
-        быстрее, чем add_card() в цикле, особенно на GPU:
-        - add_card() x10 карточек: 10 отдельных вызовов модели
-        - add_cards_batch() x10 карточек: 1 вызов модели (batch)
-        
-        Разница в скорости: в 5-10 раз на CPU, в 20-50 раз на GPU.
-        """
-        if not cards:
-            return
-
-        # Генерируем все векторы за один batch-вызов
-        texts = [card.content for card in cards]
-        vectors = self.embedding_model.embed_passages_batch(texts)
-
-        ids, embeddings, documents, metadatas = [], [], [], []
-
-        for card, vector in zip(cards, vectors):
-            card.embedding = vector
-            ids.append(card.zettel_id)
-            embeddings.append(vector)
-            documents.append(card.content)
-            metadatas.append({
-                "luhmann_id":        card.luhmann_id,
-                "parent_luhmann_id": card.parent_luhmann_id or "",
-                "thought_type":      str(card.thought_type),
-                "tags":              ",".join(card.tags),
-                "is_root_topic":     str(card.is_root_topic),
-            })
-
-            self.cards_store[card.zettel_id] = card
-
-            if card.luhmann_id.isdigit():
-                self.current_max_root_id = max(
-                    self.current_max_root_id,
-                    int(card.luhmann_id)
-                )
-
-        # Одна bulk-операция в ChromaDB
-        self.collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-        )
-        print(f"  [DB] Batch-добавлено {len(cards)} карточек")
-
-    # vector search
-    def search_candidates(self, query_text: str, limit: int = 5, similarity_threshold: float = 0.3) -> List[Tuple[ZettelCard, float]]:
-        """
-        ищет карточки, близкие по смыслу к query_text
-        """
-        total_cards = len(self.cards_store)
-        if total_cards == 0:
-            return []
-
-        n_results = min(limit, total_cards)
-
-        # embed_query добавляет "query: " перед текстом
-        query_vector = self.embedding_model.embed_query(query_text)
-
-        results = self.collection.query(
-            query_embeddings=[query_vector],
-            n_results=n_results,
-            include=["distances", "documents", "metadatas"]
-        )
-
-        # ChromaDB с cosine space возвращает расстояние [0..2]
-        # 0 = идентичные векторы, 2 = противоположные
-        # Переводим в similarity [0..1]: similarity = 1 - distance/2
-        found_ids       = results["ids"][0]
-        found_distances = results["distances"][0]
-
-        candidates = []
-        for doc_id, distance in zip(found_ids, found_distances):
-            similarity = 1.0 - (distance / 2.0)
-
-            if similarity < similarity_threshold:
-                continue
-
-            card = self.cards_store.get(doc_id)
-            if card:
-                candidates.append((card, round(similarity, 4)))
-
-        return candidates
-
-    # обновление карточки
-    def update_card_content(self, zettel_id: str, new_content: str) -> Optional[ZettelCard]:
-        """
-        Обновляет текст и эмбеддинг существующей карточки (сценарий UPDATE_OF).
-        пересчитываем вектор
-        """
-        if zettel_id not in self.cards_store:
-            print(f"  [DB] ПРЕДУПРЕЖДЕНИЕ: карточка {zettel_id} не найдена для обновления")
-            return None
-
-        card = self.cards_store[zettel_id]
-        old_content = card.content
-
-        # Формируем текст с меткой обновления
-        timestamp = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-        updated_content = f"[ОБНОВЛЕНО {timestamp}] {new_content}"
-        card.content = updated_content
-
-        # Пересчитываем вектор локально (это "passage" — документ в базе)
-        new_vector = self.embedding_model.embed_passage(updated_content)
-        card.embedding = new_vector
-
-        # Обновляем ChromaDB
-        self.collection.update(
-            ids=[zettel_id],
-            embeddings=[new_vector],
-            documents=[updated_content],
-        )
-
-        print(f"  [DB] ♻️  Карточка [{card.luhmann_id}] перезаписана:")
-        print(f"       БЫЛО:  {old_content[:65]}...")
-        print(f"       СТАЛО: {updated_content[:65]}...")
-
-        return card
-
-    def get_siblings(self, parent_luhmann_id: Optional[str]) -> List[str]:
-        """Возвращает Луман-ID всех детей указанного родителя."""
         if not parent_luhmann_id:
-            return [
-                c.luhmann_id
-                for c in self.cards_store.values()
-                if c.luhmann_id.isdigit()
+            if not existing_sibling_ids:
+                return str(current_max_root + 1)
+            roots = [int(i) for i in existing_sibling_ids if i.isdigit()]
+            return str(max(roots) + 1) if roots else str(current_max_root + 1)
+        
+        if not existing_sibling_ids:
+            if parent_luhmann_id.isdigit():
+                return f"{parent_luhmann_id}.1"
+            elif parent_luhmann_id[-1].isdigit():
+                return f"{parent_luhmann_id}a"
+            elif parent_luhmann_id[-1].isalpha():
+                return f"{parent_luhmann_id}1"
+        
+        if parent_luhmann_id.isdigit():
+            nums = [
+                int(re.search(rf"^{re.escape(parent_luhmann_id)}\.(\d+)$", cid).group(1))
+                for cid in existing_sibling_ids
+                if re.match(rf"^{re.escape(parent_luhmann_id)}\.(\d+)$", cid)
             ]
-        return [
-            c.luhmann_id
-            for c in self.cards_store.values()
-            if c.parent_luhmann_id == parent_luhmann_id
-        ]
-
-    def get_card_by_id(self, zettel_id: str) -> Optional[ZettelCard]:
-        """Получает карточку из кэша по UUID."""
-        return self.cards_store.get(zettel_id)
-
-    def total_count(self) -> int:
-        """Общее число карточек в базе."""
-        return len(self.cards_store)
-
-    def print_graph(self) -> None:
-        """Выводит текущее состояние графа в виде дерева."""
-        print("\n" + "═" * 65)
-        print("🌳 ТЕКУЩИЙ ГРАФ ЗНАНИЙ")
-        print("═" * 65)
-
-        if not self.cards_store:
-            print("   (пусто)")
-            print("═" * 65 + "\n")
-            return
-
-        sorted_cards = sorted(
-            self.cards_store.values(),
-            key=lambda c: (len(c.luhmann_id), c.luhmann_id)
-        )
-
-        for card in sorted_cards:
-            parent_info = f" ← [{card.parent_luhmann_id}]" if card.parent_luhmann_id else ""
-            prefix = "📌" if card.is_root_topic else "  └─"
-            print(f"{prefix} [{card.luhmann_id}]{parent_info}: {card.content[:68]}")
-
-        print("═" * 65 + "\n")
+            return f"{parent_luhmann_id}.{max(nums) + 1}" if nums else f"{parent_luhmann_id}.1"
+        
+        elif parent_luhmann_id[-1].isdigit():
+            chars = [
+                re.search(rf"^{re.escape(parent_luhmann_id)}([a-z])$", cid).group(1)
+                for cid in existing_sibling_ids
+                if re.match(rf"^{re.escape(parent_luhmann_id)}([a-z])$", cid)
+            ]
+            if chars:
+                return f"{parent_luhmann_id}{chr(ord(max(chars)) + 1)}"
+            return f"{parent_luhmann_id}a"
+        
+        elif parent_luhmann_id[-1].isalpha():
+            nums = [
+                int(re.search(rf"^{re.escape(parent_luhmann_id)}(\d+)$", cid).group(1))
+                for cid in existing_sibling_ids
+                if re.match(rf"^{re.escape(parent_luhmann_id)}(\d+)$", cid)
+            ]
+            return f"{parent_luhmann_id}{max(nums) + 1}" if nums else f"{parent_luhmann_id}1"
+        
+        return f"{parent_luhmann_id}.1"
 
 
-# linker
+# основной класс линкера
+
 class GraphLinker:
     """
-    Встраивает новые Zettel-карточки в существующий граф знаний.
-    
-    Pipeline для каждой карточки:
-    1. Если карточка уже привязана к родителю внутри текущего сообщения
-       (is_root_topic=False) — пересчитываем luhmann-ID, сохраняем.
-    2. Если карточка корневая (is_root_topic=True):
-       a. Векторный поиск → топ-N похожих карточек из базы 
-       b. LLM анализирует кандидатов → new_root / child_of / update_of
-       c. Применяем решение, обновляем граф
+    Встраивает новые zettel-карточки в граф знаний (neo4j).
+    Все операции изолированы по user_id.
     """
-
-    LINKER_SYSTEM_PROMPT = settings.linker_system_prompt
-
+    
     def __init__(
         self,
-        model_name: str = settings.linker_model_name,
-        system_prompt: str = settings.linker_system_prompt,
-        similarity_threshold: float = 0.3,
-        max_candidates: int = 5,
+        embedding_model: LocalEmbeddingModel = None,
+        repository: ZettelRepository = None,
+        similarity_threshold: float = settings.linker_similarity_threshold,
+        max_candidates: int = settings.linker_max_candidates,
     ):
-        """
-        Args:
-            model_name:           LLM для принятия решений (только для Linker Brain).
-                                  Эмбеддинги — всегда локально через HuggingFace.
-            similarity_threshold: Порог похожести [0..1]. Рекомендуется 0.3-0.4.
-            max_candidates:       Максимум кандидатов для LLM (не более 5-7).
-        """
-        self.similarity_threshold = similarity_threshold
-        self.max_candidates = max_candidates
-        self.system_prompt = system_prompt
-        self.model_name = model_name
-        # LLM нужна только для принятия решений (child_of / update_of / new_root)
-        # Эмбеддинги полностью локальные — LLM для них не используется
-        base_llm = ChatOpenAI(
-            model=self.model_name,
+        self._embedding_model = embedding_model
+        self._repository = repository
+        
+        self.llm = ChatOpenAI(
+            model=settings.linker_model_name,
             api_key=os.getenv("LLM_API_KEY"),
             base_url=os.getenv("LLM_BASE_URL"),
-            temperature=0.0,  # Строгая логика, никакого творчества
+            temperature=0.0,
         )
-        self.structured_llm = base_llm.with_structured_output(LinkDecision)
-
-
-    def link_and_insert(
-        self,
-        new_cards: List[ZettelCard],
-        db: ZettelVectorDB,
-    ) -> List[LinkResult]:
+        self.structured_llm = self.llm.with_structured_output(LinkDecision)
+        self.system_prompt = settings.linker_system_prompt
+        
+        self.similarity_threshold = similarity_threshold
+        self.max_candidates = max_candidates
+        
+        self._luhmann_remap: Dict[str, str] = {}  # временный id → реальный id в neo4j
+    
+    @property
+    def embedding_model(self) -> LocalEmbeddingModel:
+        if self._embedding_model is None:
+            self._embedding_model = LocalEmbeddingModel()
+        return self._embedding_model
+    
+    @property
+    def repository(self) -> ZettelRepository:
+        if self._repository is None:
+            client = get_neo4j_client()
+            init_schema(client)
+            self._repository = ZettelRepository(client)
+            # Дополнительная гарантия: удаляем legacy-связи между разными user_id.
+            removed = self._repository.remove_cross_user_links()
+            if removed:
+                print(f"[Neo4j] Удалено кросс-пользовательских связей: {removed}")
+        return self._repository
+    
+    def link_and_insert(self, user_id: str, new_cards: List[ZettelCard]) -> List[LinkResult]:
         """
-        Обрабатывает список новых карточек (вывод Атомайзера) и встраивает в граф.
+        Обрабатывает список карточек от Atomizer и встраивает в граф пользователя.
         
         Args:
-            new_cards: Карточки от Атомайзера (с временными Луман-ID).
-            db:        Векторная база данных.
-        
-        Returns:
-            Список LinkResult — что произошло с каждой карточкой.
+            user_id: ID пользователя (из Telegram)
+            new_cards: Список карточек от Atomizer
         """
         results: List[LinkResult] = []
-
-        # Маппинг: временный Луман-ID → реальный Луман-ID в базе
-        # Нужен для пересчёта ID у дочерних карточек.
-        luhmann_remap: Dict[str, str] = {}
-
+        self._luhmann_remap = {}
+        
         for card in new_cards:
             print(f"\n{'─' * 55}")
-            print(f"📋 [{card.luhmann_id}] {card.content[:60]}...")
-            print(f"   root={card.is_root_topic}, parent_luhmann={card.parent_luhmann_id}")
-
-            # ── Ветка 1: Дочерняя карточка (привязана внутри сообщения) ────────
-            # Атомайзер уже решил, что это дочерняя мысль.
-            # Нам нужно только пересчитать её Луман-ID относительно
-            # реального места родителя в базе.
-            if not card.is_root_topic and card.parent_luhmann_id in luhmann_remap:
-                result = self._handle_inner_child(card, db, luhmann_remap)
-
-            # ── Ветка 2: Корневая карточка — проверяем по базе ──────────────────
+            print(f"📋 [{card.luhmann_id}] {card.content[:55]}...")
+            print(f"   root={card.is_root_topic}, parent={card.parent_luhmann_id}")
+            
+            embedding = self.embedding_model.embed_passage(card.content)
+            
+            # дочерние мысли внутри одного сообщения не требуют llm-решения
+            if not card.is_root_topic and card.parent_luhmann_id in self._luhmann_remap:
+                result = self._handle_inner_child(user_id, card, embedding)
             else:
-                result = self._handle_root_card(card, db, luhmann_remap)
-
+                result = self._handle_root_card(user_id, card, embedding)
+            
             results.append(result)
-
+        
         return results
-
-    # обработка дочерней карточки
-
-    def _handle_inner_child(
-        self,
-        card: ZettelCard,
-        db: ZettelVectorDB,
-        luhmann_remap: Dict[str, str],
-    ) -> LinkResult:
-        """
-        Карточка уже привязана к родителю ВНУТРИ текущего сообщения.
-        Пересчитываем Луман-ID: временный → реальный.
-        """
-        # реальный luhmann-ID родителя из маппинга
-        real_parent_luhmann = luhmann_remap[card.parent_luhmann_id]
-
-        existing_siblings = db.get_siblings(real_parent_luhmann)
+    
+    def _handle_inner_child(self, user_id: str, card: ZettelCard, embedding: List[float]) -> LinkResult:
+        """Карточка уже привязана к родителю внутри текущего сообщения."""
+        real_parent_luhmann = self._luhmann_remap[card.parent_luhmann_id]
+        
+        parent_node = self.repository.get_by_luhmann_id(user_id, real_parent_luhmann)
+        if not parent_node:
+            return self._apply_new_root(user_id, card, embedding, "Родитель не найден в графе")
+        
+        siblings = self.repository.get_siblings(user_id, real_parent_luhmann)
         new_luhmann = ZettelIdGenerator.get_next_id(
             real_parent_luhmann,
-            existing_siblings,
-            db.current_max_root_id
+            siblings,
+            self.repository.get_max_root_id(user_id)
         )
-
-        # запоминаем маппинг (у этой карточки тоже могут быть дети)
-        luhmann_remap[card.luhmann_id] = new_luhmann
-
-        # Обновляем карточку
-        card.parent_luhmann_id = real_parent_luhmann
-        card.luhmann_id = new_luhmann
-
-        db.add_card(card)
-        print(f"   ✅ Дочерняя (внутри сообщения) → [{new_luhmann}]")
-
+        
+        self._luhmann_remap[card.luhmann_id] = new_luhmann
+        
+        node = self.repository.create_child_of(
+            user_id=user_id,
+            content=card.content,
+            luhmann_id=new_luhmann,
+            thought_type=str(card.thought_type),
+            tags=card.tags,
+            embedding=embedding,
+            parent_zettel_id=parent_node.zettel_id,
+        )
+        
+        print(f"   ✅ Дочерняя → [{new_luhmann}] ← [{real_parent_luhmann}]")
+        
         return LinkResult(
-            card=card,
+            card=node,
             action=LinkAction.CHILD_OF,
-            reasoning="Дочерняя карточка внутри текущего сообщения (решение Атомайзера).",
+            reasoning="Дочерняя карточка внутри текущего сообщения.",
             candidates_found=0,
         )
-
-    # обработка корневой карточки
-
-    def _handle_root_card(
-        self,
-        card: ZettelCard,
-        db: ZettelVectorDB,
-        luhmann_remap: Dict[str, str],
-    ) -> LinkResult:
-        """
-        Карточка считается новым корнем. Проверяем через векторный поиск + LLM.
-        """
-        # Векторный поиск
-        candidates = db.search_candidates(
-            query_text=card.content,
+    
+    def _handle_root_card(self, user_id: str, card: ZettelCard, embedding: List[float]) -> LinkResult:
+        """Корневая карточка: ищем похожие мысли и спрашиваем llm, куда встроить."""
+        
+        candidates = self.repository.vector_search(
+            user_id=user_id,
+            query_embedding=self.embedding_model.embed_query(card.content),
             limit=self.max_candidates,
             similarity_threshold=self.similarity_threshold,
         )
-
-        print(f"   🔍 Векторный поиск (локально): {len(candidates)} кандидатов")
-        for cand_card, score in candidates:
-            print(f"      sim={score:.3f} [{cand_card.luhmann_id}]: {cand_card.content[:50]}...")
-
-        # Нет кандидатов → сразу NEW_ROOT, без LLM-вызова
+        
+        print(f"   🔍 Vector search: {len(candidates)} кандидатов")
+        for cand, score in candidates:
+            print(f"      sim={score:.3f} [{cand.luhmann_id}]: {cand.content[:45]}...")
+        
         if not candidates:
-            return self._apply_new_root(
-                card, db, luhmann_remap,
-                reasoning="Нет похожих карточек в базе.",
-            )
-
-        # Есть кандидаты → спрашиваем LLM
-        decision = self._ask_llm(card, candidates)
-        print(f"   🤖 LLM: {decision.action.upper()} | {decision.reasoning}")
-
-        # Применяем решение
+            # нет похожих мыслей — сразу создаём новый корень без llm
+            return self._apply_new_root(user_id, card, embedding, "Нет похожих карточек в графе")
+        
+        # для каждого кандидата поднимаем окрестность графа (родитель, дети, теги)
+        contexts: List[GraphContext] = []
+        for cand, score in candidates:
+            ctx = self.repository.get_context(user_id, cand.zettel_id, hops=1)
+            if ctx:
+                ctx.similarity = score
+                contexts.append(ctx)
+        
+        decision = self._ask_llm(card, contexts)
+        print(f"   🤖 LLM: {decision.action.value.upper()} | {decision.reasoning}")
+        
         if decision.action == LinkAction.NEW_ROOT:
-            return self._apply_new_root(
-                card, db, luhmann_remap,
-                reasoning=decision.reasoning,
-                candidates_found=len(candidates),
-            )
+            return self._apply_new_root(user_id, card, embedding, decision.reasoning, len(candidates))
         elif decision.action == LinkAction.CHILD_OF:
-            return self._apply_child_of(
-                card, db, luhmann_remap, decision,
-                candidates_found=len(candidates),
-            )
+            return self._apply_child_of(user_id, card, embedding, decision, len(candidates))
         elif decision.action == LinkAction.UPDATE_OF:
-            return self._apply_update_of(
-                card, db, decision,
-                candidates_found=len(candidates),
-            )
-
-        # Fallback на случай непредвиденного ответа
-        return self._apply_new_root(
-            card, db, luhmann_remap,
-            reasoning=f"Непредвиденный ответ LLM ({decision.action}). Fallback → new_root.",
-        )
-
-    # llm-запрос
-
-    def _ask_llm(
-        self,
-        card: ZettelCard,
-        candidates: List[Tuple[ZettelCard, float]],
-    ) -> LinkDecision:
-        """Формирует промпт и запрашивает решение у LLM."""
-        candidates_text = "\n".join([
-            f"  • UUID: {c.zettel_id}\n"
-            f"    Луман-ID: [{c.luhmann_id}]\n"
-            f"    Тип: {c.thought_type}\n"
-            f"    Сходство: {score:.3f}\n"
-            f"    Текст: \"{c.content}\"\n"
-            for c, score in candidates
-        ])
-
+            return self._apply_update_of(user_id, card, embedding, decision, len(candidates))
+        
+        return self._apply_new_root(user_id, card, embedding, f"Непредвиденный ответ: {decision.action}")
+    
+    def _ask_llm(self, card: ZettelCard, contexts: List[GraphContext]) -> LinkDecision:
+        """Формирует промпт с контекстом графа и спрашивает LLM."""
+        
+        candidates_text = ""
+        for ctx in contexts:
+            cand = ctx.candidate
+            candidates_text += f"\n• UUID: {cand.zettel_id}\n"
+            candidates_text += f"  Luhmann-ID: [{cand.luhmann_id}]\n"
+            candidates_text += f"  Тип: {cand.thought_type}\n"
+            candidates_text += f"  Сходство: {ctx.similarity:.3f}\n"
+            candidates_text += f"  Текст: \"{cand.content}\"\n"
+            
+            if ctx.parent:
+                candidates_text += f"  Родитель: [{ctx.parent.luhmann_id}] \"{ctx.parent.content[:40]}...\"\n"
+            if ctx.children:
+                children_str = ", ".join([f"[{c.luhmann_id}]" for c in ctx.children[:3]])
+                candidates_text += f"  Дети: {children_str}\n"
+            if ctx.entities:
+                entities_str = ", ".join([e.name for e in ctx.entities[:5]])
+                candidates_text += f"  Сущности: {entities_str}\n"
+        
         user_prompt = (
             f"НОВАЯ МЫСЛЬ:\n"
             f"  Тип: {card.thought_type}\n"
             f"  Теги: {', '.join(card.tags)}\n"
             f"  Текст: \"{card.content}\"\n\n"
-            f"КАНДИДАТЫ ИЗ БАЗЫ:\n{candidates_text}\n"
+            f"КАНДИДАТЫ ИЗ ГРАФА (с контекстом):\n{candidates_text}\n"
             f"Реши, как встроить новую мысль в граф."
         )
-
+        
         return self.structured_llm.invoke([
-            SystemMessage(content=self.LINKER_SYSTEM_PROMPT),
+            SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
         ])
-
-    # применение решений
-
+    
     def _apply_new_root(
         self,
+        user_id: str,
         card: ZettelCard,
-        db: ZettelVectorDB,
-        luhmann_remap: Dict[str, str],
+        embedding: List[float],
         reasoning: str,
         candidates_found: int = 0,
     ) -> LinkResult:
-        """Добавляет карточку как новый корень графа."""
+        """Создаёт новый корневой узел."""
+        siblings = self.repository.get_siblings(user_id, None)
         new_luhmann = ZettelIdGenerator.get_next_id(
-            parent_luhmann_id=None,
-            existing_sibling_ids=db.get_siblings(None),
-            current_max_root=db.current_max_root_id,
+            None,
+            siblings,
+            self.repository.get_max_root_id(user_id)
         )
-
-        luhmann_remap[card.luhmann_id] = new_luhmann
-        card.luhmann_id        = new_luhmann
-        card.parent_id         = None
-        card.parent_luhmann_id = None
-        card.is_root_topic     = True
-
-        db.add_card(card)
+        
+        self._luhmann_remap[card.luhmann_id] = new_luhmann
+        
+        node = self.repository.create_zettel(
+            user_id=user_id,
+            content=card.content,
+            luhmann_id=new_luhmann,
+            thought_type=str(card.thought_type),
+            tags=card.tags,
+            embedding=embedding,
+            is_root_topic=True,
+        )
+        
         print(f"   ✅ NEW_ROOT → [{new_luhmann}]")
-
+        
         return LinkResult(
-            card=card,
+            card=node,
             action=LinkAction.NEW_ROOT,
             reasoning=reasoning,
             candidates_found=candidates_found,
         )
-
+    
     def _apply_child_of(
         self,
+        user_id: str,
         card: ZettelCard,
-        db: ZettelVectorDB,
-        luhmann_remap: Dict[str, str],
+        embedding: List[float],
         decision: LinkDecision,
         candidates_found: int,
     ) -> LinkResult:
-        """Добавляет карточку как дочернюю к существующей карточке в базе."""
-        parent_card = db.get_card_by_id(decision.target_zettel_id)
-
-        if not parent_card:
+        """Создаёт дочерний узел."""
+        parent_node = self.repository.get_by_id(user_id, decision.target_zettel_id)
+        
+        if not parent_node:
             print(f"   ⚠️  Родитель {decision.target_zettel_id} не найден! Fallback → new_root")
-            return self._apply_new_root(
-                card, db, luhmann_remap,
-                reasoning=f"Родитель не найден (UUID={decision.target_zettel_id}). Fallback.",
-                candidates_found=candidates_found,
-            )
-
-        card.is_root_topic     = False
-        card.parent_id         = parent_card.zettel_id
-        card.parent_luhmann_id = parent_card.luhmann_id
-
-        existing_siblings = db.get_siblings(parent_card.luhmann_id)
+            return self._apply_new_root(user_id, card, embedding, "Родитель не найден", candidates_found)
+        
+        siblings = self.repository.get_siblings(user_id, parent_node.luhmann_id)
         new_luhmann = ZettelIdGenerator.get_next_id(
-            parent_card.luhmann_id,
-            existing_siblings,
-            db.current_max_root_id,
+            parent_node.luhmann_id,
+            siblings,
+            self.repository.get_max_root_id(user_id)
         )
-
-        luhmann_remap[card.luhmann_id] = new_luhmann
-        card.luhmann_id = new_luhmann
-
-        db.add_card(card)
-        print(f"   ✅ CHILD_OF [{parent_card.luhmann_id}] → [{new_luhmann}]")
-
+        
+        self._luhmann_remap[card.luhmann_id] = new_luhmann
+        
+        node = self.repository.create_child_of(
+            user_id=user_id,
+            content=card.content,
+            luhmann_id=new_luhmann,
+            thought_type=str(card.thought_type),
+            tags=card.tags,
+            embedding=embedding,
+            parent_zettel_id=parent_node.zettel_id,
+        )
+        
+        print(f"   ✅ CHILD_OF [{parent_node.luhmann_id}] → [{new_luhmann}]")
+        
         return LinkResult(
-            card=card,
+            card=node,
             action=LinkAction.CHILD_OF,
             reasoning=decision.reasoning,
             candidates_found=candidates_found,
             target_zettel_id=decision.target_zettel_id,
         )
-
+    
     def _apply_update_of(
         self,
+        user_id: str,
         card: ZettelCard,
-        db: ZettelVectorDB,
+        embedding: List[float],
         decision: LinkDecision,
         candidates_found: int,
     ) -> LinkResult:
-        """Перезаписывает существующую карточку. Новая карточка не добавляется."""
-        updated_card = db.update_card_content(decision.target_zettel_id, card.content)
-
-        if not updated_card:
+        """Обновляет существующий узел."""
+        updated_node = self.repository.update_zettel_content(
+            user_id=user_id,
+            zettel_id=decision.target_zettel_id,
+            new_content=card.content,
+            new_embedding=embedding,
+            reason=decision.reasoning,
+        )
+        
+        if not updated_node:
             return LinkResult(
-                card=card,
+                card=ZettelNode(
+                    zettel_id="",
+                    luhmann_id="",
+                    content=card.content,
+                    thought_type=str(card.thought_type),
+                    tags=card.tags,
+                    is_root_topic=False,
+                ),
                 action=LinkAction.UPDATE_OF,
-                reasoning=f"Ошибка: карточка {decision.target_zettel_id} не найдена.",
+                reasoning=f"Ошибка: карточка {decision.target_zettel_id} не найдена",
                 candidates_found=candidates_found,
                 target_zettel_id=decision.target_zettel_id,
             )
-
-        print(f"   ✅ UPDATE_OF [{updated_card.luhmann_id}]")
-
+        
+        print(f"   ✅ UPDATE_OF [{updated_node.luhmann_id}]")
+        
         return LinkResult(
-            card=updated_card,
+            card=updated_node,
             action=LinkAction.UPDATE_OF,
             reasoning=decision.reasoning,
             candidates_found=candidates_found,
             target_zettel_id=decision.target_zettel_id,
         )
+    
+    def print_graph(self, user_id: str) -> None:
+        """Выводит граф пользователя."""
+        self.repository.print_graph(user_id)
+    
+    def get_user_stats(self, user_id: str) -> dict:
+        """Возвращает статистику по графу пользователя."""
+        return {
+            "total_cards": self.repository.total_count(user_id),
+            "max_root_id": self.repository.get_max_root_id(user_id),
+        }

@@ -21,10 +21,10 @@ DB_CONFIG = {
 }
 
 def create_database():
-    '''Создание базы данных (подключение к системной БД postgres)'''
+    """Создаёт рабочую базу данных, если её ещё нет."""
     conn = None
     try:
-        #  подключаемся к postgresу
+        # подключаемся к системной базе postgres для create database
         conn = psycopg2.connect(dbname='postgres', user=user, password=password, host=host, port=port)
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         
@@ -49,7 +49,7 @@ def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 def create_tables():
-    '''Создание таблиц'''
+    """Создаёт таблицу history_messages для аудита диалогов с ботом."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute('''
@@ -67,7 +67,7 @@ def create_tables():
             print('Таблица history_messages готова.')
 
 def update_history_messages(user_id, message_id, message_text, message_date, message_type, bot_answer):
-    '''Добавление истории сообщений'''
+    """Сохраняет пару «сообщение пользователя — ответ бота» в postgres."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute('''

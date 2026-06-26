@@ -1,13 +1,16 @@
 aiogram
 pandas
+tabulate
 python-dotenv
-psycopg2
-sklearn
+scikit-learn
 
 speech_recognition
 pytesseract
 pdfplumber
-tabulate
+
+psycopg2
+chromadb
+neo4j>=5.0
 
 langchain-openai
 langchain
@@ -15,4 +18,7 @@ langchain-core
 langchain-community
 langchain-huggingface
 sentence-transformers
-chromadb
+torch
+pydantic
+pydantic-settings
+
