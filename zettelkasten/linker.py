@@ -197,20 +197,27 @@ class GraphLinker:
         self,
         embedding_model: LocalEmbeddingModel = None,
         repository: ZettelRepository = None,
+        model_name: str = settings.linker_model_name,
+        temperature: float = settings.linker_temperature,
+        system_prompt: str = settings.linker_system_prompt,
+        user_prompt_template: str = settings.linker_user_prompt_template,
         similarity_threshold: float = settings.linker_similarity_threshold,
         max_candidates: int = settings.linker_max_candidates,
     ):
         self._embedding_model = embedding_model
         self._repository = repository
         
+        self.model_name = model_name
+        self.system_prompt = system_prompt
+        self.user_prompt_template = user_prompt_template
+        
         self.llm = ChatOpenAI(
-            model=settings.linker_model_name,
+            model=self.model_name,
             api_key=os.getenv("LLM_API_KEY"),
             base_url=os.getenv("LLM_BASE_URL"),
-            temperature=0.0,
+            temperature=temperature,
         )
         self.structured_llm = self.llm.with_structured_output(LinkDecision)
-        self.system_prompt = settings.linker_system_prompt
         
         self.similarity_threshold = similarity_threshold
         self.max_candidates = max_candidates
@@ -358,13 +365,11 @@ class GraphLinker:
                 entities_str = ", ".join([e.name for e in ctx.entities[:5]])
                 candidates_text += f"  Сущности: {entities_str}\n"
         
-        user_prompt = (
-            f"НОВАЯ МЫСЛЬ:\n"
-            f"  Тип: {card.thought_type}\n"
-            f"  Теги: {', '.join(card.tags)}\n"
-            f"  Текст: \"{card.content}\"\n\n"
-            f"КАНДИДАТЫ ИЗ ГРАФА (с контекстом):\n{candidates_text}\n"
-            f"Реши, как встроить новую мысль в граф."
+        user_prompt = self.user_prompt_template.format(
+            thought_type=card.thought_type,
+            tags=", ".join(card.tags),
+            content=card.content,
+            candidates_text=candidates_text,
         )
         
         return self.structured_llm.invoke([

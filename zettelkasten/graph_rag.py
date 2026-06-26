@@ -114,7 +114,12 @@ class GraphRetriever:
             self._repository = ZettelRepository(client)
         return self._repository
     
-    def retrieve(self, user_id: str, query: str, similarity_threshold: float = 0.3) -> RetrievedContext:
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        similarity_threshold: float = settings.graphrag_similarity_threshold,
+    ) -> RetrievedContext:
         """Выполняет graphrag retrieval для конкретного пользователя."""
         context = RetrievedContext()
         
@@ -228,55 +233,41 @@ class GraphRetriever:
 
 class RAGGenerator:
     """Генератор ответов на основе извлечённого контекста."""
-    
-    SYSTEM_PROMPT = """Ты — интеллектуальный ассистент топ-менеджера, часть системы Executive Exocortex.
-Отвечай на вопрос пользователя обычным, естественным, понятным языком.
 
-ПРАВИЛА:
-1. Опирайся только на факты из переданного контекста.
-2. Не выдумывай информацию, которой нет в контексте.
-3. Если данных недостаточно — честно скажи об этом простым текстом.
-4. Не делай формальных разделов вроде "Факты/Решения/Действия/Риски", если пользователь явно не просил.
-5. Можно кратко цитировать или ссылаться на карточки [luhmann_id], когда это помогает.
-6. Держи ответ дружелюбным и практичным."""
+    def __init__(
+        self,
+        model_name: str = settings.graphrag_model_name,
+        temperature: float = settings.graphrag_temperature,
+        system_prompt: str = settings.graphrag_system_prompt,
+        user_prompt_template: str = settings.graphrag_user_prompt_template,
+        no_context_response: str = settings.graphrag_no_context_response,
+    ):
+        self.system_prompt = system_prompt
+        self.user_prompt_template = user_prompt_template
+        self.no_context_response = no_context_response
 
-    NO_CONTEXT_RESPONSE = """К сожалению, в вашей базе знаний я не нашёл информации по этому вопросу.
-
-Возможные причины:
-• Эта тема ещё не обсуждалась в ваших заметках
-• Вопрос сформулирован иначе, чем информация в базе
-
-Попробуйте:
-• Переформулировать вопрос
-• Использовать ключевые слова из ваших заметок
-• Указать конкретные имена, проекты или даты"""
-
-    def __init__(self, model_name: str = settings.zettel_atomizer_model_name):
         self.llm = ChatOpenAI(
             model=model_name,
             api_key=os.getenv("LLM_API_KEY"),
             base_url=os.getenv("LLM_BASE_URL"),
-            temperature=0.3,
+            temperature=temperature,
         )
     
     def generate(self, query: str, context: RetrievedContext) -> str:
         """Генерирует ответ на основе контекста."""
         
         if not context.all_nodes:
-            return self.NO_CONTEXT_RESPONSE
+            return self.no_context_response
         
         context_str = context.to_context_string()
         
-        user_prompt = f"""КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ:
-{context_str}
-
-ВОПРОС ПОЛЬЗОВАТЕЛЯ:
-{query}
-
-Ответь на вопрос, опираясь ТОЛЬКО на предоставленный контекст."""
+        user_prompt = self.user_prompt_template.format(
+            context=context_str,
+            query=query,
+        )
         
         response = self.llm.invoke([
-            SystemMessage(content=self.SYSTEM_PROMPT),
+            SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
         ])
         
@@ -295,19 +286,42 @@ class GraphRAG:
         self,
         embedding_model: LocalEmbeddingModel = None,
         repository: ZettelRepository = None,
+        model_name: str = settings.graphrag_model_name,
+        temperature: float = settings.graphrag_temperature,
+        system_prompt: str = settings.graphrag_system_prompt,
+        user_prompt_template: str = settings.graphrag_user_prompt_template,
+        no_context_response: str = settings.graphrag_no_context_response,
+        similarity_threshold: float = settings.graphrag_similarity_threshold,
     ):
+        self.similarity_threshold = similarity_threshold
         self.retriever = GraphRetriever(
             embedding_model=embedding_model,
             repository=repository,
         )
-        self.generator = RAGGenerator()
+        self.generator = RAGGenerator(
+            model_name=model_name,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            user_prompt_template=user_prompt_template,
+            no_context_response=no_context_response,
+        )
     
-    def query(self, user_id: str, user_query: str, similarity_threshold: float = 0.3) -> RAGResponse:
+    def query(
+        self,
+        user_id: str,
+        user_query: str,
+        similarity_threshold: float | None = None,
+    ) -> RAGResponse:
         """Отвечает на вопрос пользователя, используя только его граф знаний."""
         import time
         start = time.time()
         
-        context = self.retriever.retrieve(user_id, user_query, similarity_threshold)
+        threshold = (
+            self.similarity_threshold
+            if similarity_threshold is None
+            else similarity_threshold
+        )
+        context = self.retriever.retrieve(user_id, user_query, threshold)
         answer = self.generator.generate(user_query, context)
         
         elapsed_ms = int((time.time() - start) * 1000)
@@ -328,11 +342,13 @@ class GraphRAG:
         context = self.retriever.retrieve_by_entity(user_id, entity_name)
         
         if not context.all_nodes:
-            answer = f"В вашей базе знаний нет информации о сущности '{entity_name}'."
+            answer = settings.graphrag_entity_empty_response_template.format(
+                entity_name=entity_name,
+            )
         else:
             answer = self.generator.generate(
-                f"Расскажи всё, что известно о {entity_name}",
-                context
+                settings.graphrag_entity_query_template.format(entity_name=entity_name),
+                context,
             )
         
         elapsed_ms = int((time.time() - start) * 1000)
@@ -353,11 +369,11 @@ class GraphRAG:
         context = self.retriever.retrieve_by_type(user_id, "action", limit=30)
         
         if not context.all_nodes:
-            answer = "В вашей базе знаний пока нет зафиксированных задач."
+            answer = settings.graphrag_actions_empty_response
         else:
             answer = self.generator.generate(
-                "Перечисли все задачи и поручения, сгруппируй по исполнителям или проектам",
-                context
+                settings.graphrag_actions_query_template,
+                context,
             )
         
         elapsed_ms = int((time.time() - start) * 1000)
@@ -378,11 +394,11 @@ class GraphRAG:
         context = self.retriever.retrieve_by_type(user_id, "risk", limit=30)
         
         if not context.all_nodes:
-            answer = "В вашей базе знаний пока нет зафиксированных рисков."
+            answer = settings.graphrag_risks_empty_response
         else:
             answer = self.generator.generate(
-                "Перечисли все риски, отсортируй по критичности",
-                context
+                settings.graphrag_risks_query_template,
+                context,
             )
         
         elapsed_ms = int((time.time() - start) * 1000)

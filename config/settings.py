@@ -1,45 +1,148 @@
 from typing import Literal
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from config.prompts import zettel_atomizer_prompt, linker_system_prompt, RAG_generator_prompt
+
+from config.prompts import (
+    graphrag_actions_empty_response,
+    graphrag_actions_query_template,
+    graphrag_entity_empty_response_template,
+    graphrag_entity_query_template,
+    graphrag_no_context_response,
+    graphrag_risks_empty_response,
+    graphrag_risks_query_template,
+    graphrag_system_prompt,
+    graphrag_user_prompt_template,
+    linker_system_prompt,
+    linker_user_prompt_template,
+    zettel_atomizer_system_prompt,
+    zettel_atomizer_user_prompt_template,
+)
+
 
 class Settings(BaseSettings):
-    # .env в корне проекта
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
-    
-    # llm для atomizer и linker
-    zettel_atomizer_model_name: str = "openai/gpt-4o"
-    zettel_atomizer_temperature: float = 0.0
-    zettel_atomizer_prompt: str = zettel_atomizer_prompt
-    linker_model_name: str = "openai/gpt-4o"
-    linker_system_prompt: str = linker_system_prompt
-    
-    # локальная модель эмбеддингов (huggingface)
+    """
+    Центральная конфигурация приложения.
+
+    Промпты и LLM-параметры вынесены сюда для A/B-тестов и мониторинга (Langfuse).
+    Значения можно переопределять через .env — имена переменных в UPPER_SNAKE_CASE.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # embedding
     embedding_model_name: str = "intfloat/multilingual-e5-base"
-    # Альтернативы:
-    # "intfloat/multilingual-e5-small"  — быстрее, чуть хуже качество
-    # "intfloat/multilingual-e5-large"  — медленнее, лучше качество
-    # "ai-forever/sbert_large_nlu_ru"   — только русский, отличное качество
 
     # neo4j — основное хранилище графа
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = ""  # обязательно задайте в .env (NEO4J_PASSWORD)
+    neo4j_password: str = ""  # задайте в .env: NEO4J_PASSWORD
     neo4j_database: str = "neo4j"
-    
-    # параметры линкера
-    linker_similarity_threshold: float = 0.35
-    linker_max_candidates: int = 5
-    
-    # параметры graphrag
-    graphrag_search_limit: int = 10
-    graphrag_context_hops: int = 2
 
-    # chromadb (устарело — оставлено для обратной совместимости)
+    # atomizer llm
+    zettel_atomizer_model_name: str = Field(
+        default="openai/gpt-4o",
+        description="LLM для разбиения заметок на атомарные мысли",
+    )
+    zettel_atomizer_temperature: float = Field(
+        default=0.0,
+        description="Temperature для atomizer",
+    )
+    zettel_atomizer_system_prompt: str = Field(
+        default=zettel_atomizer_system_prompt,
+        description="System prompt для atomizer",
+    )
+    zettel_atomizer_user_prompt_template: str = Field(
+        default=zettel_atomizer_user_prompt_template,
+        description="User prompt template для atomizer ({text})",
+    )
+
+    # linker llm
+    linker_model_name: str = Field(
+        default="openai/gpt-4o",
+        description="LLM для решения о встраивании мысли в граф",
+    )
+    linker_temperature: float = Field(
+        default=0.0,
+        description="Temperature для linker",
+    )
+    linker_system_prompt: str = Field(
+        default=linker_system_prompt,
+        description="System prompt для linker",
+    )
+    linker_user_prompt_template: str = Field(
+        default=linker_user_prompt_template,
+        description="User prompt template для linker",
+    )
+    linker_similarity_threshold: float = 0.5
+    linker_max_candidates: int = 5
+
+    # graphrag llm
+    graphrag_model_name: str = Field(
+        default="openai/gpt-4o",
+        description="LLM для генерации ответов GraphRAG",
+    )
+    graphrag_temperature: float = Field(
+        default=0.3,
+        description="Temperature для GraphRAG generator",
+    )
+    graphrag_system_prompt: str = Field(
+        default=graphrag_system_prompt,
+        description="System prompt для GraphRAG generator",
+    )
+    graphrag_user_prompt_template: str = Field(
+        default=graphrag_user_prompt_template,
+        description="User prompt template для GraphRAG ({context}, {query})",
+    )
+    graphrag_no_context_response: str = Field(
+        default=graphrag_no_context_response,
+        description="Ответ, когда контекст для GraphRAG пуст",
+    )
+    graphrag_entity_query_template: str = Field(
+        default=graphrag_entity_query_template,
+        description="Шаблон user query для поиска по сущности ({entity_name})",
+    )
+    graphrag_actions_query_template: str = Field(
+        default=graphrag_actions_query_template,
+        description="User query для списка задач",
+    )
+    graphrag_risks_query_template: str = Field(
+        default=graphrag_risks_query_template,
+        description="User query для списка рисков",
+    )
+    graphrag_entity_empty_response_template: str = Field(
+        default=graphrag_entity_empty_response_template,
+        description="Ответ, когда сущность не найдена ({entity_name})",
+    )
+    graphrag_actions_empty_response: str = Field(
+        default=graphrag_actions_empty_response,
+        description="Ответ, когда задач нет",
+    )
+    graphrag_risks_empty_response: str = Field(
+        default=graphrag_risks_empty_response,
+        description="Ответ, когда рисков нет",
+    )
+
+    # graphrag retrieval
+    graphrag_search_limit: int = 5
+    graphrag_context_hops: int = 1
+    graphrag_similarity_threshold: float = 0.3
+
+    # chromadb (legacy)
     chroma_mode: Literal["http", "persistent", "memory"] = "http"
     chroma_host: str = "localhost"
     chroma_port: int = 8000
     chroma_persist_dir: str = "./storage/chromadb/data"
-    chroma_collection_name: str = "zettelkasten_nodes" 
+    chroma_collection_name: str = "zettelkasten_nodes"
+
+    @property
+    def zettel_atomizer_prompt(self) -> str:
+        """Алиас для обратной совместимости."""
+        return self.zettel_atomizer_system_prompt
 
 
 settings = Settings()

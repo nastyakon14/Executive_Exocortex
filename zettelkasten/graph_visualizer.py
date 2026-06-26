@@ -185,6 +185,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         vis_nodes.append({
             "id": nid,
             "label": label,
+            "preview": _short_text(z["content"], 120),
             "title": title,
             "color": {
                 "background": branch["bg"],
@@ -215,6 +216,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         vis_nodes.append({
             "id": eid,
             "label": make_entity_label(e["display_name"]),
+            "preview": e["display_name"],
             "title": title,
             "color": {
                 "background": _ENTITY_NODE_BG,
@@ -368,9 +370,12 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
   }}
   #detail-panel .neighbors {{ margin-top: 12px; }}
   #detail-panel .neighbor-item {{
-    padding: 6px 8px; margin: 3px 0;
+    padding: 8px 10px; margin: 5px 0;
     background: rgba(255,255,255,0.05); border-radius: 6px;
     cursor: pointer; font-size: 13px; color: #e2e8f0;
+    line-height: 1.35;
+    white-space: normal;
+    word-break: break-word;
   }}
   #detail-panel .neighbor-item:hover {{ background: rgba(59,130,246,0.2); }}
   #detail-panel hr {{ border-color: #334155; margin: 10px 0; }}
@@ -583,9 +588,10 @@ function showDetail(nodeId) {{
         }}
       }}
 
+      const neighborText = cn.preview || cn.label;
       const neighborHtml = '<div class="neighbor-item" onclick="focusNode(\\'' +
         cid.replace(/'/g, "\\\\'") + '\\')">' +
-        arrow + '<b>' + cn.label + '</b></div>';
+        arrow + '<b>' + neighborText + '</b></div>';
 
       if (cn.group === 'entity') {{
         entityNeighbors.push(neighborHtml);

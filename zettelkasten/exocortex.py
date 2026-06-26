@@ -35,11 +35,16 @@ embedding_model = LocalEmbeddingModel(
 atomizer = NoteAtomizer(
     model_name=settings.zettel_atomizer_model_name,
     temperature=settings.zettel_atomizer_temperature,
-    system_prompt=settings.zettel_atomizer_prompt,
+    system_prompt=settings.zettel_atomizer_system_prompt,
+    user_prompt_template=settings.zettel_atomizer_user_prompt_template,
 )
 
 linker = GraphLinker(
     embedding_model=embedding_model,
+    model_name=settings.linker_model_name,
+    temperature=settings.linker_temperature,
+    system_prompt=settings.linker_system_prompt,
+    user_prompt_template=settings.linker_user_prompt_template,
     similarity_threshold=settings.linker_similarity_threshold,
     max_candidates=settings.linker_max_candidates,
 )
@@ -185,7 +190,15 @@ def demo_graphrag(user_id: str):
     print(f"🧠 GraphRAG Demo — поиск по графу знаний [{user_id}]")
     print("=" * 70)
     
-    rag = GraphRAG(embedding_model=embedding_model)
+    rag = GraphRAG(
+        embedding_model=embedding_model,
+        model_name=settings.graphrag_model_name,
+        temperature=settings.graphrag_temperature,
+        system_prompt=settings.graphrag_system_prompt,
+        user_prompt_template=settings.graphrag_user_prompt_template,
+        no_context_response=settings.graphrag_no_context_response,
+        similarity_threshold=settings.graphrag_similarity_threshold,
+    )
     
     questions = [
         "Кто отвечает за аудит b2b?",
@@ -210,7 +223,15 @@ def demo_multi_user():
     print("=" * 70)
 
     from zettelkasten.graph_rag import GraphRAG
-    rag = GraphRAG(embedding_model=embedding_model)
+    rag = GraphRAG(
+        embedding_model=embedding_model,
+        model_name=settings.graphrag_model_name,
+        temperature=settings.graphrag_temperature,
+        system_prompt=settings.graphrag_system_prompt,
+        user_prompt_template=settings.graphrag_user_prompt_template,
+        no_context_response=settings.graphrag_no_context_response,
+        similarity_threshold=settings.graphrag_similarity_threshold,
+    )
 
     # Заполняем графы для каждого user_id отдельно.
     for user_id, scenario in DEMO_USER_SCENARIOS.items():

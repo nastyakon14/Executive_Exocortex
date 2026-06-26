@@ -139,12 +139,14 @@ class NoteAtomizer:
         self,
         model_name: str = settings.zettel_atomizer_model_name,
         temperature: float = settings.zettel_atomizer_temperature,
-        system_prompt: str = settings.zettel_atomizer_prompt,
+        system_prompt: str = settings.zettel_atomizer_system_prompt,
+        user_prompt_template: str = settings.zettel_atomizer_user_prompt_template,
     ):
 
         self.model_name = model_name
         self.temperature = temperature
         self.system_prompt = system_prompt
+        self.user_prompt_template = user_prompt_template
 
         base_llm = ChatOpenAI(
             model=self.model_name,
@@ -183,7 +185,7 @@ class NoteAtomizer:
         '''Вызов LLM для извлечения атомарных мыслей'''
         messages = [
             SystemMessage(content=self.system_prompt),
-            HumanMessage(content=f"Разбей следующую заметку на атомарные мысли:\n\n{text}"),
+            HumanMessage(content=self.user_prompt_template.format(text=text)),
         ]
         return self.structured_llm.invoke(messages)
 
