@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: exocortex_chroma
+    ports:
+      - "${CHROMA_PORT:-8000}:8000"
+    volumes:
+      # Данные базы будут лежать локально в этой папке, чтобы не потеряться при удалении контейнера
+      - ./storage/chromadb/data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped

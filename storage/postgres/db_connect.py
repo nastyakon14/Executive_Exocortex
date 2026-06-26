@@ -7,7 +7,7 @@ import os
 load_dotenv()
 
 user = 'postgres'
-password = os.getenv('DB_PASSWORD')
+password = os.getenv('POSTGRES_PASSWORD')
 db_name = 'ExoCortex_Bot'
 host = 'localhost'
 port = 5432

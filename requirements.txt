@@ -2,6 +2,7 @@ aiogram
 pandas
 python-dotenv
 psycopg2
+sklearn
 
 speech_recognition
 pytesseract
@@ -12,3 +13,6 @@ langchain-openai
 langchain
 langchain-core 
 langchain-community
+langchain-huggingface
+sentence-transformers
+chromadb
