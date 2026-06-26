@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from storage.postgres.db_connect import update_history_messages, create_database, create_tables
 import telegram_bot.texts as texts
 import telegram_bot.handlers.asr as asr
+from telegram_bot.html_format import prepare_telegram_html, plain_fallback
 from telegram_bot.handlers.txt_reader import read_txt
 from telegram_bot.handlers.pdf_reader import read_pdf
 from config.settings import settings
@@ -98,6 +99,22 @@ def _short_preview(text: str, max_len: int = 90) -> str:
     if len(normalized) <= max_len:
         return normalized
     return normalized[: max_len - 1] + "…"
+
+
+def _format_search_answer(answer: str) -> str:
+    """Форматирует ответ GraphRAG для Telegram HTML."""
+    return (
+        f"{prepare_telegram_html(answer)}\n\n"
+        "<i>Можете отправлять запросы для поиска по очереди.</i>"
+    )
+
+
+async def _answer_html(message: Message, text: str, **kwargs) -> None:
+    """Отправляет HTML-сообщение; при ошибке разметки — plain text."""
+    try:
+        await message.answer(text, parse_mode="HTML", **kwargs)
+    except TelegramBadRequest:
+        await message.answer(plain_fallback(text), **kwargs)
 
 # состояния fsm: режим добавления, поиска, уточнения и удаления
 class BotStates(StatesGroup):
@@ -291,10 +308,10 @@ async def btn_search_context(callback: types.CallbackQuery, state: FSMContext):
 async def process_search_query(message: Message, state: FSMContext):
     user_id = build_user_id(message.from_user.id)
     response = graphrag.query(user_id, message.text)
-    bot_answer = escape(response.answer)
+    bot_answer = _format_search_answer(response.answer)
     
     # состояние поиска сохраняем — можно делать несколько запросов подряд
-    await message.answer(bot_answer, parse_mode="HTML", reply_markup=cancel_kb)
+    await _answer_html(message, bot_answer, reply_markup=cancel_kb)
     
     update_history_messages(
         message.from_user.id,
@@ -667,11 +684,8 @@ async def process_clarify_search(callback: types.CallbackQuery, state: FSMContex
     
     user_id = build_user_id(callback.from_user.id)
     response = graphrag.query(user_id, saved_text)
-    bot_answer = (
-        f"{escape(response.answer)}\n\n"
-        "<i>Можете отправлять запросы для поиска по очереди.</i>"
-    )
-    await callback.message.answer(bot_answer, parse_mode="HTML", reply_markup=cancel_kb)
+    bot_answer = _format_search_answer(response.answer)
+    await _answer_html(callback.message, bot_answer, reply_markup=cancel_kb)
     
     update_history_messages(
         callback.from_user.id,
