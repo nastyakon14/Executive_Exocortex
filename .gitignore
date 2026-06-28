@@ -35,3 +35,4 @@ storage/chromadb/data/
 .cache/
 
 coursework.docx
+storage/langfuse/db
