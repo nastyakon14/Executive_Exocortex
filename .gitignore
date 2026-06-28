@@ -33,3 +33,5 @@ storage/chromadb/data/
 
 # Model cache (downloaded models)
 .cache/
+
+coursework.docx

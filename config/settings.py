@@ -1,4 +1,6 @@
+from pathlib import Path
 from typing import Literal
+import os
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,8 +30,10 @@ class Settings(BaseSettings):
     Значения можно переопределять через .env — имена переменных в UPPER_SNAKE_CASE.
     """
 
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
     model_config = SettingsConfigDict(
-        env_file=".env",    
+        env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -40,12 +44,13 @@ class Settings(BaseSettings):
     # neo4j — основное хранилище графа
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = ""  # задайте в .env: NEO4J_PASSWORD
+    neo4j_password: str = os.getenv('NEO4J_PASSWORD')  # задайте в .env: NEO4J_PASSWORD
     neo4j_database: str = "neo4j"
 
     # atomizer llm
     zettel_atomizer_model_name: str = Field(
-        default="openai/gpt-4o",
+        # default="openai/gpt-4o",
+        default="google/gemini-2.5-flash",
         description="LLM для разбиения заметок на атомарные мысли",
     )
     zettel_atomizer_temperature: float = Field(
@@ -63,7 +68,8 @@ class Settings(BaseSettings):
 
     # linker llm
     linker_model_name: str = Field(
-        default="openai/gpt-4o",
+        # default="openai/gpt-4o",
+        default="google/gemini-2.5-flash",
         description="LLM для решения о встраивании мысли в граф",
     )
     linker_temperature: float = Field(
@@ -83,7 +89,8 @@ class Settings(BaseSettings):
 
     # graphrag llm
     graphrag_model_name: str = Field(
-        default="openai/gpt-4o",
+        # default="openai/gpt-4o",
+        default="anthropic/claude-haiku-4.5",
         description="LLM для генерации ответов GraphRAG",
     )
     graphrag_temperature: float = Field(

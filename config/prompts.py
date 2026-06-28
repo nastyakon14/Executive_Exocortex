@@ -1,10 +1,3 @@
-"""
-Централизованное хранилище промптов.
-
-Все system/user шаблоны задаются здесь, а в runtime подключаются через
-config.settings — так их удобно менять для A/B-тестов и мониторинга в Langfuse.
-"""
-
 # atomizer — system
 
 zettel_atomizer_system_prompt = """

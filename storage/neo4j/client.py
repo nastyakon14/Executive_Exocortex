@@ -30,10 +30,21 @@ class Neo4jClient:
         password: str = None,
         database: str = "neo4j",
     ):
-        self.uri = uri or settings.neo4j_uri
-        self.user = user or settings.neo4j_user
-        self.password = password if password is not None else settings.neo4j_password
-        self.database = database or settings.neo4j_database
+        # В ноутбуках settings может быть уже импортирован до загрузки .env.
+        # Поэтому делаем fallback на os.getenv, чтобы клиент был устойчивее.
+        self.uri = uri or settings.neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.user = user or settings.neo4j_user or os.getenv("NEO4J_USER", "neo4j")
+        self.password = (
+            password
+            if password is not None
+            else (settings.neo4j_password or os.getenv("NEO4J_PASSWORD", ""))
+        )
+        print(self.password)
+        self.database = (
+            database
+            or settings.neo4j_database
+            or os.getenv("NEO4J_DATABASE", "neo4j")
+        )
 
         if not self.password:
             raise ValueError(

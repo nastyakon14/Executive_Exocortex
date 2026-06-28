@@ -412,48 +412,48 @@ class GraphRAG:
         )
 
 
-# cli-демо для локального тестирования
+# # cli-демо для локального тестирования
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("🧠 GraphRAG Demo (Multi-User)")
-    print("=" * 60)
+# if __name__ == "__main__":
+#     print("=" * 60)
+#     print("🧠 GraphRAG Demo (Multi-User)")
+#     print("=" * 60)
     
-    rag = GraphRAG()
+#     rag = GraphRAG()
     
-    # Demo user
-    demo_user_id = "demo_user_123"
+#     # Demo user
+#     demo_user_id = "demo_user_123"
     
-    print(f"\n📱 User ID: {demo_user_id}")
-    print("Введите вопрос (или 'q' для выхода):")
+#     print(f"\n📱 User ID: {demo_user_id}")
+#     print("Введите вопрос (или 'q' для выхода):")
     
-    while True:
-        try:
-            query = input("\n> ").strip()
+#     while True:
+#         try:
+#             query = input("\n> ").strip()
             
-            if query.lower() in ("q", "quit", "exit"):
-                break
+#             if query.lower() in ("q", "quit", "exit"):
+#                 break
             
-            if not query:
-                continue
+#             if not query:
+#                 continue
             
-            if query.startswith("/actions"):
-                response = rag.query_actions(demo_user_id)
-            elif query.startswith("/risks"):
-                response = rag.query_risks(demo_user_id)
-            elif query.startswith("/entity "):
-                entity = query[8:].strip()
-                response = rag.query_entity(demo_user_id, entity)
-            else:
-                response = rag.query(demo_user_id, query)
+#             if query.startswith("/actions"):
+#                 response = rag.query_actions(demo_user_id)
+#             elif query.startswith("/risks"):
+#                 response = rag.query_risks(demo_user_id)
+#             elif query.startswith("/entity "):
+#                 entity = query[8:].strip()
+#                 response = rag.query_entity(demo_user_id, entity)
+#             else:
+#                 response = rag.query(demo_user_id, query)
             
-            print(f"\n📝 Ответ ({response.processing_time_ms}ms):\n")
-            print(response.answer)
+#             print(f"\n📝 Ответ ({response.processing_time_ms}ms):\n")
+#             print(response.answer)
             
-            if response.context.entry_points:
-                print(f"\n📊 Найдено карточек: {len(response.context.all_nodes)}")
+#             if response.context.entry_points:
+#                 print(f"\n📊 Найдено карточек: {len(response.context.all_nodes)}")
         
-        except KeyboardInterrupt:
-            break
+#         except KeyboardInterrupt:
+#             break
     
-    print("\n👋 До свидания!")
+#     print("\n👋 До свидания!")

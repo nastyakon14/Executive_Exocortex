@@ -1,0 +1,41 @@
+=== RAG GENERATION EVALUATION REPORT ===
+User ID:        linker_eval_gpt-5.2
+Best top_k:     7 (from retrieval eval)
+Judge model:    openai/gpt-5.1
+Evaluated:      131 questions × 3 models
+Generated at:   2026-06-28T17:23:40.710785
+
+--- Results by model ---
+
+[gpt-4o-mini]
+  Faithfulness             0.9340
+  Relevance                0.8802
+  Completeness             0.2302
+  Coherence                0.9874
+  Accuracy                 0.4260
+  Hallucinations ↓       ↓ 0.0698
+  Overall Score            0.7274
+  Latency mean (ms)        3212
+
+[gemini-2.5-flash]
+  Faithfulness             0.9724
+  Relevance                0.8818
+  Completeness             0.2565
+  Coherence                0.9792
+  Accuracy                 0.3435
+  Hallucinations ↓       ↓ 0.0288
+  Overall Score            0.7294
+  Latency mean (ms)        2446
+
+[claude-haiku-4.5]  ← BEST
+  Faithfulness             0.9723
+  Relevance                0.8958
+  Completeness             0.2898
+  Coherence                0.9867
+  Accuracy                 0.3898
+  Hallucinations ↓       ↓ 0.0313
+  Overall Score            0.7462
+  Latency mean (ms)        4255
+
+--- Winner ---
+Best model: anthropic/claude-haiku-4.5  (overall_score=0.7462)

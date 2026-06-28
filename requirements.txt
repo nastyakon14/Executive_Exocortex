@@ -3,6 +3,7 @@ pandas
 tabulate
 python-dotenv
 scikit-learn
+openpyxl
 
 speech_recognition
 pytesseract
@@ -17,6 +18,8 @@ langchain
 langchain-core 
 langchain-community
 langchain-huggingface
+langfuse
+
 sentence-transformers
 torch
 pydantic

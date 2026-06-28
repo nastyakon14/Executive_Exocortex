@@ -5,8 +5,6 @@ services:
   neo4j:
     image: neo4j:5.26-community  # версия с поддержкой vector index
     container_name: exocortex_neo4j
-    env_file:
-      - .env
     ports:
       - "${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt protocol (для драйвера)
       - "${NEO4J_HTTP_PORT:-7474}:7474"   # http (neo4j browser)
@@ -43,4 +41,34 @@ services:
     environment:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+
+  # База данных для Langfuse
+  langfuse-db:
+    image: postgres:15
+    container_name: langfuse_postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=langfuse
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./storage/langfuse/db:/var/lib/postgresql/data
+
+  # Сервер Langfuse
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: langfuse_server
+    depends_on:
+      - langfuse-db
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@langfuse-db:5432/langfuse
+      - NEXTAUTH_SECRET=my_super_secret_key_change_me # Задайте случайную строку
+      - SALT=my_super_secret_salt_change_me         # Задайте случайную строку
+      - NEXTAUTH_URL=http://localhost:3000
+      - TELEMETRY_ENABLED=false
     restart: unless-stopped

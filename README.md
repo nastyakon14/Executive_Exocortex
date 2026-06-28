@@ -637,12 +637,12 @@ flowchart LR
 Параметры из `config/settings.py`:
 
 ```python
-graphrag_search_limit = 10      # сколько entry points искать
-graphrag_context_hops = 2       # глубина обхода RELATED_TO
+graphrag_search_limit = 5       # сколько entry points искать (по умолчанию)
+graphrag_context_hops = 1        # глубина обхода RELATED_TO (по умолчанию)
 similarity_threshold = 0.3        # порог косинусного сходства (мягче, чем у линкера)
 ```
 
-У линкера порог жёстче (`0.35`), потому что там решение о встраивании должно быть точным. У GraphRAG порог мягче — лучше найти больше кандидатов и дать LLM широкий контекст.
+У линкера порог жёстче (`0.5` по умолчанию в settings), потому что там решение о встраивании должно быть точным. У GraphRAG порог мягче (`0.3`) — лучше найти больше кандидатов и дать LLM широкий контекст.
 
 ### 9.2 RAG vs GraphRAG
 
@@ -677,11 +677,11 @@ sequenceDiagram
     B->>R: retrieve(user_id, query)
 
     R->>R: embed_query(query)
-    R->>N: vector_search(user_id, embedding, limit=10, threshold=0.3)
+    R->>N: vector_search(user_id, embedding, limit=5, threshold=0.3)
     N-->>R: entry_points: list[ZettelNode]
 
     loop Для каждой entry point
-        R->>N: get_context(user_id, zettel_id, hops=2)
+        R->>N: get_context(user_id, zettel_id, hops=1)
         N-->>R: parent + children + related + entities
     end
 
@@ -713,7 +713,7 @@ query_embedding = embedding_model.embed_query("Кто курирует DevSummit
 candidates = repository.vector_search(
     user_id=user_id,
     query_embedding=query_embedding,
-    limit=10,                    # graphrag_search_limit
+    limit=5,                     # graphrag_search_limit (default)
     similarity_threshold=0.3,
 )
 ```
@@ -725,7 +725,7 @@ candidates = repository.vector_search(
 2. Для каждого узла: score = cosine(query_vec, z.embedding)
 3. Отфильтровать: score >= threshold (0.3)
 4. Отсортировать по score убыванию
-5. Вернуть top-10
+5. Вернуть top-5
 ```
 
 Почему Python, а не vector index Neo4j напрямую: vector index не умеет фильтровать по `user_id`. Поэтому сначала загружаются все мысли конкретного пользователя, затем similarity считается в numpy. Для персональной базы топ-менеджера (сотни–тысячи карточек) это быстро.
@@ -741,14 +741,14 @@ context.entry_points = [node for node, score in candidates]
 
 ### 9.5 Этап 2: обход графа (расширение контекста)
 
-Для каждой entry point вызывается `repository.get_context(user_id, zettel_id, hops=2)`. Это один Cypher-запрос на каждый тип связи:
+Для каждой entry point вызывается `repository.get_context(user_id, zettel_id, hops=1)` по умолчанию (значение настраивается). Это один Cypher-запрос на каждый тип связи:
 
 ```mermaid
 flowchart TD
     EP["entry point [1.1]"]
     EP --> P["parent via CHILD_OF\n[1] срок до 10 мая"]
     EP --> C1["child via CHILD_OF\n(если есть)"]
-    EP --> R["related via RELATED_TO\nдо 2 hops"]
+    EP --> R["related via RELATED_TO\nдо 1 hop (по умолчанию)"]
     EP --> E["entities via MENTIONS\nолег_мишин, devsummit"]
 
     P --> RC[RetrievedContext.expanded_nodes]
@@ -778,11 +778,11 @@ RETURN child
 **Связанные мысли (RELATED_TO)**
 
 ```cypher
-MATCH (z)-[:RELATED_TO*1..2]-(related:Zettel {user_id: $user_id})
+MATCH (z)-[:RELATED_TO*1..1]-(related:Zettel {user_id: $user_id})
 RETURN DISTINCT related
 ```
 
-`hops=2` означает до двух шагов по `RELATED_TO`. Связь используется реже, чем `CHILD_OF`, но позволяет подтянуть смыслово близкие, но не иерархические мысли.
+`hops=1` по умолчанию (настраивается через `settings.graphrag_context_hops`). Этого достаточно для большинства запросов и снижает шум в контексте.
 
 **Сущности (MENTIONS)**
 
@@ -888,8 +888,8 @@ RETURN z, e ORDER BY z.created_at DESC LIMIT 20
 | | Linker (запись) | GraphRAG (поиск) |
 |--|-----------------|------------------|
 | Цель | Куда встроить новую мысль | Ответить на вопрос |
-| limit | 5 | 10 |
-| threshold | 0.35 | 0.3 |
+| limit | 5 | 5 (default) |
+| threshold | 0.5 (default) | 0.3 (default) |
 | После search | LLM решает new_root/child_of/update_of | Graph expand + LLM генерирует ответ |
 | Префикс embed | `passage:` для карточки, `query:` для search | `query:` для вопроса |
 

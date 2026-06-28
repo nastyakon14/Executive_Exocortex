@@ -1,0 +1,35 @@
+=== RAG RETRIEVAL EVALUATION REPORT ===
+User ID:          linker_eval_gpt-5.2
+Dataset:          synthetic_datasets/rag_qa_dataset.xlsx
+Evaluated:        131 questions
+Similarity thr.:  0.2
+Generated at:     2026-06-28T17:15:07.433262
+
+--- Metrics by top_k ---
+
+top_k = 3:
+  Precision@k      mean=0.0941  median=0.0000  std=0.1951
+  Recall@k         mean=0.0877  median=0.0000  std=0.2342
+  F1@k             mean=0.0725  median=0.0000  std=0.1546
+  HitRate@k        mean=0.2214  median=0.0000  std=0.4168
+  MRR              mean=0.1887  median=0.0000  std=0.3437
+  nDCG@k           mean=0.1240  median=0.0000  std=0.2592
+
+top_k = 5:
+  Precision@k      mean=0.0718  median=0.0000  std=0.1427
+  Recall@k         mean=0.1008  median=0.0000  std=0.2409
+  F1@k             mean=0.0684  median=0.0000  std=0.1303
+  HitRate@k        mean=0.2519  median=0.0000  std=0.4358
+  MRR              mean=0.1887  median=0.0000  std=0.3437
+  nDCG@k           mean=0.1162  median=0.0000  std=0.2353
+
+top_k = 7:
+  Precision@k      mean=0.0687  median=0.0000  std=0.1318
+  Recall@k         mean=0.1191  median=0.0000  std=0.2492
+  F1@k             mean=0.0732  median=0.0000  std=0.1277
+  HitRate@k        mean=0.2977  median=0.0000  std=0.4590
+  MRR              mean=0.1887  median=0.0000  std=0.3437
+  nDCG@k           mean=0.1212  median=0.0000  std=0.2315
+
+--- Best top_k ---
+best_k = 7  (highest mean F1=0.0732)
