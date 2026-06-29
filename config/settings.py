@@ -89,8 +89,9 @@ class Settings(BaseSettings):
 
     # graphrag llm
     graphrag_model_name: str = Field(
+        default="google/gemini-2.5-flash",
         # default="openai/gpt-4o",
-        default="anthropic/claude-haiku-4.5",
+        # default="anthropic/claude-haiku-4.5",
         description="LLM для генерации ответов GraphRAG",
     )
     graphrag_temperature: float = Field(

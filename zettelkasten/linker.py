@@ -254,9 +254,9 @@ class GraphLinker:
         self._luhmann_remap = {}
         
         for card in new_cards:
-            print(f"\n{'─' * 55}")
-            print(f"📋 [{card.luhmann_id}] {card.content[:55]}...")
-            print(f"   root={card.is_root_topic}, parent={card.parent_luhmann_id}")
+            # print(f"\n{'─' * 55}")
+            # print(f"📋 [{card.luhmann_id}] {card.content[:55]}...")
+            # print(f"   root={card.is_root_topic}, parent={card.parent_luhmann_id}")
             
             embedding = self.embedding_model.embed_passage(card.content)
             
@@ -297,7 +297,7 @@ class GraphLinker:
             parent_zettel_id=parent_node.zettel_id,
         )
         
-        print(f"   ✅ Дочерняя → [{new_luhmann}] ← [{real_parent_luhmann}]")
+        # print(f"   ✅ Дочерняя → [{new_luhmann}] ← [{real_parent_luhmann}]")
         
         return LinkResult(
             card=node,
@@ -316,9 +316,9 @@ class GraphLinker:
             similarity_threshold=self.similarity_threshold,
         )
         
-        print(f"   🔍 Vector search: {len(candidates)} кандидатов")
+        # print(f"   🔍 Vector search: {len(candidates)} кандидатов")
         for cand, score in candidates:
-            print(f"      sim={score:.3f} [{cand.luhmann_id}]: {cand.content[:45]}...")
+            f"      sim={score:.3f} [{cand.luhmann_id}]: {cand.content[:45]}..."
         
         if not candidates:
             # нет похожих мыслей — сразу создаём новый корень без llm
@@ -333,7 +333,7 @@ class GraphLinker:
                 contexts.append(ctx)
         
         decision = self._ask_llm(card, contexts)
-        print(f"   🤖 LLM: {decision.action.value.upper()} | {decision.reasoning}")
+        # print(f"   🤖 LLM: {decision.action.value.upper()} | {decision.reasoning}")
         
         if decision.action == LinkAction.NEW_ROOT:
             return self._apply_new_root(user_id, card, embedding, decision.reasoning, len(candidates))
@@ -405,7 +405,7 @@ class GraphLinker:
             is_root_topic=True,
         )
         
-        print(f"   ✅ NEW_ROOT → [{new_luhmann}]")
+        # print(f"   ✅ NEW_ROOT → [{new_luhmann}]")
         
         return LinkResult(
             card=node,
@@ -426,7 +426,7 @@ class GraphLinker:
         parent_node = self.repository.get_by_id(user_id, decision.target_zettel_id)
         
         if not parent_node:
-            print(f"   ⚠️  Родитель {decision.target_zettel_id} не найден! Fallback → new_root")
+            # print(f"   ⚠️  Родитель {decision.target_zettel_id} не найден! Fallback → new_root")
             return self._apply_new_root(user_id, card, embedding, "Родитель не найден", candidates_found)
         
         siblings = self.repository.get_siblings(user_id, parent_node.luhmann_id)
@@ -448,7 +448,7 @@ class GraphLinker:
             parent_zettel_id=parent_node.zettel_id,
         )
         
-        print(f"   ✅ CHILD_OF [{parent_node.luhmann_id}] → [{new_luhmann}]")
+        # print(f"   ✅ CHILD_OF [{parent_node.luhmann_id}] → [{new_luhmann}]")
         
         return LinkResult(
             card=node,
@@ -491,7 +491,7 @@ class GraphLinker:
                 target_zettel_id=decision.target_zettel_id,
             )
         
-        print(f"   ✅ UPDATE_OF [{updated_node.luhmann_id}]")
+        # print(f"   ✅ UPDATE_OF [{updated_node.luhmann_id}]")
         
         return LinkResult(
             card=updated_node,
@@ -501,9 +501,9 @@ class GraphLinker:
             target_zettel_id=decision.target_zettel_id,
         )
     
-    def print_graph(self, user_id: str) -> None:
-        """Выводит граф пользователя."""
-        self.repository.print_graph(user_id)
+    # def print_graph(self, user_id: str) -> None:
+    #     """Выводит граф пользователя."""
+    #     self.repository.print_graph(user_id)
     
     def get_user_stats(self, user_id: str) -> dict:
         """Возвращает статистику по графу пользователя."""

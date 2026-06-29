@@ -1,0 +1,50 @@
+   RAG GENERATION EVALUATION REPORT  (GraphRAG)
+
+
+  User ID       : graphrag_test_user_v10
+  Best top_k    : 5  (from retriever eval)
+  Judge model   : openai/gpt-5.1
+  Evaluated     : 98 questions × 3 models
+  Generated at  : 2026-06-30 02:09:06
+
+
+  Results by model
+
+  [gpt-4o-mini]
+    Faithfulness            0.8974  
+    Relevance               0.9278  
+    Completeness            0.7515  
+    Coherence               0.9767  
+    Accuracy                0.8153  
+    Hallucinations ↓        0.1031  ↓ (lower=better)
+    Overall Score           0.8772
+    Latency mean (ms)       3721
+    Latency P95 (ms)        5534
+
+  [gemini-2.5-flash]  ← BEST MODEL
+    Faithfulness            0.9500  
+    Relevance               0.9413  
+    Completeness            0.7872  
+    Coherence               0.9814  
+    Accuracy                0.8510  
+    Hallucinations ↓        0.0500  ↓ (lower=better)
+    Overall Score           0.9094
+    Latency mean (ms)       3163
+    Latency P95 (ms)        5352
+
+  [claude-haiku-4.5]
+    Faithfulness            0.9249  
+    Relevance               0.9607  
+    Completeness            0.7990  
+    Coherence               0.9815  
+    Accuracy                0.8478  
+    Hallucinations ↓        0.0761  ↓ (lower=better)
+    Overall Score           0.9059
+    Latency mean (ms)       5052
+    Latency P95 (ms)        6894
+
+
+
+  WINNER: google/gemini-2.5-flash
+  Overall Score: 0.9094
+

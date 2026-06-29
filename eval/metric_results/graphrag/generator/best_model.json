@@ -1,0 +1,17 @@
+{
+  "best_model": "google/gemini-2.5-flash",
+  "label": "gemini-2.5-flash",
+  "overall_score": 0.9094,
+  "best_k": 5,
+  "eval_user_id": "graphrag_test_user_v10",
+  "n_questions": 98,
+  "metrics": {
+    "faithfulness": 0.95,
+    "relevance": 0.9413,
+    "completeness": 0.7872,
+    "coherence": 0.9814,
+    "accuracy": 0.851,
+    "hallucinations": 0.05
+  },
+  "generated_at": "2026-06-30T02:08:49.709731"
+}

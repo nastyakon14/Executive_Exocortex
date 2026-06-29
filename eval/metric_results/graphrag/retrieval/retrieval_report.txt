@@ -1,0 +1,35 @@
+=== RAG RETRIEVAL EVALUATION REPORT ===
+User ID:          graphrag_test_user_v1
+Dataset:          metric_results/graphrag/retrieval/retriever_results.xlsx
+Evaluated:        98 questions
+Similarity thr.:  0.5
+Generated at:     2026-06-30T02:23:17.824548
+
+--- Metrics by top_k ---
+
+top_k = 3:
+  Precision@k      mean=0.5170  median=0.6667  std=0.2877
+  Recall@k         mean=0.5494  median=0.6667  std=0.3436
+  F1@k             mean=0.5034  median=0.5584  std=0.2802
+  HitRate@k        mean=0.8673  median=1.0000  std=0.3409
+  MRR              mean=0.8318  median=1.0000  std=0.3091
+  nDCG@k           mean=0.6516  median=0.7346  std=0.3266
+
+top_k = 5:
+  Precision@k      mean=0.3714  median=0.4000  std=0.1883
+  Recall@k         mean=0.6487  median=0.6667  std=0.3300
+  F1@k             mean=0.4473  median=0.5000  std=0.2115
+  HitRate@k        mean=0.9388  median=1.0000  std=0.2410
+  MRR              mean=0.8318  median=1.0000  std=0.3091
+  nDCG@k           mean=0.6675  median=0.7227  std=0.2981
+
+top_k = 7:
+  Precision@k      mean=0.3236  median=0.2857  std=0.1648
+  Recall@k         mean=0.7581  median=1.0000  std=0.3202
+  F1@k             mean=0.4309  median=0.4444  std=0.1902
+  HitRate@k        mean=0.9592  median=1.0000  std=0.1989
+  MRR              mean=0.8318  median=1.0000  std=0.3091
+  nDCG@k           mean=0.7146  median=0.8316  std=0.3000
+
+--- Best top_k ---
+best_k = 3  (highest mean F1=0.5034)
