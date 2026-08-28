@@ -116,23 +116,25 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         lines.append(current)
         return "\n".join(lines)
 
-    def make_thought_label(content: str, depth: int) -> str:
+    def make_thought_label(topic: str, content: str, depth: int) -> str:
         """
-        Для маленьких кругов делаем подпись короче и переносим строки,
-        чтобы размер узла не выравнивался из-за длинного текста.
+        Отображает тему мысли на узле. Если тема пустая — показывает обрезанный контент.
         """
+        # Используем тему, если она есть
+        display_text = topic.strip() if topic else content
+        
         if depth <= 0:
-            # Корневые: почти без обрезки и без переноса строки.
-            return _short_text(content, 34)
+            # Корневые: показываем полную тему или до 34 символов
+            return _short_text(display_text, 34)
         elif depth == 1:
-            max_len, line_len = 16, 6
+            max_len, line_len = 18, 8
         elif depth == 2:
-            max_len, line_len = 11, 5
+            max_len, line_len = 14, 6
         elif depth == 3:
-            max_len, line_len = 9, 4
+            max_len, line_len = 12, 5
         else:
-            max_len, line_len = 7, 4
-        return _wrap_text(_short_text(content, max_len), line_len)
+            max_len, line_len = 10, 5
+        return _wrap_text(_short_text(display_text, max_len), line_len)
 
     def make_entity_label(content: str, max_len: int = 9) -> str:
         """Короткий заголовок сущности, чтобы текст помещался в маленький круг."""
@@ -162,18 +164,23 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         node_ids_seen.add(nid)
 
         depth = calc_depth(z["luhmann_id"])
-        label = make_thought_label(z["content"], depth)
+        topic = z.get("topic", "")
+        label = make_thought_label(topic, z["content"], depth)
         # Корни заметно крупнее, дочерние ступенчато меньше.
         size = thought_size_by_depth(depth)
         font_size = 12 if depth == 0 else (11 if depth == 1 else (10 if depth == 2 else 9))
 
         content_escaped = json.dumps(z["content"], ensure_ascii=False)[1:-1]
+        topic_escaped = json.dumps(topic, ensure_ascii=False)[1:-1] if topic else ""
         tags_str = ", ".join(z["tags"]) if z["tags"] else "—"
         tt = z["thought_type"]
         parent_info = f"← [{z['parent_luhmann']}]" if z.get("parent_luhmann") else "корневая"
 
-        title = (
-            f"<b>[{z['luhmann_id']}]</b> {parent_info}<br/>"
+        # При клике показываем полный текст заметки
+        title = f"<b>[{z['luhmann_id']}]</b> {parent_info}<br/>"
+        if topic_escaped:
+            title += f"<b>Тема:</b> {topic_escaped}<br/>"
+        title += (
             f"<i>Тип:</i> {tt}<br/>"
             f"<i>Теги:</i> {tags_str}<br/><hr/>"
             f"{content_escaped}"
@@ -185,7 +192,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         vis_nodes.append({
             "id": nid,
             "label": label,
-            "preview": _short_text(z["content"], 120),
+            "preview": f"{topic}: {_short_text(z['content'], 100)}" if topic else _short_text(z["content"], 120),
             "title": title,
             "color": {
                 "background": branch["bg"],
@@ -444,6 +451,30 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
     box-shadow: 0 1px 3px rgba(0,0,0,0.06);
   }}
   body.light-theme #search-box input:focus {{ border-color: #3b82f6; }}
+  #spray-layer {{
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    overflow: hidden;
+    z-index: 20;
+  }}
+  .spray-dot {{
+    position: fixed;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(125, 211, 252, 0.9) 0%, rgba(56, 189, 248, 0.35) 65%, rgba(56, 189, 248, 0) 100%);
+    transform: translate(-50%, -50%);
+    animation: spray-burst 680ms ease-out forwards;
+    will-change: transform, opacity;
+  }}
+  body.light-theme .spray-dot {{
+    background: radial-gradient(circle, rgba(14, 165, 233, 0.75) 0%, rgba(56, 189, 248, 0.25) 65%, rgba(56, 189, 248, 0) 100%);
+  }}
+  @keyframes spray-burst {{
+    0% {{ opacity: 0.85; transform: translate(-50%, -50%) scale(0.9); }}
+    100% {{ opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(0.2); }}
+  }}
 </style>
 </head>
 <body>
@@ -461,6 +492,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
 <div id="search-box">
   <input type="text" id="searchInput" placeholder="🔍 Найти мысль или сущность..."/>
 </div>
+<div id="spray-layer"></div>
 <div id="graph"></div>
 <div id="legend">
   <h3>Легенда</h3>
@@ -546,6 +578,48 @@ themeToggleBtn.addEventListener('click', function() {{
     localStorage.setItem('exocortex_theme', 'dark');
   }}
 }});
+
+// мягкий "спрей" за курсором
+(function() {{
+  const layer = document.getElementById('spray-layer');
+  if (!layer) return;
+  if (window.matchMedia('(pointer: coarse)').matches) return;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  let lastSpawn = 0;
+  const spawnEveryMs = 18;
+
+  function spawnSpray(x, y, count) {{
+    for (let i = 0; i < count; i++) {{
+      const dot = document.createElement('div');
+      dot.className = 'spray-dot';
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 8 + Math.random() * 24;
+      const dx = Math.cos(angle) * radius;
+      const dy = Math.sin(angle) * radius;
+      const size = 4 + Math.random() * 7;
+      dot.style.left = x + 'px';
+      dot.style.top = y + 'px';
+      dot.style.width = size + 'px';
+      dot.style.height = size + 'px';
+      dot.style.setProperty('--dx', dx.toFixed(2) + 'px');
+      dot.style.setProperty('--dy', dy.toFixed(2) + 'px');
+      layer.appendChild(dot);
+      dot.addEventListener('animationend', () => dot.remove(), {{ once: true }});
+    }}
+  }}
+
+  window.addEventListener('mousemove', function(e) {{
+    const now = performance.now();
+    if (now - lastSpawn < spawnEveryMs) return;
+    lastSpawn = now;
+    spawnSpray(e.clientX, e.clientY, 2);
+  }});
+
+  window.addEventListener('click', function(e) {{
+    spawnSpray(e.clientX, e.clientY, 10);
+  }});
+}})();
 
 // панель деталей выбранного узла
 function closeDetail() {{

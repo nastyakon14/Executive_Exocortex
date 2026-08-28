@@ -289,6 +289,7 @@ class GraphLinker:
         
         node = self.repository.create_child_of(
             user_id=user_id,
+            topic=card.topic,
             content=card.content,
             luhmann_id=new_luhmann,
             thought_type=str(card.thought_type),
@@ -397,6 +398,7 @@ class GraphLinker:
         
         node = self.repository.create_zettel(
             user_id=user_id,
+            topic=card.topic,
             content=card.content,
             luhmann_id=new_luhmann,
             thought_type=str(card.thought_type),
@@ -440,6 +442,7 @@ class GraphLinker:
         
         node = self.repository.create_child_of(
             user_id=user_id,
+            topic=card.topic,
             content=card.content,
             luhmann_id=new_luhmann,
             thought_type=str(card.thought_type),
@@ -480,6 +483,7 @@ class GraphLinker:
                 card=ZettelNode(
                     zettel_id="",
                     luhmann_id="",
+                    topic=card.topic,
                     content=card.content,
                     thought_type=str(card.thought_type),
                     tags=card.tags,

@@ -326,6 +326,33 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .particle { position: absolute; width: 4px; height: 4px; background: var(--accent); border-radius: 50%; opacity: 0.3; animation: float 15s infinite; }
 @keyframes float { 0%, 100% { transform: translateY(100vh) rotate(0deg); opacity: 0; } 10% { opacity: 0.3; } 90% { opacity: 0.3; } }
 
+/* Mouse spray trail */
+.spray-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 50;
+}
+.spray-dot {
+  position: fixed;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(168,85,247,0.95) 0%, rgba(99,102,241,0.45) 65%, rgba(99,102,241,0) 100%);
+  transform: translate(-50%, -50%);
+  filter: blur(0.2px);
+  animation: spray-burst 680ms ease-out forwards;
+  will-change: transform, opacity;
+}
+[data-theme="light"] .spray-dot {
+  background: radial-gradient(circle, rgba(99,102,241,0.8) 0%, rgba(168,85,247,0.35) 65%, rgba(168,85,247,0) 100%);
+}
+@keyframes spray-burst {
+  0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.9); }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(0.2); }
+}
+
 /* Modal */
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(10,10,15,0.92); display: none; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(8px); padding: 20px; }
 [data-theme="light"] .modal-overlay { background: rgba(248,250,252,0.92); }
@@ -420,6 +447,48 @@ document.addEventListener('keydown', function(e) {
         container.appendChild(p);
     }
 })();
+
+// Mouse spray trail
+(function() {
+    const layer = document.getElementById('sprayLayer');
+    if (!layer) return;
+    if (window.matchMedia('(pointer: coarse)').matches) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+    let lastSpawn = 0;
+    const spawnEveryMs = 18;
+
+    function spawnSpray(x, y, count) {
+        for (let i = 0; i < count; i++) {
+            const dot = document.createElement('div');
+            dot.className = 'spray-dot';
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 8 + Math.random() * 24;
+            const dx = Math.cos(angle) * radius;
+            const dy = Math.sin(angle) * radius;
+            const size = 4 + Math.random() * 7;
+            dot.style.left = x + 'px';
+            dot.style.top = y + 'px';
+            dot.style.width = size + 'px';
+            dot.style.height = size + 'px';
+            dot.style.setProperty('--dx', dx.toFixed(2) + 'px');
+            dot.style.setProperty('--dy', dy.toFixed(2) + 'px');
+            layer.appendChild(dot);
+            dot.addEventListener('animationend', () => dot.remove(), { once: true });
+        }
+    }
+
+    window.addEventListener('mousemove', function(e) {
+        const now = performance.now();
+        if (now - lastSpawn < spawnEveryMs) return;
+        lastSpawn = now;
+        spawnSpray(e.clientX, e.clientY, 2);
+    });
+
+    window.addEventListener('click', function(e) {
+        spawnSpray(e.clientX, e.clientY, 10);
+    });
+})();
 """
 
 
@@ -436,6 +505,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 </head>
 <body>
 <div class="particles"></div>
+<div id="sprayLayer" class="spray-layer"></div>
 {theme_btn}
 <div id="loadingOverlay" class="loading-overlay">
     <div class="loading-box">
@@ -931,16 +1001,24 @@ async def delete_search(request: Request, q: str = Form("")):
     cards_html = ""
     
     for i, (node, score) in enumerate(cands):
+        topic = getattr(node, 'topic', '') or ''
         cached.append({
             "zettel_id": node.zettel_id, 
-            "luhmann_id": node.luhmann_id, 
+            "luhmann_id": node.luhmann_id,
+            "topic": topic,
             "content": node.content
         })
-        preview = escape(node.content[:120]) + ("..." if len(node.content) > 120 else "")
+        # Формат: "Тема: сокращённый текст" или просто сокращённый текст
+        if topic:
+            short_content = node.content[:80] + ("..." if len(node.content) > 80 else "")
+            preview = f"<strong>{escape(topic)}</strong>: {escape(short_content)}"
+        else:
+            preview = escape(node.content[:120]) + ("..." if len(node.content) > 120 else "")
         full_content = escape(node.content).replace("\n", "<br>")
+        topic_escaped = escape(topic) if topic else ""
         
         cards_html += f"""
-        <div class="delete-card" onclick="showDeleteModal({i}, '{escape(node.luhmann_id)}', `{full_content}`)">
+        <div class="delete-card" onclick="showDeleteModal({i}, '{escape(node.luhmann_id)}', `{full_content}`, `{topic_escaped}`)">
             <div class="card-header">
                 <span class="card-id">[{escape(node.luhmann_id)}]</span>
                 <span class="card-score">{score:.0%} совпадение</span>
@@ -969,6 +1047,7 @@ async def delete_search(request: Request, q: str = Form("")):
             <div class="modal-box">
                 <h3>🗑 Удалить эту мысль?</h3>
                 <div class="card-id" id="modalCardId"></div>
+                <div class="modal-topic" id="modalTopic" style="font-weight:600;color:var(--accent);margin:8px 0;font-size:15px"></div>
                 <div class="quote" id="modalQuote"></div>
                 <p>Это действие нельзя отменить. Мысль и все связанные данные будут удалены.</p>
                 <div class="modal-btns">
@@ -985,9 +1064,16 @@ async def delete_search(request: Request, q: str = Form("")):
     js = """
     let pendingDeleteIdx = null;
     
-    function showDeleteModal(idx, cardId, content) {
+    function showDeleteModal(idx, cardId, content, topic) {
         pendingDeleteIdx = idx;
         document.getElementById('modalCardId').textContent = '[' + cardId + ']';
+        const topicEl = document.getElementById('modalTopic');
+        if (topic) {
+            topicEl.textContent = 'Тема: ' + topic;
+            topicEl.style.display = 'block';
+        } else {
+            topicEl.style.display = 'none';
+        }
         document.getElementById('modalQuote').innerHTML = content;
         document.getElementById('deleteModal').classList.add('active');
     }
@@ -1044,4 +1130,5 @@ async def delete_confirm(request: Request, token: str = Form(""), idx: int = For
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("web_app:app", host="0.0.0.0", port=8008, reload=False)
+    port = int(os.getenv("WEB_APP_PORT", "8008"))
+    uvicorn.run("web_app:app", host="0.0.0.0", port=port, reload=False)

@@ -34,6 +34,13 @@ class ThoughtType(str, Enum):
 
 class AtomicThought(BaseModel):
     '''Объект атомарной мысли'''
+    topic: str = Field(
+        description=(
+            "Краткая тема мысли (1-3 слова). "
+            "Суть мысли в максимально сжатой форме. "
+            "Например: 'Поправки ПДД', 'Встреча с клиентом', 'Идея продукта', 'Риск проекта'."
+        )
+    )
     content: str = Field(
         description=(
             "Одно краткое самодостаточное атомарное утверждение (1-2 предложения). "
@@ -85,6 +92,7 @@ class ZettelCard(BaseModel):
     luhmann_id: str = Field(description="Идентификатор по методу Лумана (например: 1, 1.1, 1.1a)") 
     parent_id: Optional[str] = Field(default=None, description="UUID родительской карточки") 
     parent_luhmann_id: Optional[str] = Field(default=None, description="Луман-ID родительской карточки")
+    topic: str = Field(description="Краткая тема мысли (1-3 слова)")  # тема мысли для отображения на графе
     content: str = Field(description="Контент карточки")    # одно краткое самодостаточное атомарное утверждение (1-2 предложения)  
     thought_type: ThoughtType = Field(description="Тип мысли")   # тип мысли: факт, решение, задача, риск, идея, контекст, вопрос, ответ, объяснение, комментарий, заметка, память, напоминание, побуждение к действию, другое
     tags: list[str] = Field(description="Теги карточки")         # ключевые теги — сущности: имена людей, проекты, организации, технологии. snake_case, на языке оригинала. От 1 до 5 тегов.
@@ -230,6 +238,7 @@ class NoteAtomizer:
                 luhmann_id=current_luhmann,
                 parent_id=parent_uuid,
                 parent_luhmann_id=parent_luhmann,
+                topic=self._clean_topic(thought.topic),
                 content=self._clean_content(thought.content),
                 thought_type=thought.thought_type,
                 tags=self._normalize_tags(thought.tags),
@@ -238,6 +247,15 @@ class NoteAtomizer:
             )
             cards.append(card)
         return cards
+
+    def _clean_topic(self, topic: str) -> str:
+        '''Очистка темы Zettel-карточки - 1-3 слова'''
+        topic = " ".join(topic.split())
+        # Убираем точки в конце темы
+        topic = topic.rstrip(".,;:!?")
+        # Ограничиваем до 3 слов
+        words = topic.split()[:3]
+        return " ".join(words) if words else "Без темы"
 
     def _clean_content(self, content: str) -> str:
         '''Очистка контента Zettel-карточки от лишних пробелов и символов'''

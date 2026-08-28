@@ -371,14 +371,21 @@ async def process_delete_search_query(message: Message, state: FSMContext):
     delete_candidates = []
     lines = ["<b>Найдено до 5 подходящих мыслей для удаления:</b>\n"]
     for i, (node, score) in enumerate(candidates, start=1):
-        full_text = escape(node.content.strip())
+        topic = getattr(node, 'topic', '') or ''
+        # Формат: "Тема: сокращённый текст" или просто текст
+        if topic:
+            short_content = _short_preview(node.content, 80)
+            display_text = f"<b>{escape(topic)}</b>: {escape(short_content)}"
+        else:
+            display_text = escape(node.content.strip())
         lines.append(
-            f"{i}. <b>[{node.luhmann_id}]</b> {full_text}\n"
+            f"{i}. <b>[{node.luhmann_id}]</b> {display_text}\n"
             f"   <i>релевантность: {score:.2f}</i>"
         )
         delete_candidates.append({
             "zettel_id": node.zettel_id,
             "luhmann_id": node.luhmann_id,
+            "topic": topic,
             "content": node.content,
             "score": score,
         })

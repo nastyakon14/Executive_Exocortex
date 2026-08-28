@@ -18,6 +18,7 @@ class ZettelNode:
     thought_type: str
     tags: List[str]
     is_root_topic: bool
+    topic: str = ""  # тема мысли (1-3 слова)
     user_id: str = ""
     embedding: Optional[List[float]] = None
     created_at: Optional[datetime] = None
@@ -65,6 +66,7 @@ class ZettelRepository:
     def create_zettel(
         self,
         user_id: str,
+        topic: str,
         content: str,
         luhmann_id: str,
         thought_type: str,
@@ -84,6 +86,7 @@ class ZettelRepository:
             zettel_id: $zettel_id,
             user_id: $user_id,
             luhmann_id: $luhmann_id,
+            topic: $topic,
             content: $content,
             thought_type: $thought_type,
             tags: $tags,
@@ -99,6 +102,7 @@ class ZettelRepository:
             "zettel_id": zettel_id,
             "user_id": user_id,
             "luhmann_id": luhmann_id,
+            "topic": topic,
             "content": content,
             "thought_type": thought_type,
             "tags": tags,
@@ -114,12 +118,13 @@ class ZettelRepository:
         if is_root_topic and luhmann_id.isdigit():
             self._max_root_id_cache.pop(user_id, None)
         
-        print(f"  [Neo4j] Создан [{luhmann_id}]: {content[:50]}...")
+        print(f"  [Neo4j] Создан [{luhmann_id}] {topic}: {content[:50]}...")
         
         return ZettelNode(
             zettel_id=zettel_id,
             user_id=user_id,
             luhmann_id=luhmann_id,
+            topic=topic,
             content=content,
             thought_type=thought_type,
             tags=tags,
@@ -130,6 +135,7 @@ class ZettelRepository:
     def create_child_of(
         self,
         user_id: str,
+        topic: str,
         content: str,
         luhmann_id: str,
         thought_type: str,
@@ -150,6 +156,7 @@ class ZettelRepository:
             zettel_id: $zettel_id,
             user_id: $user_id,
             luhmann_id: $luhmann_id,
+            topic: $topic,
             content: $content,
             thought_type: $thought_type,
             tags: $tags,
@@ -166,6 +173,7 @@ class ZettelRepository:
             "zettel_id": zettel_id,
             "user_id": user_id,
             "luhmann_id": luhmann_id,
+            "topic": topic,
             "content": content,
             "thought_type": thought_type,
             "tags": tags,
@@ -177,12 +185,13 @@ class ZettelRepository:
         self._create_entity_links(user_id, zettel_id, tags)
         
         parent_luhmann = result[0]["parent_luhmann"] if result else "?"
-        print(f"  [Neo4j] Создан [{luhmann_id}] ← [{parent_luhmann}]")
+        print(f"  [Neo4j] Создан [{luhmann_id}] {topic} ← [{parent_luhmann}]")
         
         return ZettelNode(
             zettel_id=zettel_id,
             user_id=user_id,
             luhmann_id=luhmann_id,
+            topic=topic,
             content=content,
             thought_type=thought_type,
             tags=tags,
@@ -232,6 +241,7 @@ class ZettelRepository:
             zettel_id=z["zettel_id"],
             user_id=z["user_id"],
             luhmann_id=z["luhmann_id"],
+            topic=z.get("topic", ""),
             content=z["content"],
             thought_type=z["thought_type"],
             tags=z["tags"],
@@ -518,6 +528,7 @@ class ZettelRepository:
             zettel_id=node_dict["zettel_id"],
             user_id=node_dict.get("user_id", ""),
             luhmann_id=node_dict["luhmann_id"],
+            topic=node_dict.get("topic", ""),
             content=node_dict["content"],
             thought_type=node_dict["thought_type"],
             tags=list(node_dict.get("tags", [])),
@@ -649,6 +660,7 @@ class ZettelRepository:
             zettels.append({
                 "zettel_id": z["zettel_id"],
                 "luhmann_id": z["luhmann_id"],
+                "topic": z.get("topic", ""),
                 "content": z["content"],
                 "thought_type": z["thought_type"],
                 "tags": list(z.get("tags", [])),
