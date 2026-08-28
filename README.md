@@ -680,6 +680,185 @@ flowchart LR
 
 Структура данных `RetrievedContext` содержит: `entry_points`, `expanded_nodes`, `entities`, `paths`.
 
+### 10.1.1 Подробная схема работы GraphRAG (по компонентам)
+
+Ниже — полная карта пайплайна: от вопроса в Telegram до ответа LLM. Все параметры соответствуют `config/settings.py` и `zettelkasten/graph_rag.py`.
+
+```mermaid
+flowchart TB
+    subgraph TG["Telegram Bot (main.py)"]
+        U["Пользователь\nвводит вопрос"]
+        UID["user_id = tg_user_{telegram_id}\nизоляция данных"]
+    end
+
+    subgraph FACADE["GraphRAG — фасад (graph_rag.py)"]
+        Q["query(user_id, user_query)"]
+        Q --> R1["retriever.retrieve()"]
+        R1 --> G1["generator.generate()"]
+        G1 --> OUT["RAGResponse\nanswer + context + latency"]
+    end
+
+    subgraph RET["GraphRetriever — retrieval"]
+        EMB_Q["LocalEmbeddingModel.embed_query()\nпрефикс: query:"]
+        VS["vector_search()\nlimit=5, threshold≥0.3"]
+        EP["entry_points\nдо 5 ZettelNode"]
+        LOOP["для каждой entry point:\nget_context(hops=1)"]
+        EXP["expanded_nodes\n+ entities + paths"]
+        RC["RetrievedContext"]
+        EMB_Q --> VS --> EP --> LOOP --> EXP --> RC
+    end
+
+    subgraph NEO["Neo4j (ZettelRepository)"]
+        DB_Z["Zettel\ncontent, embedding[768],\nluhmann_id, thought_type"]
+        DB_E["Entity\nname, mention_count"]
+        E1["CHILD_OF → parent / children"]
+        E2["MENTIONS → entities"]
+        E3["RELATED_TO → related\n(читается, если есть)"]
+    end
+
+    subgraph GEN["RAGGenerator — generation"]
+        FMT["to_context_string()\nгруппировка по типам"]
+        LLM["ChatOpenAI\ngoogle/gemini-2.5-flash\nT=0.3"]
+        FMT --> LLM
+    end
+
+    subgraph EMB["Embedding (локально)"]
+        M["intfloat/multilingual-e5-base\n768 dim · CUDA/MPS/CPU"]
+    end
+
+    U --> UID --> Q
+    R1 --> EMB_Q
+    VS --> DB_Z
+    LOOP --> E1 & E2 & E3
+    E1 & E2 & E3 --> DB_Z & DB_E
+    RC --> FMT
+    LLM --> OUT --> U
+    M -.-> EMB_Q
+    M -.-> DB_Z
+```
+
+#### Компоненты и их связь
+
+| Компонент | Класс / файл | Вход | Выход | Хранилище |
+|-----------|--------------|------|-------|-----------|
+| Telegram-бот | `main.py` | текст вопроса | HTML-ответ пользователю | PostgreSQL (лог) |
+| Фасад | `GraphRAG` · `graph_rag.py` | `user_id`, `query` | `RAGResponse` | — |
+| Retriever | `GraphRetriever` · `graph_rag.py` | вопрос + `user_id` | `RetrievedContext` | Neo4j (read) |
+| Generator | `RAGGenerator` · `graph_rag.py` | вопрос + контекст | строка-ответ | — (LLM API) |
+| Repository | `ZettelRepository` · `repository.py` | Cypher-запросы | `ZettelNode`, `EntityNode` | Neo4j |
+| Embedding | `LocalEmbeddingModel` · `linker.py` | текст | `float[768]` | локально (HF) |
+
+#### Параметры (продакшн, `settings.py`)
+
+| Параметр | Значение | Назначение |
+|----------|----------|------------|
+| `graphrag_model_name` | `google/gemini-2.5-flash` | LLM для генерации ответа |
+| `graphrag_temperature` | `0.3` | Температура генерации |
+| `graphrag_search_limit` | `5` | Макс. entry points (top-K) |
+| `graphrag_similarity_threshold` | `0.3` | Мин. cosine similarity для кандидата |
+| `graphrag_context_hops` | `1` | Глубина обхода `RELATED_TO` |
+| `embedding_model_name` | `intfloat/multilingual-e5-base` | Модель эмбеддингов (768 dim) |
+
+#### Этап 1 — Retriever: векторный поиск
+
+```mermaid
+flowchart LR
+    Q["Вопрос"] --> P["query: {text}"]
+    P --> V["вектор 768 dim"]
+    V --> C["Neo4j: все Zettel\nuser_id = ..."]
+    C --> COS["cosine similarity\n(numpy, Python)"]
+    COS --> F["score ≥ 0.3"]
+    F --> T["sort DESC → top-5"]
+    T --> EP["entry_points"]
+```
+
+| Шаг | Что происходит | Детали |
+|-----|----------------|--------|
+| 1 | Эмбеддинг вопроса | `embed_query()` → префикс `"query: "`, L2-нормализация |
+| 2 | Загрузка карточек | Cypher: все `Zettel` пользователя с `embedding IS NOT NULL` |
+| 3 | Scoring | Cosine similarity между вектором вопроса и каждой карточкой |
+| 4 | Фильтрация | Отбрасываются карточки с `score < 0.3` |
+| 5 | Top-K | Сортировка по убыванию → **не более 5** entry points |
+
+> Vector index Neo4j **не используется** для поиска: индекс не фильтрует по `user_id`. Для персональной базы (сотни–тысячи карточек) brute-force в Python достаточно быстр.
+
+Если `entry_points` пуст → retriever возвращает пустой контекст → generator отдаёт `graphrag_no_context_response` **без вызова LLM**.
+
+#### Этап 2 — Retriever: обход графа
+
+Для **каждой** из ≤5 entry points вызывается `get_context(user_id, zettel_id, hops=1)`:
+
+```mermaid
+flowchart TD
+    EP["entry point [1.1]"] --> P["parent\nCHILD_OF ← (1)"]
+    EP --> C["children\nCHILD_OF → (...)"]
+    EP --> R["related\nRELATED_TO ↔ (...)\nдо 1 hop, limit 10"]
+    EP --> EN["entities\nMENTIONS → Entity"]
+
+    P --> RC["RetrievedContext"]
+    C --> RC
+    R --> RC
+    EN --> RC
+
+    RC --> DEDUP["дедупликация по zettel_id"]
+    DEDUP --> PATHS["paths: текстовые\nописания связей"]
+```
+
+| Связь Neo4j | Cypher-направление | Что добавляется в контекст |
+|-------------|-------------------|---------------------------|
+| `CHILD_OF` | `(child)-[:CHILD_OF]->(parent)` | Родитель entry point (1 узел) |
+| `CHILD_OF` | `(child)-[:CHILD_OF]->(entry)` | Все прямые дочерние узлы |
+| `RELATED_TO` | `(z)-[:RELATED_TO*1..1]-(related)` | До 10 соседних по горизонтали |
+| `MENTIONS` | `(z)-[:MENTIONS]->(e:Entity)` | Сущности-теги карточки |
+
+**Дедупликация:** один `zettel_id` не попадает в контекст дважды, даже если связан с несколькими entry points.
+
+> **Примечание:** рёбра `RELATED_TO` **читаются** при обходе, но Linker **не создаёт** их автоматически. В типичном графе расширение идёт через `CHILD_OF` и `MENTIONS`; горизонтальные связи появятся только при ручном добавлении в Neo4j или будущей доработке Linker.
+
+#### Этап 3 — Generator: сборка промпта и LLM
+
+```mermaid
+flowchart LR
+    RC["RetrievedContext"] --> FMT["to_context_string()"]
+    FMT --> S1["## FACT / ACTION / RISK / ..."]
+    FMT --> S2["## СВЯЗАННЫЕ СУЩНОСТИ\nдо 10"]
+    FMT --> S3["## СВЯЗИ МЕЖДУ МЫСЛЯМИ\nдо 5 paths"]
+    S1 & S2 & S3 --> PROMPT["user_prompt_template\n{context} + {query}"]
+    PROMPT --> LLM["gemini-2.5-flash\nsystem + user messages"]
+    LLM --> HTML["Ответ → HTML\nдля Telegram"]
+```
+
+| Элемент | Значение |
+|---------|----------|
+| LLM | `google/gemini-2.5-flash` через `ChatOpenAI` (OpenAI-compatible API) |
+| API | `LLM_API_KEY` + `LLM_BASE_URL` из `.env` |
+| Temperature | `0.3` |
+| Промпты | `config/prompts.py` → `graphrag_system_prompt`, `graphrag_user_prompt_template` |
+| Ограничения промпта | Только факты из контекста, без галлюцинаций, HTML-разметка |
+
+#### Сквозной поток данных (одним взглядом)
+
+```
+Пользователь: «Кто курирует DevSummit?»
+       │
+       ▼
+main.py: graphrag.query("tg_user_123", query)
+       │
+       ├─► GraphRetriever
+       │     ├─ embed_query → vector[768]
+       │     ├─ Neo4j vector_search → [1.1] sim=0.91, [1] sim=0.84, ... (≤5)
+       │     └─ get_context([1.1]) → parent [1], child [1.1a], entities [devsummit, олег_мишин]
+       │
+       ├─► RetrievedContext { entry_points, expanded_nodes, entities, paths }
+       │
+       └─► RAGGenerator
+             ├─ to_context_string() → текст по типам мыслей
+             └─ gemini-2.5-flash → «Конференцией DevSummit курирует Олег Мишин...»
+       │
+       ▼
+Telegram: HTML-ответ пользователю
+```
+
 ### 10.2 RAG vs GraphRAG
 
 ```

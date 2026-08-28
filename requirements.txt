@@ -25,3 +25,7 @@ torch
 pydantic
 pydantic-settings
 
+fastapi 
+uvicorn 
+python-multipart
+
