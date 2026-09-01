@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from config.settings import settings
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
 from telegram_bot.handlers import asr
+from telegram_bot.handlers.confluence import get_confluence_page_content
 from telegram_bot.handlers.pdf_reader import read_pdf
 from telegram_bot.handlers.txt_reader import read_txt
 from zettelkasten.atomizer import NoteAtomizer
@@ -262,7 +263,7 @@ input[type="file"] { width: 100%; padding: 14px; background: var(--card); border
 input[type="file"]::file-selector-button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin-right: 12px; }
 
 /* Tabs */
-.tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
 .tab { flex: 1; padding: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 14px; text-align: center; cursor: pointer; transition: all 0.2s; }
 .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .tab-content { display: none; }
@@ -660,6 +661,7 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
             <div class="tab active" onclick="showTab('text', this)">📝 Текст</div>
             <div class="tab" onclick="showTab('file', this)">📄 Файл</div>
             <div class="tab" onclick="showTab('voice', this)">🎤 Голос</div>
+            <div class="tab" onclick="showTab('confluence', this)">🔗 Confluence</div>
         </div>
         
         <div id="tab-text" class="tab-content active">
@@ -682,6 +684,16 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
                 <button type="submit" class="btn">Распознать</button>
             </form>
         </div>
+        
+        <div id="tab-confluence" class="tab-content">
+            <form action="/add/confluence" method="post" onsubmit="return submitConfluence(this)">
+                <div class="form-group">
+                    <label>Извлечь из страницы Confluence</label>
+                    <input type="text" name="url" placeholder="Вставьте ссылку на страницу Confluence..." required>
+                </div>
+                <button type="submit" class="btn">Извлечь</button>
+            </form>
+        </div>
     </div>
     """
     
@@ -691,6 +703,15 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         el.classList.add('active');
         document.getElementById('tab-' + name).classList.add('active');
+    }
+    function submitConfluence(form) {
+        const inp = form.querySelector('input[name="url"]');
+        if (!inp || !inp.value.trim()) {
+            if (inp) inp.focus();
+            return false;
+        }
+        showLoading('Загрузка Confluence', 'Извлечение текста и добавление в граф знаний');
+        return true;
     }
     """
     return HTMLResponse(html_page("Добавить", body, js))
@@ -772,6 +793,46 @@ async def add_voice(request: Request, file: UploadFile = File(None)):
         inp.unlink(missing_ok=True)
         if wav != inp:
             wav.unlink(missing_ok=True)
+
+
+CONFLUENCE_HOST = "confluence.domen.ru"
+
+
+def _is_confluence_fetch_error(text: str) -> bool:
+    t = (text or "").strip()
+    return (
+        not t
+        or t.startswith("Ошибка URL:")
+        or t.startswith("Отсутствует доступ к странице")
+        or t.startswith("Произошла ошибка при загрузке страницы:")
+    )
+
+
+@app.post("/add/confluence")
+async def add_confluence(request: Request, url: str = Form("")):
+    if not check_auth(request):
+        return RedirectResponse("/login", status_code=303)
+    user = get_user(request)
+    page_url = url.strip()
+
+    if not page_url:
+        return RedirectResponse("/add?msg=Вставьте ссылку на страницу Confluence&st=err", status_code=303)
+
+    if CONFLUENCE_HOST not in page_url.lower():
+        return RedirectResponse(
+            f"/add?msg={escape('Ссылка должна быть на Confluence и содержать в себе confluence.domen.ru')}&st=err",
+            status_code=303,
+        )
+
+    text = await asyncio.get_running_loop().run_in_executor(None, get_confluence_page_content, page_url)
+    if _is_confluence_fetch_error(text):
+        err = text.strip() or "Не удалось извлечь текст со страницы Confluence"
+        log_event(user or "demo", page_url, "confluence", err)
+        return RedirectResponse(f"/add?msg={escape(err)}&st=err", status_code=303)
+
+    ok, ans = save_user_note(build_user_id(user or "demo"), text)
+    log_event(user or "demo", page_url, "confluence", ans)
+    return RedirectResponse(f"/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
 
 
 # ========== SEARCH (Chat style with formatting) ==========
