@@ -33,6 +33,7 @@ class RetrievedContext:
     expanded_nodes: List[ZettelNode] = field(default_factory=list)
     entities: List[EntityNode] = field(default_factory=list)
     paths: List[str] = field(default_factory=list)
+    project_labels: Dict[str, str] = field(default_factory=dict)
     
     @property
     def all_nodes(self) -> List[ZettelNode]:
@@ -56,7 +57,9 @@ class RetrievedContext:
         for thought_type, nodes in sorted(by_type.items()):
             lines.append(f"\n## {thought_type.upper()}")
             for node in nodes:
-                lines.append(f"• [{node.luhmann_id}] {node.content}")
+                project = self.project_labels.get(node.user_id or "", "")
+                source = f" | проект: {project}" if project else ""
+                lines.append(f"• [{node.luhmann_id}]{source} {node.content}")
         
         if self.entities:
             lines.append("\n## СВЯЗАННЫЕ СУЩНОСТИ")
@@ -119,18 +122,27 @@ class GraphRetriever:
         user_id: str,
         query: str,
         similarity_threshold: float = settings.graphrag_similarity_threshold,
+        user_ids: list[str] | None = None,
     ) -> RetrievedContext:
-        """Выполняет graphrag retrieval для конкретного пользователя."""
+        """Выполняет graphrag retrieval для конкретного пользователя или по всем проектам."""
         context = RetrievedContext()
         
         # шаг 1: векторный поиск точек входа в граф
         query_embedding = self.embedding_model.embed_query(query)
-        candidates = self.repository.vector_search(
-            user_id=user_id,
-            query_embedding=query_embedding,
-            limit=self.search_limit,
-            similarity_threshold=similarity_threshold,
-        )
+        if user_id == "__all__":
+            candidates = self.repository.vector_search_all(
+                query_embedding=query_embedding,
+                limit=self.search_limit,
+                similarity_threshold=similarity_threshold,
+                user_ids=user_ids,
+            )
+        else:
+            candidates = self.repository.vector_search(
+                user_id=user_id,
+                query_embedding=query_embedding,
+                limit=self.search_limit,
+                similarity_threshold=similarity_threshold,
+            )
         
         context.entry_points = [node for node, _ in candidates]
         
@@ -141,7 +153,10 @@ class GraphRetriever:
         
         # шаг 2: расширяем контекст — родители, дети, related, сущности
         for entry in context.entry_points:
-            node_context = self.repository.get_context(user_id, entry.zettel_id, hops=self.context_hops)
+            owner_id = entry.user_id or user_id
+            if owner_id == "__all__":
+                continue
+            node_context = self.repository.get_context(owner_id, entry.zettel_id, hops=self.context_hops)
             
             if not node_context:
                 continue
@@ -265,6 +280,11 @@ class RAGGenerator:
             context=context_str,
             query=query,
         )
+        if context.project_labels:
+            user_prompt += (
+                "\nЕсли у мыслей указан проект, в ответе явно называй, "
+                "из какого проекта взята мысль."
+            )
         
         response = self.llm.invoke([
             SystemMessage(content=self.system_prompt),
@@ -311,8 +331,10 @@ class GraphRAG:
         user_id: str,
         user_query: str,
         similarity_threshold: float | None = None,
+        user_ids: list[str] | None = None,
+        project_labels: dict[str, str] | None = None,
     ) -> RAGResponse:
-        """Отвечает на вопрос пользователя, используя только его граф знаний."""
+        """Отвечает на вопрос, используя граф пользователя или все проекты."""
         import time
         start = time.time()
         
@@ -321,7 +343,9 @@ class GraphRAG:
             if similarity_threshold is None
             else similarity_threshold
         )
-        context = self.retriever.retrieve(user_id, user_query, threshold)
+        context = self.retriever.retrieve(user_id, user_query, threshold, user_ids=user_ids)
+        if project_labels:
+            context.project_labels = project_labels
         answer = self.generator.generate(user_query, context)
         
         elapsed_ms = int((time.time() - start) * 1000)

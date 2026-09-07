@@ -1,0 +1,36 @@
+{
+  "projects": [
+    {
+      "slug": "legacy_admin",
+      "name": "admin",
+      "graph_id": "web_admin",
+      "description": "все подряд",
+      "archived": false,
+      "created_at": "2026-09-07T14:03:24.733547+00:00"
+    },
+    {
+      "slug": "legacy_demo",
+      "name": "demo project",
+      "graph_id": "web_demo",
+      "description": "",
+      "archived": false,
+      "created_at": "2026-09-07T14:03:24.733560+00:00"
+    },
+    {
+      "slug": "test_project",
+      "name": "test project",
+      "graph_id": "proj_test_project",
+      "description": "exocortex",
+      "archived": false,
+      "created_at": "2026-09-07T14:41:26.895253+00:00"
+    },
+    {
+      "slug": "b2b_аудит",
+      "name": "b2b аудит",
+      "graph_id": "proj_b2b_аудит",
+      "description": "великий",
+      "archived": false,
+      "created_at": "2026-09-07T14:42:05.424621+00:00"
+    }
+  ]
+}

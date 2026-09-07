@@ -1,6 +1,7 @@
 # repository для работы с zettel-графом в neo4j
 # изоляция по user_id: каждый пользователь видит только свой граф
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
@@ -344,6 +345,43 @@ class ZettelRepository:
         result = self.client.execute_read(query, {"user_id": user_id})
         return result[0]["cnt"] if result else 0
 
+    def list_graph_ids(self, prefixes: Optional[List[str]] = None) -> List[str]:
+        """Возвращает уникальные user_id графов (для веб-проектов)."""
+        prefixes = prefixes or ["proj_", "web_"]
+        query = """
+        MATCH (z:Zettel)
+        WHERE z.user_id IS NOT NULL
+        RETURN DISTINCT z.user_id AS user_id
+        """
+        result = self.client.execute_read(query)
+        ids = [row["user_id"] for row in result if row.get("user_id")]
+        return [uid for uid in ids if any(uid.startswith(p) for p in prefixes)]
+
+    def total_count_many(self, user_ids: List[str]) -> int:
+        """Суммарное число карточек по списку графов."""
+        if not user_ids:
+            return 0
+        query = """
+        MATCH (z:Zettel)
+        WHERE z.user_id IN $user_ids
+        RETURN count(z) as cnt
+        """
+        result = self.client.execute_read(query, {"user_ids": user_ids})
+        return result[0]["cnt"] if result else 0
+
+    def delete_graph(self, user_id: str) -> int:
+        """Удаляет все мысли и сущности одного проекта."""
+        query = """
+        MATCH (n)
+        WHERE (n:Zettel OR n:Entity OR n:Source) AND n.user_id = $user_id
+        WITH collect(n) AS nodes
+        FOREACH (node IN nodes | DETACH DELETE node)
+        RETURN size(nodes) AS deleted_count
+        """
+        result = self.client.execute_write(query, {"user_id": user_id})
+        self._max_root_id_cache.pop(user_id, None)
+        return result[0]["deleted_count"] if result else 0
+
     def delete_zettel(self, user_id: str, zettel_id: str) -> Optional[Dict[str, Any]]:
         """
         Удаляет выбранную мысль и её дочернее поддерево.
@@ -448,6 +486,56 @@ class ZettelRepository:
                 node.similarity = score
                 candidates.append((node, score))
         
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:limit]
+
+    def vector_search_all(
+        self,
+        query_embedding: List[float],
+        limit: int = 5,
+        similarity_threshold: float = 0.3,
+        user_ids: Optional[List[str]] = None,
+    ) -> List[Tuple[ZettelNode, float]]:
+        """Семантический поиск по нескольким графам или по всем веб-проектам."""
+        import numpy as np
+
+        if user_ids is not None and not user_ids:
+            return []
+
+        if user_ids:
+            query = """
+            MATCH (z:Zettel)
+            WHERE z.embedding IS NOT NULL AND z.user_id IN $user_ids
+            RETURN z
+            """
+            params = {"user_ids": user_ids}
+        else:
+            query = """
+            MATCH (z:Zettel)
+            WHERE z.embedding IS NOT NULL
+              AND (z.user_id STARTS WITH 'proj_' OR z.user_id STARTS WITH 'web_')
+            RETURN z
+            """
+            params = {}
+
+        result = self.client.execute_read(query, params)
+        if not result:
+            return []
+
+        query_vec = np.array(query_embedding)
+        query_norm = np.linalg.norm(query_vec)
+        candidates = []
+        for row in result:
+            z = row["z"]
+            emb = np.array(z["embedding"])
+            emb_norm = np.linalg.norm(emb)
+            if emb_norm < 1e-10 or query_norm < 1e-10:
+                continue
+            score = float(np.dot(query_vec, emb) / (query_norm * emb_norm))
+            if score >= similarity_threshold:
+                node = self._node_to_zettel(z)
+                node.similarity = score
+                candidates.append((node, score))
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[:limit]
     
@@ -685,6 +773,44 @@ class ZettelRepository:
                 "to_id": row["to_id"],
                 "rel_type": row["rel_type"],
             })
+
+        return {"zettels": zettels, "entities": entities, "edges": edges}
+
+    def export_graph_data_combined(
+        self,
+        user_ids: List[str],
+        labels: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Собирает графы нескольких проектов в один, без пересечения Luhmann ID."""
+        labels = labels or {}
+        zettels, entities, edges = [], [], []
+        seen_entities = set()
+
+        for uid in user_ids:
+            data = self.export_graph_data(uid)
+            label = labels.get(uid, uid)
+            short = re.sub(r"\s+", " ", label).strip()[:18] or uid
+            for z in data["zettels"]:
+                item = dict(z)
+                item["luhmann_id"] = f"{short}/{z['luhmann_id']}"
+                if z.get("parent_luhmann"):
+                    item["parent_luhmann"] = f"{short}/{z['parent_luhmann']}"
+                zettels.append(item)
+            for e in data["entities"]:
+                key = f"{uid}::{e['name']}"
+                if key in seen_entities:
+                    continue
+                seen_entities.add(key)
+                item = dict(e)
+                item["name"] = key
+                item["display_name"] = e.get("display_name", e["name"])
+                entities.append(item)
+            for edge in data["edges"]:
+                item = dict(edge)
+                if str(item.get("to_id", "")).startswith("entity:"):
+                    raw = item["to_id"][7:]
+                    item["to_id"] = f"entity:{uid}::{raw}"
+                edges.append(item)
 
         return {"zettels": zettels, "entities": entities, "edges": edges}
 

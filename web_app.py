@@ -1,12 +1,13 @@
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
@@ -17,17 +18,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from config.settings import settings
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
 from telegram_bot.handlers import asr
-from telegram_bot.handlers.confluence import get_confluence_page_content
+from telegram_bot.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
 from telegram_bot.handlers.pdf_reader import read_pdf
 from telegram_bot.handlers.txt_reader import read_txt
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG
-from zettelkasten.graph_visualizer import generate_graph_html_from_repo
-from zettelkasten.linker import GraphLinker, LinkAction, LocalEmbeddingModel
+from zettelkasten.graph_visualizer import generate_graph_html_from_data, generate_graph_html_from_repo
+from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
 
 load_dotenv()
 
-app = FastAPI(title="Executive Exocortex Web App")
+app = FastAPI(title="Project Exocortex Web App")
 
 create_database()
 create_tables()
@@ -59,16 +60,165 @@ graphrag = GraphRAG(
 )
 
 DELETE_CACHE: dict[str, list[dict]] = {}
-DEMO_USERS = {"admin": "admin123", "demo": "demo", "nastya": "1234"}
+COMMON_SLUG = "all"
+PROJECTS_FILE = Path(__file__).resolve().parent / "storage" / "web_projects.json"
+RESERVED_SLUGS = {COMMON_SLUG, "login", "home", "overview", "projects", "api"}
+PROJECT_ACCENTS = ["#6366f1", "#a855f7", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6"]
+MAX_PROJECT_DESC = 240
+EDIT_ICON = (
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>'
+)
 
 
-def build_user_id(raw_user: str) -> str:
-    clean = "".join(ch for ch in raw_user.strip() if ch.isalnum() or ch in "_-.")
-    return f"web_{clean or 'demo'}"
+def slugify_project(name: str) -> str:
+    text = " ".join(name.strip().lower().split())
+    text = re.sub(r"[\s]+", "_", text)
+    text = "".join(ch for ch in text if ch.isalnum() or ch in "_-")
+    return (text[:48] or uuid.uuid4().hex[:8]).strip("_-")
 
 
-def pseudo_numeric_user_id(raw_user: str) -> int:
-    return abs(hash(raw_user)) % 2_000_000_000
+def project_accent(slug: str) -> str:
+    digest = hashlib.md5(slug.encode("utf-8")).hexdigest()
+    return PROJECT_ACCENTS[int(digest, 16) % len(PROJECT_ACCENTS)]
+
+
+def _normalize_project(item: dict) -> dict:
+    item.setdefault("description", "")
+    item.setdefault("archived", False)
+    return item
+
+
+def load_projects() -> list[dict]:
+    if not PROJECTS_FILE.exists():
+        return []
+    try:
+        data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+        return [_normalize_project(p) for p in (data.get("projects") or []) if isinstance(p, dict)]
+    except Exception as e:
+        print(f"[web_app] projects load warning: {e}")
+        return []
+
+
+def save_projects(projects: list[dict]) -> None:
+    PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROJECTS_FILE.write_text(
+        json.dumps({"projects": projects}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def sync_projects_from_graph() -> list[dict]:
+    """Подтягивает графы из Neo4j, чтобы старые данные не потерялись."""
+    projects = load_projects()
+    by_graph = {p.get("graph_id"): p for p in projects if p.get("graph_id")}
+    by_slug = {p.get("slug"): p for p in projects if p.get("slug")}
+    changed = False
+    try:
+        graph_ids = linker.repository.list_graph_ids()
+    except Exception as e:
+        print(f"[web_app] graph sync warning: {e}")
+        graph_ids = []
+
+    for gid in graph_ids:
+        if gid in by_graph:
+            continue
+        if gid.startswith("proj_"):
+            slug = gid[5:] or uuid.uuid4().hex[:8]
+            name = slug.replace("_", " ")
+        elif gid.startswith("web_"):
+            slug = f"legacy_{gid[4:]}"[:48]
+            name = gid[4:] or gid
+        else:
+            continue
+        base = slug
+        n = 2
+        while slug in by_slug or slug in RESERVED_SLUGS:
+            slug = f"{base}_{n}"
+            n += 1
+        item = {
+            "slug": slug,
+            "name": name,
+            "graph_id": gid,
+            "description": "",
+            "archived": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        projects.append(item)
+        by_graph[gid] = item
+        by_slug[slug] = item
+        changed = True
+
+    if changed:
+        save_projects(projects)
+    return projects
+
+
+def get_project(slug: str) -> dict | None:
+    for item in load_projects():
+        if item.get("slug") == slug:
+            return item
+    return None
+
+
+def project_labels_map(projects: list[dict] | None = None) -> dict[str, str]:
+    projects = projects if projects is not None else load_projects()
+    return {
+        p["graph_id"]: p.get("name") or p["slug"]
+        for p in projects
+        if p.get("graph_id")
+    }
+
+
+def update_project(slug: str, **fields) -> dict | None:
+    projects = load_projects()
+    for item in projects:
+        if item.get("slug") == slug:
+            item.update(fields)
+            save_projects(projects)
+            return item
+    return None
+
+
+def remove_project(slug: str) -> dict | None:
+    projects = load_projects()
+    item = next((p for p in projects if p.get("slug") == slug), None)
+    if not item:
+        return None
+    save_projects([p for p in projects if p.get("slug") != slug])
+    return item
+
+
+def resolve_scope(slug: str) -> dict | None:
+    if slug == COMMON_SLUG:
+        projects = sync_projects_from_graph()
+        active = [p for p in projects if p.get("graph_id") and not p.get("archived")]
+        graph_ids = [p["graph_id"] for p in active]
+        return {
+            "slug": COMMON_SLUG,
+            "name": "Общий граф",
+            "graph_id": "__all__",
+            "graph_ids": graph_ids,
+            "project_labels": project_labels_map(active),
+            "readonly": True,
+            "description": "",
+            "archived": False,
+        }
+    projects = sync_projects_from_graph()
+    item = next((p for p in projects if p.get("slug") == slug), None)
+    if not item:
+        return None
+    return {
+        "slug": item["slug"],
+        "name": item.get("name") or item["slug"],
+        "graph_id": item["graph_id"],
+        "graph_ids": [item["graph_id"]],
+        "project_labels": {item["graph_id"]: item.get("name") or item["slug"]},
+        "readonly": False,
+        "description": (item.get("description") or "").strip(),
+        "archived": bool(item.get("archived")),
+    }
 
 
 def save_user_note(user_id: str, text: str) -> tuple[bool, str]:
@@ -78,28 +228,26 @@ def save_user_note(user_id: str, text: str) -> tuple[bool, str]:
     )
     if isinstance(raw_cards, str):
         return False, f"Ошибка: {raw_cards}"
-    results = linker.link_and_insert(user_id=user_id, new_cards=raw_cards)
-    actions_count = {a: 0 for a in LinkAction}
-    for r in results:
-        actions_count[r.action] += 1
+    linker.link_and_insert(user_id=user_id, new_cards=raw_cards)
     stats = linker.get_user_stats(user_id)
     return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
 
 
-def log_event(raw_user: str, message_text: str, message_type: str, bot_answer: str) -> None:
+def log_event(scope_key: str, message_text: str, message_type: str, bot_answer: str) -> None:
     try:
-        update_history_messages(pseudo_numeric_user_id(raw_user), int(time.time() * 1000),
+        numeric = abs(hash(scope_key)) % 2_000_000_000
+        update_history_messages(numeric, int(time.time() * 1000),
             message_text, datetime.now(), message_type, bot_answer)
     except Exception as e:
         print(f"[web_app] log warning: {e}")
 
 
-def get_user(request: Request) -> str | None:
-    return request.cookies.get("web_user")
-
-
-def check_auth(request: Request) -> bool:
-    return request.cookies.get("web_auth") == "1"
+def project_nav(scope: dict) -> str:
+    return (
+        f'<a href="/" class="back-link">← Проекты</a>'
+        f'<div class="page-kicker">{escape(scope["name"])}'
+        f'{" · только просмотр" if scope["readonly"] else ""}</div>'
+    )
 
 
 def format_llm_response(text: str) -> str:
@@ -178,18 +326,18 @@ def format_llm_response(text: str) -> str:
 
 CSS = """
 :root {
-  --bg: #0a0a0f; --card: #12121a; --card2: #1a1a24;
-  --text: #fff; --text2: #e5e5e5; --muted: #6b7280; 
-  --accent: #6366f1; --accent2: #a855f7;
-  --success: #10b981; --error: #ef4444; --border: #1f1f2e;
-  --glow: rgba(99,102,241,0.15);
-  --code-bg: #1e1e2e;
-}
-[data-theme="light"] {
   --bg: #f8fafc; --card: #ffffff; --card2: #f1f5f9;
   --text: #0f172a; --text2: #334155; --muted: #64748b;
-  --border: #e2e8f0; --glow: rgba(99,102,241,0.1);
+  --accent: #6366f1; --accent2: #a855f7;
+  --success: #10b981; --error: #ef4444; --border: #e2e8f0;
+  --glow: rgba(99,102,241,0.1);
   --code-bg: #f1f5f9;
+}
+[data-theme="dark"] {
+  --bg: #0a0a0f; --card: #12121a; --card2: #1a1a24;
+  --text: #fff; --text2: #e5e5e5; --muted: #6b7280;
+  --border: #1f1f2e; --glow: rgba(99,102,241,0.15);
+  --code-bg: #1e1e2e;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -202,6 +350,57 @@ body {
 }
 .container { max-width: 480px; margin: 0 auto; padding: 20px 16px; min-height: 100vh; }
 .container.wide { max-width: 600px; }
+.container.hub { max-width: 880px; }
+.page-kicker { color: var(--muted); font-size: 13px; margin: 4px 0 12px; }
+.readonly-banner { background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(168,85,247,0.12)); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; margin-bottom: 16px; font-size: 14px; color: var(--text2); line-height: 1.5; }
+.hub-hero { text-align: center; padding: 28px 0 8px; }
+.hub-hero h1 { font-size: 32px; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.hub-hero p { color: var(--muted); margin-top: 8px; font-size: 15px; }
+.hub-search { width: 100%; padding: 14px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; margin: 16px 0 20px; }
+.hub-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); }
+.common-card { display: block; text-decoration: none; color: inherit; background: linear-gradient(135deg, rgba(99,102,241,0.18), rgba(168,85,247,0.12)); border: 1px solid rgba(99,102,241,0.45); border-radius: 20px; padding: 22px; margin-bottom: 22px; transition: transform 0.2s, box-shadow 0.2s; }
+.common-card:hover { transform: translateY(-3px); box-shadow: 0 16px 40px var(--glow); }
+.common-card h2 { font-size: 20px; margin-bottom: 6px; }
+.common-card p { color: var(--text2); font-size: 14px; line-height: 1.5; }
+.common-meta { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.section-title { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 8px 0 12px; }
+.project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; margin-bottom: 24px; }
+.project-card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; min-height: 130px; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s; position: relative; overflow: hidden; }
+.project-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px; background: var(--dot, var(--accent)); }
+.project-card:hover { transform: translateY(-3px); border-color: var(--dot, var(--accent)); box-shadow: 0 10px 28px var(--glow); }
+.project-card-link { display: block; padding: 18px 40px 18px 18px; color: inherit; text-decoration: none; min-height: 130px; }
+.project-card h3 { font-size: 16px; margin-bottom: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.project-card p { color: var(--muted); font-size: 13px; }
+.project-card .desc { color: var(--text2); font-size: 13px; line-height: 1.45; margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.project-card.archived { opacity: 0.58; }
+.project-card .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--card2); color: var(--muted); font-weight: 500; }
+.icon-edit { position: absolute; top: 12px; right: 10px; z-index: 2; width: 30px; height: 30px; border: none; background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.35; transition: opacity 0.15s, background 0.15s, color 0.15s; }
+.project-card:hover .icon-edit, .icon-edit:focus { opacity: 1; }
+.icon-edit:hover { background: var(--card2); color: var(--accent); }
+.icon-edit.inline { position: static; opacity: 0.4; flex-shrink: 0; }
+.icon-edit.inline:hover { opacity: 1; }
+.project-card.create-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; width: 100%; background: transparent; border: 1.5px dashed var(--border); opacity: 0.5; cursor: pointer; color: var(--muted); padding: 18px; font: inherit; }
+.project-card.create-card::before { opacity: 0.25; background: var(--muted); }
+.project-card.create-card:hover { opacity: 0.95; border-color: var(--accent); color: var(--text); background: rgba(99,102,241,0.04); }
+.create-plus { font-size: 38px; font-weight: 300; line-height: 1; color: var(--accent); }
+.create-label { font-size: 13px; }
+.hub-tools { display: flex; justify-content: flex-end; margin: -4px 0 12px; }
+.hub-tools label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.title-row { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap; }
+.title-row h1 { margin: 0; }
+.project-desc { color: var(--text2); font-size: 15px; line-height: 1.6; margin-top: 10px; }
+.project-desc.empty { color: var(--muted); font-style: italic; }
+.project-count { color: var(--muted); font-size: 13px; margin-top: 10px; }
+.meta-actions { display: flex; gap: 10px; margin: 8px 0 28px; }
+.meta-actions form { flex: 1; margin: 0; }
+.btn-ghost { display: block; width: 100%; padding: 12px 10px; background: transparent; border: 1px solid var(--border); border-radius: 12px; color: var(--muted); font-size: 13px; cursor: pointer; transition: all 0.15s; }
+.btn-ghost:hover { border-color: var(--accent); color: var(--text); background: var(--card); }
+.btn-ghost.danger { color: var(--error); border-color: rgba(239,68,68,0.35); }
+.btn-ghost.danger:hover { background: rgba(239,68,68,0.08); border-color: var(--error); }
+.empty-projects { color: var(--muted); font-size: 14px; padding: 12px 0 20px; }
+.archived-banner { background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.35); color: #f59e0b; border-radius: 14px; padding: 14px 16px; margin-bottom: 16px; font-size: 14px; line-height: 1.5; }
+.source-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.source-chip { font-size: 11px; padding: 4px 10px; border-radius: 999px; background: rgba(99,102,241,0.14); border: 1px solid rgba(99,102,241,0.35); color: var(--text2); }
 
 /* Theme toggle */
 .theme-toggle { position: fixed; top: 16px; right: 16px; z-index: 100; background: var(--card); border: 1px solid var(--border); border-radius: 50%; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 20px; transition: all 0.2s; }
@@ -231,6 +430,8 @@ body {
 .header { text-align: center; padding: 28px 0 20px; }
 .header h1 { font-size: 26px; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 .header p { color: var(--muted); font-size: 14px; margin-top: 4px; }
+.header .project-desc { color: var(--text2); font-size: 15px; line-height: 1.6; margin-top: 10px; }
+.header .project-desc.empty { color: var(--muted); font-style: italic; }
 .user-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 20px; font-size: 13px; color: var(--muted); margin-bottom: 16px; }
 .user-pill a { color: var(--accent); text-decoration: none; margin-left: 8px; }
 .user-pill a:hover { text-decoration: underline; }
@@ -307,8 +508,8 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .delete-card .card-preview { font-size: 14px; color: var(--text2); line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* Loading */
-.loading-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(10,10,15,0.92); display: none; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(8px); }
-[data-theme="light"] .loading-overlay { background: rgba(248,250,252,0.92); }
+.loading-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(248,250,252,0.92); display: none; align-items: center; justify-content: center; z-index: 1100; backdrop-filter: blur(8px); }
+[data-theme="dark"] .loading-overlay { background: rgba(10,10,15,0.92); }
 .loading-overlay.active { display: flex; }
 .loading-box { text-align: center; }
 .spinner { width: 56px; height: 56px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
@@ -322,8 +523,8 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 @keyframes progress { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
 
 /* Particles */
-.particles { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; z-index: -1; }
-[data-theme="light"] .particles { opacity: 0.5; }
+.particles { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; z-index: -1; opacity: 0.5; }
+[data-theme="dark"] .particles { opacity: 1; }
 .particle { position: absolute; width: 4px; height: 4px; background: var(--accent); border-radius: 50%; opacity: 0.3; animation: float 15s infinite; }
 @keyframes float { 0%, 100% { transform: translateY(100vh) rotate(0deg); opacity: 0; } 10% { opacity: 0.3; } 90% { opacity: 0.3; } }
 
@@ -337,31 +538,48 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 }
 .spray-dot {
   position: fixed;
-  width: 8px;
-  height: 8px;
+  width: 110px;
+  height: 110px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(168,85,247,0.95) 0%, rgba(99,102,241,0.45) 65%, rgba(99,102,241,0) 100%);
+  background: radial-gradient(circle, rgba(99,102,241,0.22) 0%, rgba(168,85,247,0.12) 38%, rgba(99,102,241,0) 72%);
   transform: translate(-50%, -50%);
-  filter: blur(0.2px);
-  animation: spray-burst 680ms ease-out forwards;
-  will-change: transform, opacity;
+  filter: blur(22px);
+  animation: spray-haze 1.55s ease-out forwards;
+  will-change: transform, opacity, filter;
+  pointer-events: none;
 }
-[data-theme="light"] .spray-dot {
-  background: radial-gradient(circle, rgba(99,102,241,0.8) 0%, rgba(168,85,247,0.35) 65%, rgba(168,85,247,0) 100%);
+[data-theme="dark"] .spray-dot {
+  background: radial-gradient(circle, rgba(168,85,247,0.28) 0%, rgba(99,102,241,0.16) 40%, rgba(99,102,241,0) 72%);
 }
-@keyframes spray-burst {
-  0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.9); }
-  100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(0.2); }
+.spray-follow {
+  position: fixed;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(99,102,241,0.16) 0%, rgba(168,85,247,0.08) 42%, transparent 70%);
+  transform: translate(-50%, -50%);
+  filter: blur(28px);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s;
+}
+[data-theme="dark"] .spray-follow {
+  background: radial-gradient(circle, rgba(168,85,247,0.22) 0%, rgba(99,102,241,0.1) 45%, transparent 72%);
+}
+@keyframes spray-haze {
+  0% { opacity: 0.55; transform: translate(-50%, -50%) scale(0.55); filter: blur(16px); }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(1.85); filter: blur(34px); }
 }
 
 /* Modal */
-.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(10,10,15,0.92); display: none; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(8px); padding: 20px; }
-[data-theme="light"] .modal-overlay { background: rgba(248,250,252,0.92); }
+.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(248,250,252,0.92); display: none; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(8px); padding: 20px; }
+[data-theme="dark"] .modal-overlay { background: rgba(10,10,15,0.92); }
 .modal-overlay.active { display: flex; }
 .modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 28px; max-width: 450px; width: 100%; animation: modalIn 0.25s ease; }
 @keyframes modalIn { from { opacity: 0; transform: scale(0.95) translateY(10px); } to { opacity: 1; transform: scale(1) translateY(0); } }
 .modal-box h3 { margin-bottom: 12px; font-size: 18px; }
 .modal-box p { color: var(--muted); font-size: 14px; margin-bottom: 16px; }
+.modal-box textarea { min-height: 88px; background: var(--bg); }
 .modal-box .quote { background: var(--card2); padding: 16px; border-radius: 12px; margin-bottom: 20px; font-size: 14px; line-height: 1.6; color: var(--text2); max-height: 200px; overflow-y: auto; border-left: 3px solid var(--accent); }
 .modal-box .card-id { font-size: 12px; color: var(--accent); margin-bottom: 8px; font-weight: 500; }
 .modal-btns { display: flex; gap: 12px; }
@@ -375,7 +593,7 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 JS_COMMON = """
 // Theme
 function initTheme() {
-    const saved = localStorage.getItem('theme') || 'dark';
+    const saved = localStorage.getItem('theme') || 'light';
     document.documentElement.setAttribute('data-theme', saved);
     updateThemeIcon();
 }
@@ -384,6 +602,7 @@ function toggleTheme() {
     const next = current === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('theme', next);
+    localStorage.setItem('exocortex_theme', next);
     updateThemeIcon();
 }
 function updateThemeIcon() {
@@ -394,6 +613,27 @@ function updateThemeIcon() {
     }
 }
 initTheme();
+
+function openModal(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('active');
+}
+function closeModal(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.remove('active');
+}
+document.addEventListener('click', function(e) {
+    if (e.target.classList && e.target.classList.contains('modal-overlay')) {
+        e.target.classList.remove('active');
+    }
+});
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        document.querySelectorAll('.modal-overlay.active').forEach(function(el) {
+            el.classList.remove('active');
+        });
+    }
+});
 
 // Loading
 function showLoading(text, subtext) {
@@ -449,46 +689,61 @@ document.addEventListener('keydown', function(e) {
     }
 })();
 
-// Mouse spray trail
+// Mouse haze trail
 (function() {
     const layer = document.getElementById('sprayLayer');
     if (!layer) return;
     if (window.matchMedia('(pointer: coarse)').matches) return;
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
-    let lastSpawn = 0;
-    const spawnEveryMs = 18;
+    const follow = document.createElement('div');
+    follow.className = 'spray-follow';
+    layer.appendChild(follow);
 
-    function spawnSpray(x, y, count) {
-        for (let i = 0; i < count; i++) {
-            const dot = document.createElement('div');
-            dot.className = 'spray-dot';
-            const angle = Math.random() * Math.PI * 2;
-            const radius = 8 + Math.random() * 24;
-            const dx = Math.cos(angle) * radius;
-            const dy = Math.sin(angle) * radius;
-            const size = 4 + Math.random() * 7;
-            dot.style.left = x + 'px';
-            dot.style.top = y + 'px';
-            dot.style.width = size + 'px';
-            dot.style.height = size + 'px';
-            dot.style.setProperty('--dx', dx.toFixed(2) + 'px');
-            dot.style.setProperty('--dy', dy.toFixed(2) + 'px');
-            layer.appendChild(dot);
-            dot.addEventListener('animationend', () => dot.remove(), { once: true });
-        }
+    let lastSpawn = 0;
+    let tx = 0, ty = 0, cx = 0, cy = 0, hasMove = false;
+
+    function spawnHaze(x, y) {
+        const puff = document.createElement('div');
+        puff.className = 'spray-dot';
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 6 + Math.random() * 18;
+        const size = 80 + Math.random() * 70;
+        puff.style.left = x + 'px';
+        puff.style.top = y + 'px';
+        puff.style.width = size + 'px';
+        puff.style.height = size + 'px';
+        puff.style.setProperty('--dx', (Math.cos(angle) * radius).toFixed(2) + 'px');
+        puff.style.setProperty('--dy', (Math.sin(angle) * radius - 8).toFixed(2) + 'px');
+        layer.appendChild(puff);
+        puff.addEventListener('animationend', () => puff.remove(), { once: true });
     }
 
     window.addEventListener('mousemove', function(e) {
+        tx = e.clientX;
+        ty = e.clientY;
+        if (!hasMove) {
+            cx = tx;
+            cy = ty;
+            hasMove = true;
+            follow.style.opacity = '1';
+        }
         const now = performance.now();
-        if (now - lastSpawn < spawnEveryMs) return;
+        if (now - lastSpawn < 42) return;
         lastSpawn = now;
-        spawnSpray(e.clientX, e.clientY, 2);
+        spawnHaze(e.clientX, e.clientY);
     });
 
-    window.addEventListener('click', function(e) {
-        spawnSpray(e.clientX, e.clientY, 10);
-    });
+    function tick() {
+        if (hasMove) {
+            cx += (tx - cx) * 0.14;
+            cy += (ty - cy) * 0.14;
+            follow.style.left = cx + 'px';
+            follow.style.top = cy + 'px';
+        }
+        requestAnimationFrame(tick);
+    }
+    tick();
 })();
 """
 
@@ -496,10 +751,11 @@ document.addEventListener('keydown', function(e) {
 def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool = True) -> str:
     theme_btn = '<button class="theme-toggle" onclick="toggleTheme()">🌙</button>' if show_theme_toggle else ''
     return f"""<!DOCTYPE html>
-<html lang="ru" data-theme="dark">
+<html lang="ru" data-theme="light">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+<script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>{CSS}</style>
@@ -522,140 +778,477 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 </html>"""
 
 
-# ========== AUTH ==========
+# ========== PROJECTS HUB ==========
 
 @app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    return RedirectResponse("/home", status_code=303)
+async def root(request: Request, msg: str = "", st: str = ""):
+    projects = sync_projects_from_graph()
+    counts = {}
+    total_all = 0
+    active_count = 0
+    archived_count = 0
+    try:
+        for p in projects:
+            n = linker.repository.total_count(p["graph_id"])
+            counts[p["slug"]] = n
+            if p.get("archived"):
+                archived_count += 1
+            else:
+                active_count += 1
+                total_all += n
+    except Exception as e:
+        print(f"[web_app] stats warning: {e}")
 
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request, error: str = ""):
-    if check_auth(request):
-        return RedirectResponse("/home", status_code=303)
-    
-    error_html = f'<div class="error-msg">{escape(error)}</div>' if error else ""
-    
-    body = f"""
-    <div class="container auth-wrap">
-        <div class="auth-box">
-            <div class="logo">
-                <h1>Executive Exocortex</h1>
-                <p>Цифровой экзокортекс топ-менеджера</p>
-            </div>
-            <div class="auth-card">
-                {error_html}
-                <form action="/login" method="post" onsubmit="showLoading('Вход в систему')">
-                    <div class="form-group">
-                        <label>Логин</label>
-                        <input type="text" name="username" placeholder="Введите логин" required autofocus>
-                    </div>
-                    <div class="form-group">
-                        <label>Пароль</label>
-                        <input type="password" name="password" placeholder="Введите пароль" required>
-                    </div>
-                    <button type="submit" class="btn">Войти</button>
-                </form>
-            </div>
-        </div>
-    </div>
-    """
-    return HTMLResponse(html_page("Вход — Executive Exocortex", body))
-
-
-@app.post("/login")
-async def login_submit(username: str = Form(""), password: str = Form("")):
-    username = username.strip()
-    password = password.strip()
-    
-    if not username or not password:
-        return RedirectResponse("/login?error=Введите логин и пароль", status_code=303)
-    
-    if DEMO_USERS.get(username) == password:
-        resp = RedirectResponse("/home", status_code=303)
-        resp.set_cookie("web_user", username, max_age=86400*30)
-        resp.set_cookie("web_auth", "1", max_age=86400*30)
-        return resp
-    
-    return RedirectResponse("/login?error=Неверный логин или пароль", status_code=303)
-
-
-@app.get("/logout")
-async def logout():
-    resp = RedirectResponse("/login", status_code=303)
-    resp.delete_cookie("web_user")
-    resp.delete_cookie("web_auth")
-    return resp
-
-
-# ========== HOME ==========
-
-@app.get("/home", response_class=HTMLResponse)
-async def home_page(request: Request):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
-    user = get_user(request)
-    
-    body = f"""
-    <div class="container">
-        <div class="header">
-            <h1>Executive Exocortex</h1>
-            <p>Ваша персональная база знаний</p>
-        </div>
-        
-        <div class="user-pill">
-            👤 {escape(user or 'demo')}
-            <a href="/logout">Выйти</a>
-        </div>
-        
-        <div class="welcome">
-            <h3>📥 Отправляйте:</h3>
-            <ul>
-                <li>голосовые сообщения</li>
-                <li>текстовые заметки</li>
-                <li>документы и файлы</li>
-            </ul>
-            <h3>🧠 Система автоматически:</h3>
-            <ul>
-                <li>распознает и анализирует информацию</li>
-                <li>связывает заметки по смыслу</li>
-                <li>формирует персональный граф знаний</li>
-            </ul>
-            <p>🔍 Задавайте вопросы и получайте релевантную информацию из базы знаний.</p>
-        </div>
-        
-        <a href="/add" class="menu-btn"><span class="icon">➕</span><span>Добавить новую заметку</span></a>
-        <a href="/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск мыслей по запросу</span></a>
-        <a href="/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
-        <a href="/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить заметку</span></a>
-    </div>
-    """
-    return HTMLResponse(html_page("Executive Exocortex", body))
-
-
-# ========== ADD ==========
-
-@app.get("/add", response_class=HTMLResponse)
-async def add_page(request: Request, msg: str = "", st: str = ""):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
     alert = ""
     if msg:
         cls = "alert-success" if st == "ok" else "alert-error"
         alert = f'<div class="alert {cls}">{escape(msg)}</div>'
-    
+
+    cards = ""
+    for p in sorted(projects, key=lambda x: (bool(x.get("archived")), (x.get("name") or "").lower())):
+        slug = p["slug"]
+        n = counts.get(slug, 0)
+        color = project_accent(slug)
+        archived = bool(p.get("archived"))
+        desc = (p.get("description") or "").strip()
+        desc_html = f'<div class="desc">{escape(desc)}</div>' if desc else ""
+        badge = '<span class="badge">архив</span>' if archived else ""
+        search_blob = escape(f"{p.get('name', slug)} {desc}".lower())
+        name = p.get("name") or slug
+        cards += f"""
+        <div class="project-card{' archived' if archived else ''}" data-name="{search_blob}" data-archived="{'1' if archived else '0'}" style="--dot:{color}">
+            <button type="button" class="icon-edit" title="Редактировать" aria-label="Редактировать проект"
+                data-slug="{escape(slug)}" data-name="{escape(name)}" data-desc="{escape(desc)}">{EDIT_ICON}</button>
+            <a class="project-card-link" href="/p/{escape(slug)}">
+                <h3><span>{escape(name)}</span>{badge}</h3>
+                {desc_html}
+                <p>{n} мыслей в графе</p>
+            </a>
+        </div>
+        """
+    cards += """
+        <button type="button" class="project-card create-card" id="openCreateModal" aria-label="Создать новый проект">
+            <span class="create-plus">+</span>
+            <span class="create-label">Создать новый проект</span>
+        </button>
+    """
+
+    archive_toggle = ""
+    if archived_count:
+        archive_toggle = f"""
+        <div class="hub-tools">
+            <label><input type="checkbox" id="showArchived"> Показать архив ({archived_count})</label>
+        </div>
+        """
+
+    body = f"""
+    <div class="container hub">
+        <div class="hub-hero">
+            <h1>Project Exocortex</h1>
+            <p>Пространство проектов: у каждого свой граф знаний, общий слой собирает всё вместе.</p>
+        </div>
+        {alert}
+        <input class="hub-search" id="hubSearch" type="search" placeholder="Найти проект по названию..." />
+
+        <a class="common-card" href="/p/{COMMON_SLUG}">
+            <h2>🌌 Общий граф</h2>
+            <p>Единый слой по активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять заметки. Архивные проекты в общий слой не входят.</p>
+            <div class="common-meta">{active_count} проектов · {total_all} мыслей</div>
+        </a>
+
+        <div class="section-title">Проекты</div>
+        {archive_toggle}
+        <div class="project-grid" id="projectGrid">{cards}</div>
+    </div>
+
+    <div class="modal-overlay" id="createModal">
+        <div class="modal-box">
+            <h3>Новый проект</h3>
+            <p>Название можно будет изменить позже.</p>
+            <form action="/projects/create" method="post" onsubmit="showLoading('Создание проекта')">
+                <div class="form-group">
+                    <label>Название</label>
+                    <input type="text" name="name" placeholder="Название проекта" required maxlength="80">
+                </div>
+                <div class="form-group">
+                    <label>Краткое описание</label>
+                    <textarea name="description" placeholder="О чём этот проект (необязательно)" maxlength="{MAX_PROJECT_DESC}"></textarea>
+                </div>
+                <div class="modal-btns">
+                    <button type="button" class="cancel" onclick="closeModal('createModal')">Отмена</button>
+                    <button type="submit" class="confirm" style="background:linear-gradient(135deg,var(--accent),var(--accent2))">Создать</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="editModal">
+        <div class="modal-box">
+            <h3>Редактировать проект</h3>
+            <form id="editForm" method="post">
+                <input type="hidden" name="next" value="/">
+                <div class="form-group">
+                    <label>Название</label>
+                    <input type="text" name="name" id="editName" required maxlength="80">
+                </div>
+                <div class="form-group">
+                    <label>Описание</label>
+                    <textarea name="description" id="editDesc" maxlength="{MAX_PROJECT_DESC}"></textarea>
+                </div>
+                <div class="modal-btns">
+                    <button type="button" class="cancel" onclick="closeModal('editModal')">Отмена</button>
+                    <button type="submit" class="confirm" style="background:linear-gradient(135deg,var(--accent),var(--accent2))">Сохранить</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    """
+    js = """
+    const search = document.getElementById('hubSearch');
+    const grid = document.getElementById('projectGrid');
+    const toggle = document.getElementById('showArchived');
+    function applyHubFilters() {
+        if (!grid) return;
+        const q = search ? search.value.trim().toLowerCase() : '';
+        const showArchived = toggle && toggle.checked;
+        grid.querySelectorAll('.project-card:not(.create-card)').forEach(function(card) {
+            const name = card.getAttribute('data-name') || '';
+            const archived = card.getAttribute('data-archived') === '1';
+            const match = !q || name.includes(q);
+            card.style.display = match && (!archived || showArchived) ? '' : 'none';
+        });
+    }
+    if (search) search.addEventListener('input', applyHubFilters);
+    if (toggle) toggle.addEventListener('change', applyHubFilters);
+    applyHubFilters();
+
+    const createBtn = document.getElementById('openCreateModal');
+    if (createBtn) createBtn.addEventListener('click', function() { openModal('createModal'); });
+
+    document.querySelectorAll('.icon-edit').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const form = document.getElementById('editForm');
+            form.action = '/p/' + btn.getAttribute('data-slug') + '/edit';
+            document.getElementById('editName').value = btn.getAttribute('data-name') || '';
+            document.getElementById('editDesc').value = btn.getAttribute('data-desc') || '';
+            openModal('editModal');
+        });
+    });
+    """
+    return HTMLResponse(html_page("Проекты — Project Exocortex", body, js))
+
+
+@app.post("/projects/create")
+async def create_project(name: str = Form(""), description: str = Form("")):
+    title = " ".join((name or "").split())
+    if not title:
+        return RedirectResponse("/?msg=Введите название проекта&st=err", status_code=303)
+    if len(title) > 80:
+        return RedirectResponse("/?msg=Название слишком длинное&st=err", status_code=303)
+
+    desc = " ".join((description or "").split())
+    if len(desc) > MAX_PROJECT_DESC:
+        return RedirectResponse("/?msg=Описание слишком длинное&st=err", status_code=303)
+
+    projects = sync_projects_from_graph()
+    if any((p.get("name") or "").strip().lower() == title.lower() for p in projects):
+        return RedirectResponse("/?msg=Проект с таким названием уже есть&st=err", status_code=303)
+
+    slug = slugify_project(title)
+    existing = {p["slug"] for p in projects}
+    if slug in RESERVED_SLUGS or slug in existing:
+        base = slug
+        n = 2
+        while f"{base}_{n}" in existing or f"{base}_{n}" in RESERVED_SLUGS:
+            n += 1
+        slug = f"{base}_{n}"
+
+    projects.append({
+        "slug": slug,
+        "name": title,
+        "graph_id": f"proj_{slug}",
+        "description": desc,
+        "archived": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_projects(projects)
+    return RedirectResponse(f"/p/{slug}", status_code=303)
+
+
+@app.get("/home")
+async def home_legacy():
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/login")
+async def login_legacy():
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/login")
+async def login_legacy_post():
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/logout")
+async def logout_legacy():
+    return RedirectResponse("/", status_code=303)
+
+
+# ========== PROJECT HOME ==========
+
+@app.get("/p/{slug}", response_class=HTMLResponse)
+async def project_home(slug: str, msg: str = "", st: str = ""):
+    scope = resolve_scope(slug)
+    if not scope:
+        return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+
+    alert = ""
+    if msg:
+        cls = "alert-success" if st == "ok" else "alert-error"
+        alert = f'<div class="alert {cls}">{escape(msg)}</div>'
+
+    if scope["readonly"]:
+        n = 0
+        try:
+            n = linker.repository.total_count_many(scope["graph_ids"])
+        except Exception:
+            pass
+        body = f"""
+        <div class="container">
+            {project_nav(scope)}
+            {alert}
+            <div class="header">
+                <h1>Общий граф</h1>
+                <p>Сводный слой знаний по активным проектам</p>
+            </div>
+            <div class="readonly-banner">Этот граф только для навигации и поиска. Новые заметки добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
+            <div class="msg-box">Сейчас объединено {n} мыслей из {len(scope["graph_ids"])} проектов.</div>
+            <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
+            <a href="/p/{COMMON_SLUG}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть общий граф</span></a>
+        </div>
+        """
+        return HTMLResponse(html_page("Общий граф", body))
+
+    n = 0
+    try:
+        n = linker.repository.total_count(scope["graph_id"])
+    except Exception:
+        pass
+    desc = scope.get("description") or ""
+    archived = bool(scope.get("archived"))
+    archived_banner = (
+        '<div class="archived-banner">Проект в архиве: он скрыт из общего графа и поиска по всем проектам.</div>'
+        if archived else ""
+    )
+    archive_action = "0" if archived else "1"
+    archive_label = "Вернуть из архива" if archived else "В архив"
+    desc_html = (
+        f'<p class="project-desc">{escape(desc)}</p>'
+        if desc
+        else '<p class="project-desc empty">Нет описания — нажмите карандаш, чтобы добавить.</p>'
+    )
+    name_js = json.dumps(scope["name"], ensure_ascii=False)
     body = f"""
     <div class="container">
-        <a href="/home" class="back-link">← На главную</a>
+        {project_nav(scope)}
+        {alert}
+        {archived_banner}
+        <div class="header">
+            <div class="title-row">
+                <h1>{escape(scope["name"])}</h1>
+                <button type="button" class="icon-edit inline" id="openEditModal" title="Редактировать" aria-label="Редактировать проект">{EDIT_ICON}</button>
+            </div>
+            {desc_html}
+            <p class="project-count">📚 {n} мыслей в проекте</p>
+        </div>
+        <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Добавить новую заметку</span></a>
+        <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск мыслей по запросу</span></a>
+        <a href="/p/{escape(slug)}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
+        <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить заметку</span></a>
+        <div class="meta-actions">
+            <form action="/p/{escape(slug)}/archive" method="post">
+                <input type="hidden" name="archived" value="{archive_action}">
+                <button type="submit" class="btn-ghost">{archive_label}</button>
+            </form>
+            <form action="/p/{escape(slug)}/destroy" method="post" onsubmit="return confirmDestroy(this)">
+                <button type="submit" class="btn-ghost danger">{"Удалить проект" if n > 0 else "Удалить пустой проект"}</button>
+            </form>
+        </div>
+    </div>
+    <div class="modal-overlay" id="editModal">
+        <div class="modal-box">
+            <h3>Редактировать проект</h3>
+            <form action="/p/{escape(slug)}/edit" method="post">
+                <div class="form-group">
+                    <label>Название</label>
+                    <input type="text" name="name" value="{escape(scope['name'])}" required maxlength="80">
+                </div>
+                <div class="form-group">
+                    <label>Описание</label>
+                    <textarea name="description" maxlength="{MAX_PROJECT_DESC}" placeholder="О чём этот проект">{escape(desc)}</textarea>
+                </div>
+                <div class="modal-btns">
+                    <button type="button" class="cancel" onclick="closeModal('editModal')">Отмена</button>
+                    <button type="submit" class="confirm" style="background:linear-gradient(135deg,var(--accent),var(--accent2))">Сохранить</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    """
+    js = f"""
+    const projectName = {name_js};
+    const thoughtCount = {n};
+    const openEdit = document.getElementById('openEditModal');
+    if (openEdit) openEdit.addEventListener('click', function() {{ openModal('editModal'); }});
+    function confirmDestroy(form) {{
+        if (thoughtCount > 0) {{
+            const typed = window.prompt('Чтобы удалить проект вместе с ' + thoughtCount + ' мыслями, введите его название:');
+            if (typed === null) return false;
+            if (typed.trim() !== projectName) {{
+                alert('Название не совпало. Проект не удалён.');
+                return false;
+            }}
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.name = 'confirm_name';
+            hidden.value = typed.trim();
+            form.appendChild(hidden);
+        }} else if (!confirm('Удалить пустой проект «' + projectName + '»?')) {{
+            return false;
+        }}
+        showLoading('Удаление проекта');
+        return true;
+    }}
+    """
+    return HTMLResponse(html_page(scope["name"], body, js))
+
+
+@app.post("/p/{slug}/edit")
+async def project_edit(
+    slug: str,
+    name: str = Form(""),
+    description: str = Form(""),
+    next: str = Form(""),
+):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    dest = "/" if next.strip() in {"/", "hub"} else f"/p/{slug}"
+    title = " ".join((name or "").split())
+    if not title:
+        return RedirectResponse(f"{dest}?msg=Введите название проекта&st=err", status_code=303)
+    if len(title) > 80:
+        return RedirectResponse(f"{dest}?msg=Название слишком длинное&st=err", status_code=303)
+    desc = " ".join((description or "").split())
+    if len(desc) > MAX_PROJECT_DESC:
+        return RedirectResponse(f"{dest}?msg=Описание слишком длинное&st=err", status_code=303)
+    projects = load_projects()
+    if any(
+        (p.get("name") or "").strip().lower() == title.lower() and p.get("slug") != slug
+        for p in projects
+    ):
+        return RedirectResponse(f"{dest}?msg=Проект с таким названием уже есть&st=err", status_code=303)
+    update_project(slug, name=title, description=desc)
+    return RedirectResponse(f"{dest}?msg=Проект обновлён&st=ok", status_code=303)
+
+
+@app.post("/p/{slug}/rename")
+async def project_rename(slug: str, name: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    title = " ".join((name or "").split())
+    if not title:
+        return RedirectResponse(f"/p/{slug}?msg=Введите название проекта&st=err", status_code=303)
+    if len(title) > 80:
+        return RedirectResponse(f"/p/{slug}?msg=Название слишком длинное&st=err", status_code=303)
+    if title == scope["name"]:
+        return RedirectResponse(f"/p/{slug}", status_code=303)
+    projects = load_projects()
+    if any(
+        (p.get("name") or "").strip().lower() == title.lower() and p.get("slug") != slug
+        for p in projects
+    ):
+        return RedirectResponse(f"/p/{slug}?msg=Проект с таким названием уже есть&st=err", status_code=303)
+    update_project(slug, name=title)
+    return RedirectResponse(f"/p/{slug}?msg=Проект переименован&st=ok", status_code=303)
+
+
+@app.post("/p/{slug}/settings")
+async def project_settings(slug: str, description: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    desc = " ".join((description or "").split())
+    if len(desc) > MAX_PROJECT_DESC:
+        return RedirectResponse(f"/p/{slug}?msg=Описание слишком длинное&st=err", status_code=303)
+    update_project(slug, description=desc)
+    return RedirectResponse(f"/p/{slug}?msg=Описание сохранено&st=ok", status_code=303)
+
+
+@app.post("/p/{slug}/archive")
+async def project_archive(slug: str, archived: str = Form("1")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    is_archived = archived.strip() not in {"0", "false", "no"}
+    update_project(slug, archived=is_archived)
+    msg = "Проект отправлен в архив" if is_archived else "Проект возвращён из архива"
+    return RedirectResponse(f"/p/{slug}?msg={escape(msg)}&st=ok", status_code=303)
+
+
+@app.post("/p/{slug}/destroy")
+async def project_destroy(slug: str, confirm_name: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    n = 0
+    try:
+        n = linker.repository.total_count(scope["graph_id"])
+    except Exception:
+        pass
+    if n > 0 and confirm_name.strip() != scope["name"]:
+        return RedirectResponse(
+            f"/p/{slug}?msg=Чтобы удалить проект с мыслями, введите его точное название&st=err",
+            status_code=303,
+        )
+    try:
+        linker.repository.delete_graph(scope["graph_id"])
+    except Exception as e:
+        print(f"[web_app] delete graph warning: {e}")
+        return RedirectResponse(f"/p/{slug}?msg=Не удалось удалить граф проекта&st=err", status_code=303)
+    remove_project(slug)
+    label = "пустой проект" if n == 0 else "проект и все его мысли"
+    return RedirectResponse(f"/?msg=Удалён {label}: {escape(scope['name'])}&st=ok", status_code=303)
+
+
+# ========== ADD ==========
+
+@app.get("/p/{slug}/add", response_class=HTMLResponse)
+async def add_page(slug: str, msg: str = "", st: str = ""):
+    scope = resolve_scope(slug)
+    if not scope:
+        return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+    if scope["readonly"]:
+        return RedirectResponse(f"/p/{slug}?msg=В общий граф нельзя добавлять заметки&st=err", status_code=303)
+
+    alert = ""
+    if msg:
+        cls = "alert-success" if st == "ok" else "alert-error"
+        alert = f'<div class="alert {cls}">{escape(msg)}</div>'
+
+    body = f"""
+    <div class="container">
+        {project_nav(scope)}
+        <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
         <div class="page-header"><h2>➕ Добавить заметку</h2></div>
         
         {alert}
         
-        <div class="msg-box">Отправьте текст или загрузите файл для записи в базу знаний.</div>
+        <div class="msg-box">Отправьте текст или загрузите файл для записи в базу знаний проекта.</div>
         
         <div class="tabs">
             <div class="tab active" onclick="showTab('text', this)">📝 Текст</div>
@@ -665,28 +1258,28 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
         </div>
         
         <div id="tab-text" class="tab-content active">
-            <form action="/add/text" method="post" data-enter-submit="true" data-loading-text="Сохранение заметки" data-loading-subtext="Анализ и добавление в граф знаний" onsubmit="return submitWithLoading(this, 'Сохранение заметки', 'Анализ и добавление в граф знаний')">
+            <form action="/p/{escape(slug)}/add/text" method="post" data-enter-submit="true" data-loading-text="Сохранение заметки" data-loading-subtext="Анализ и добавление в граф знаний" onsubmit="return submitWithLoading(this, 'Сохранение заметки', 'Анализ и добавление в граф знаний')">
                 <div class="form-group"><textarea name="note_text" placeholder="Введите заметку..." required></textarea></div>
                 <button type="submit" class="btn">Сохранить</button>
             </form>
         </div>
         
         <div id="tab-file" class="tab-content">
-            <form action="/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Обработка файла', 'Извлечение текста и анализ содержимого')">
+            <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Обработка файла', 'Извлечение текста и анализ содержимого')">
                 <div class="form-group"><label>Файл (.pdf / .txt)</label><input type="file" name="file" accept=".pdf,.txt" required></div>
                 <button type="submit" class="btn">Обработать</button>
             </form>
         </div>
         
         <div id="tab-voice" class="tab-content">
-            <form action="/add/voice" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Распознавание речи', 'Конвертация и транскрибация аудио')">
+            <form action="/p/{escape(slug)}/add/voice" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Распознавание речи', 'Конвертация и транскрибация аудио')">
                 <div class="form-group"><label>Аудиофайл</label><input type="file" name="file" accept="audio/*" required></div>
                 <button type="submit" class="btn">Распознать</button>
             </form>
         </div>
         
         <div id="tab-confluence" class="tab-content">
-            <form action="/add/confluence" method="post" onsubmit="return submitConfluence(this)">
+            <form action="/p/{escape(slug)}/add/confluence" method="post" onsubmit="return submitConfluence(this)">
                 <div class="form-group">
                     <label>Извлечь из страницы Confluence</label>
                     <input type="text" name="url" placeholder="Вставьте ссылку на страницу Confluence..." required>
@@ -696,7 +1289,7 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
         </div>
     </div>
     """
-    
+
     js = """
     function showTab(name, el) {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -717,32 +1310,41 @@ async def add_page(request: Request, msg: str = "", st: str = ""):
     return HTMLResponse(html_page("Добавить", body, js))
 
 
-@app.post("/add/text")
-async def add_text(request: Request, note_text: str = Form("")):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    user = get_user(request)
+def _writable_scope(slug: str):
+    scope = resolve_scope(slug)
+    if not scope:
+        return None, RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+    if scope["readonly"]:
+        return None, RedirectResponse(f"/p/{slug}?msg=В общий граф нельзя добавлять или удалять заметки&st=err", status_code=303)
+    return scope, None
+
+
+@app.post("/p/{slug}/add/text")
+async def add_text(slug: str, note_text: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
     text = note_text.strip()
     if not text:
-        return RedirectResponse("/add?msg=Введите текст заметки&st=err", status_code=303)
-    ok, ans = save_user_note(build_user_id(user or "demo"), text)
-    log_event(user or "demo", text, "text_artifact", ans)
-    return RedirectResponse(f"/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+        return RedirectResponse(f"/p/{slug}/add?msg=Введите текст заметки&st=err", status_code=303)
+    ok, ans = save_user_note(scope["graph_id"], text)
+    log_event(slug, text, "text_artifact", ans)
+    return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
 
 
-@app.post("/add/file")
-async def add_file(request: Request, file: UploadFile = File(None)):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    user = get_user(request)
-    
+@app.post("/p/{slug}/add/file")
+async def add_file(slug: str, file: UploadFile = File(None)):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+
     if not file or not file.filename:
-        return RedirectResponse("/add?msg=Выберите файл&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/add?msg=Выберите файл&st=err", status_code=303)
+
     ext = Path(file.filename).suffix.lower()
     if ext not in {".pdf", ".txt"}:
-        return RedirectResponse("/add?msg=Поддерживаются .pdf и .txt&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/add?msg=Поддерживаются .pdf и .txt&st=err", status_code=303)
+
     tmp = Path(tempfile.gettempdir()) / f"web_{uuid.uuid4().hex}{ext}"
     try:
         with tmp.open("wb") as f:
@@ -753,23 +1355,23 @@ async def add_file(request: Request, file: UploadFile = File(None)):
         else:
             text = read_txt(str(tmp))
         if not text.strip():
-            return RedirectResponse("/add?msg=Текст не извлечен&st=err", status_code=303)
-        ok, ans = save_user_note(build_user_id(user or "demo"), text)
-        log_event(user or "demo", f"[{file.filename}]", ext[1:].upper(), ans)
-        return RedirectResponse(f"/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+            return RedirectResponse(f"/p/{slug}/add?msg=Текст не извлечен&st=err", status_code=303)
+        ok, ans = save_user_note(scope["graph_id"], text)
+        log_event(slug, f"[{file.filename}]", ext[1:].upper(), ans)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
     finally:
         tmp.unlink(missing_ok=True)
 
 
-@app.post("/add/voice")
-async def add_voice(request: Request, file: UploadFile = File(None)):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    user = get_user(request)
-    
+@app.post("/p/{slug}/add/voice")
+async def add_voice(slug: str, file: UploadFile = File(None)):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+
     if not file or not file.filename:
-        return RedirectResponse("/add?msg=Выберите аудиофайл&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/add?msg=Выберите аудиофайл&st=err", status_code=303)
+
     ext = Path(file.filename).suffix.lower() or ".bin"
     inp = Path(tempfile.gettempdir()) / f"web_v_{uuid.uuid4().hex}{ext}"
     wav = Path(tempfile.gettempdir()) / f"web_v_{uuid.uuid4().hex}.wav"
@@ -781,21 +1383,18 @@ async def add_voice(request: Request, file: UploadFile = File(None)):
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             await proc.communicate()
             if proc.returncode != 0:
-                return RedirectResponse("/add?msg=Ошибка конвертации аудио&st=err", status_code=303)
+                return RedirectResponse(f"/p/{slug}/add?msg=Ошибка конвертации аудио&st=err", status_code=303)
         else:
             wav = inp
         text = await asyncio.get_running_loop().run_in_executor(None, asr.recognize_audio, str(wav))
-        ok, ans = save_user_note(build_user_id(user or "demo"), text)
+        ok, ans = save_user_note(scope["graph_id"], text)
         msg = f"🎤 \"{text[:100]}{'...' if len(text)>100 else ''}\"\n\n{ans}"
-        log_event(user or "demo", text, "voice", ans)
-        return RedirectResponse(f"/add?msg={escape(msg)}&st={'ok' if ok else 'err'}", status_code=303)
+        log_event(slug, text, "voice", ans)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(msg)}&st={'ok' if ok else 'err'}", status_code=303)
     finally:
         inp.unlink(missing_ok=True)
         if wav != inp:
             wav.unlink(missing_ok=True)
-
-
-CONFLUENCE_HOST = "confluence.domen.ru"
 
 
 def _is_confluence_fetch_error(text: str) -> bool:
@@ -808,49 +1407,57 @@ def _is_confluence_fetch_error(text: str) -> bool:
     )
 
 
-@app.post("/add/confluence")
-async def add_confluence(request: Request, url: str = Form("")):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    user = get_user(request)
+@app.post("/p/{slug}/add/confluence")
+async def add_confluence(slug: str, url: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
     page_url = url.strip()
 
     if not page_url:
-        return RedirectResponse("/add?msg=Вставьте ссылку на страницу Confluence&st=err", status_code=303)
+        return RedirectResponse(f"/p/{slug}/add?msg=Вставьте ссылку на страницу Confluence&st=err", status_code=303)
 
     if CONFLUENCE_HOST not in page_url.lower():
         return RedirectResponse(
-            f"/add?msg={escape('Ссылка должна быть на Confluence и содержать в себе confluence.domen.ru')}&st=err",
+            f"/p/{slug}/add?msg={escape(f'Ссылка должна быть на Confluence и содержать в себе {CONFLUENCE_HOST}')}&st=err",
             status_code=303,
         )
 
     text = await asyncio.get_running_loop().run_in_executor(None, get_confluence_page_content, page_url)
     if _is_confluence_fetch_error(text):
-        err = text.strip() or "Не удалось извлечь текст со страницы Confluence"
-        log_event(user or "demo", page_url, "confluence", err)
-        return RedirectResponse(f"/add?msg={escape(err)}&st=err", status_code=303)
+        err_text = text.strip() or "Не удалось извлечь текст со страницы Confluence"
+        log_event(slug, page_url, "confluence", err_text)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(err_text)}&st=err", status_code=303)
 
-    ok, ans = save_user_note(build_user_id(user or "demo"), text)
-    log_event(user or "demo", page_url, "confluence", ans)
-    return RedirectResponse(f"/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+    ok, ans = save_user_note(scope["graph_id"], text)
+    log_event(slug, page_url, "confluence", ans)
+    return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
 
 
 # ========== SEARCH (Chat style with formatting) ==========
 
-@app.get("/search", response_class=HTMLResponse)
-async def search_page(request: Request):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
-    body = """
+@app.get("/p/{slug}/search", response_class=HTMLResponse)
+async def search_page(slug: str):
+    scope = resolve_scope(slug)
+    if not scope:
+        return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+
+    hint = (
+        "Задайте вопрос по всем активным проектам сразу. У каждой найденной мысли будет подпись, из какого проекта она пришла."
+        if scope["readonly"]
+        else "Задайте вопрос, и я найду релевантную информацию из графа этого проекта."
+    )
+    body = f"""
     <div class="container wide">
-        <a href="/home" class="back-link">← На главную</a>
+        {project_nav(scope)}
+        <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
         <div class="page-header"><h2>🔍 Поиск мыслей</h2></div>
+        {"<div class='readonly-banner'>Поиск идёт по объединённому графу. Добавлять заметки здесь нельзя.</div>" if scope["readonly"] else ""}
         
         <div class="chat-container">
             <div class="chat-messages" id="chatMessages">
                 <div class="chat-msg bot">
-                    <p>Задайте вопрос, и я найду релевантную информацию из вашей базы знаний.</p>
+                    <p>{hint}</p>
                 </div>
             </div>
             
@@ -861,38 +1468,39 @@ async def search_page(request: Request):
         </div>
     </div>
     """
-    
-    js = """
+
+    js = f"""
     const chatMessages = document.getElementById('chatMessages');
     const queryInput = document.getElementById('queryInput');
     const sendBtn = document.getElementById('sendBtn');
+    const searchUrl = '/p/{slug}/api/search';
     
-    queryInput.addEventListener('input', function() {
+    queryInput.addEventListener('input', function() {{
         this.style.height = 'auto';
         this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-    });
+    }});
     
-    queryInput.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) {
+    queryInput.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter' && !e.shiftKey) {{
             e.preventDefault();
             sendMessage(e);
-        }
-    });
+        }}
+    }});
     
-    async function sendMessage(e) {
+    async function sendMessage(e) {{
         e.preventDefault();
         const query = queryInput.value.trim();
-        if (!query) {
+        if (!query) {{
             queryInput.focus();
             return false;
-        }
+        }}
         
         addMessage(query, 'user');
         queryInput.value = '';
         queryInput.style.height = 'auto';
         
         const loadingId = 'loading-' + Date.now();
-        chatMessages.innerHTML += `<div class="chat-msg bot" id="${loadingId}">
+        chatMessages.innerHTML += `<div class="chat-msg bot" id="${{loadingId}}">
             <div style="display:flex;align-items:center;gap:12px">
                 <div class="spinner" style="width:20px;height:20px;margin:0;border-width:2px"></div>
                 <span style="color:var(--muted)">Поиск по базе знаний...</span>
@@ -901,106 +1509,156 @@ async def search_page(request: Request):
         chatMessages.scrollTop = chatMessages.scrollHeight;
         sendBtn.disabled = true;
         
-        try {
-            const resp = await fetch('/api/search', {
+        try {{
+            const resp = await fetch(searchUrl, {{
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({q: query})
-            });
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{q: query}})
+            }});
             const data = await resp.json();
             
             document.getElementById(loadingId).remove();
             
-            if (data.error) {
+            if (data.error) {{
                 addMessage('Ошибка: ' + data.error, 'bot');
-            } else {
-                addMessageHtml(data.answer_html, data.meta);
-            }
-        } catch (err) {
+            }} else {{
+                addMessageHtml(data.answer_html, data.meta, data.sources);
+            }}
+        }} catch (err) {{
             document.getElementById(loadingId).remove();
             addMessage('Ошибка соединения', 'bot');
-        }
+        }}
         
         sendBtn.disabled = false;
         queryInput.focus();
         return false;
-    }
+    }}
     
-    function addMessage(text, type) {
+    function addMessage(text, type) {{
         const div = document.createElement('div');
         div.className = 'chat-msg ' + type;
         div.textContent = text;
         chatMessages.appendChild(div);
         chatMessages.scrollTop = chatMessages.scrollHeight;
-    }
+    }}
     
-    function addMessageHtml(html, meta) {
+    function addMessageHtml(html, meta, sources) {{
         const div = document.createElement('div');
         div.className = 'chat-msg bot';
         div.innerHTML = html;
-        if (meta) {
+        if (sources && sources.length) {{
+            const wrap = document.createElement('div');
+            wrap.className = 'source-chips';
+            sources.forEach(function(name) {{
+                const chip = document.createElement('span');
+                chip.className = 'source-chip';
+                chip.textContent = name;
+                wrap.appendChild(chip);
+            }});
+            div.appendChild(wrap);
+        }}
+        if (meta) {{
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';
             metaDiv.textContent = meta;
             div.appendChild(metaDiv);
-        }
+        }}
         chatMessages.appendChild(div);
         chatMessages.scrollTop = chatMessages.scrollHeight;
-    }
+    }}
     """
     return HTMLResponse(html_page("Поиск", body, js))
 
 
-@app.post("/api/search")
-async def api_search(request: Request):
-    if not check_auth(request):
-        return JSONResponse({"error": "Не авторизован"}, status_code=401)
-    
+@app.post("/p/{slug}/api/search")
+async def api_search(slug: str, request: Request):
+    scope = resolve_scope(slug)
+    if not scope:
+        return JSONResponse({"error": "Проект не найден"}, status_code=404)
+
     try:
         data = await request.json()
         query = data.get("q", "").strip()
-    except:
+    except Exception:
         return JSONResponse({"error": "Неверный формат"}, status_code=400)
-    
+
     if not query:
         return JSONResponse({"error": "Введите запрос"}, status_code=400)
-    
-    user = get_user(request)
-    resp = graphrag.query(build_user_id(user or "demo"), query)
-    log_event(user or "demo", query, "search_query", resp.answer)
-    
-    # Format the response with markdown-like styling
+
+    graph_key = "__all__" if scope["readonly"] else scope["graph_id"]
+    labels = scope.get("project_labels") or {}
+    resp = graphrag.query(
+        graph_key,
+        query,
+        user_ids=scope["graph_ids"] if scope["readonly"] else None,
+        project_labels=labels if scope["readonly"] else None,
+    )
+    log_event(slug, query, "search_query", resp.answer)
     formatted = format_llm_response(resp.answer)
-    
+    sources = []
+    if scope["readonly"] and labels:
+        seen = set()
+        for node in resp.context.all_nodes:
+            name = labels.get(node.user_id or "")
+            if name and name not in seen:
+                seen.add(name)
+                sources.append(name)
+    meta = (
+        f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · "
+        f"{len(resp.context.expanded_nodes)} узлов"
+    )
+    if sources:
+        meta += " · из: " + ", ".join(sources)
     return JSONResponse({
         "answer_html": formatted,
-        "meta": f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · {len(resp.context.expanded_nodes)} узлов"
+        "meta": meta,
+        "sources": sources,
     })
 
 
 # ========== VIEW ==========
 
-@app.get("/view", response_class=HTMLResponse)
-async def view_page(request: Request):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
-    user = get_user(request)
-    uid = build_user_id(user or "demo")
-    stats = linker.get_user_stats(uid)
-    
+@app.get("/p/{slug}/view", response_class=HTMLResponse)
+async def view_page(slug: str):
+    scope = resolve_scope(slug)
+    if not scope:
+        return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+
+    if scope["readonly"]:
+        graph_ids = scope["graph_ids"]
+        n = linker.repository.total_count_many(graph_ids)
+        if n == 0:
+            body = f"""
+            <div class="container">
+                {project_nav(scope)}
+                <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
+                <div class="page-header"><h2>💡 Общий граф</h2></div>
+                <div class="alert alert-error">📭 Пока нет мыслей ни в одном проекте.</div>
+            </div>
+            """
+            return HTMLResponse(html_page("Общий граф", body))
+        labels = scope.get("project_labels") or {}
+        data = linker.repository.export_graph_data_combined(graph_ids, labels)
+        path = generate_graph_html_from_data(data, user_label="Все проекты")
+        try:
+            return HTMLResponse(Path(path).read_text(encoding="utf-8"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    stats = linker.get_user_stats(scope["graph_id"])
     if stats["total_cards"] == 0:
-        body = """
+        body = f"""
         <div class="container">
-            <a href="/home" class="back-link">← На главную</a>
+            {project_nav(scope)}
+            <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
             <div class="page-header"><h2>💡 База знаний</h2></div>
             <div class="alert alert-error">📭 Граф пуст. Добавьте первую заметку!</div>
-            <a href="/add" class="btn" style="text-decoration:none;text-align:center;display:block;margin-top:16px">➕ Добавить заметку</a>
+            <a href="/p/{escape(slug)}/add" class="btn" style="text-decoration:none;text-align:center;display:block;margin-top:16px">➕ Добавить заметку</a>
         </div>
         """
         return HTMLResponse(html_page("База знаний", body))
-    
-    path = generate_graph_html_from_repo(linker.repository, uid, None)
+
+    path = generate_graph_html_from_repo(linker.repository, scope["graph_id"], None)
     try:
         return HTMLResponse(Path(path).read_text(encoding="utf-8"))
     finally:
@@ -1009,26 +1667,28 @@ async def view_page(request: Request):
 
 # ========== DELETE (Card-based) ==========
 
-@app.get("/delete", response_class=HTMLResponse)
-async def delete_page(request: Request, msg: str = "", st: str = ""):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
+@app.get("/p/{slug}/delete", response_class=HTMLResponse)
+async def delete_page(slug: str, msg: str = "", st: str = ""):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+
     alert = ""
     if msg:
         cls = "alert-success" if st == "ok" else "alert-error"
         alert = f'<div class="alert {cls}">{escape(msg)}</div>'
-    
+
     body = f"""
     <div class="container">
-        <a href="/home" class="back-link">← На главную</a>
+        {project_nav(scope)}
+        <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
         <div class="page-header"><h2>🗑 Удалить заметку</h2></div>
         
         {alert}
         
         <div class="msg-box">Опишите мысль, которую хотите найти и удалить.</div>
         
-        <form action="/delete/search" method="post" data-enter-submit="true" data-loading-text="Поиск" data-loading-subtext="Ищем похожие заметки" onsubmit="return submitWithLoading(this, 'Поиск заметок', 'Ищем похожие мысли в базе знаний')">
+        <form action="/p/{escape(slug)}/delete/search" method="post" data-enter-submit="true" data-loading-text="Поиск" data-loading-subtext="Ищем похожие заметки" onsubmit="return submitWithLoading(this, 'Поиск заметок', 'Ищем похожие мысли в базе знаний')">
             <div class="form-group"><textarea name="q" placeholder="Что удалить..." required></textarea></div>
             <button type="submit" class="btn">Найти</button>
         </form>
@@ -1037,39 +1697,37 @@ async def delete_page(request: Request, msg: str = "", st: str = ""):
     return HTMLResponse(html_page("Удалить", body))
 
 
-@app.post("/delete/search", response_class=HTMLResponse)
-async def delete_search(request: Request, q: str = Form("")):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
-    user = get_user(request)
-    uid = build_user_id(user or "demo")
+@app.post("/p/{slug}/delete/search", response_class=HTMLResponse)
+async def delete_search(slug: str, q: str = Form("")):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    uid = scope["graph_id"]
     query = q.strip()
-    
+
     if not query:
-        return RedirectResponse("/delete?msg=Введите запрос&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/delete?msg=Введите запрос&st=err", status_code=303)
+
     emb = embedding_model.embed_query(query)
     threshold = max(0.35, settings.linker_similarity_threshold)
     cands = linker.repository.vector_search(user_id=uid, query_embedding=emb, limit=5, similarity_threshold=threshold)
-    
+
     if not cands:
-        log_event(user or "demo", query, "delete_query", "Не найдено")
-        return RedirectResponse("/delete?msg=Ничего не найдено. Попробуйте другую формулировку.&st=err", status_code=303)
-    
+        log_event(slug, query, "delete_query", "Не найдено")
+        return RedirectResponse(f"/p/{slug}/delete?msg=Ничего не найдено. Попробуйте другую формулировку.&st=err", status_code=303)
+
     token = uuid.uuid4().hex
     cached = []
     cards_html = ""
-    
+
     for i, (node, score) in enumerate(cands):
         topic = getattr(node, 'topic', '') or ''
         cached.append({
-            "zettel_id": node.zettel_id, 
+            "zettel_id": node.zettel_id,
             "luhmann_id": node.luhmann_id,
             "topic": topic,
             "content": node.content
         })
-        # Формат: "Тема: сокращённый текст" или просто сокращённый текст
         if topic:
             short_content = node.content[:80] + ("..." if len(node.content) > 80 else "")
             preview = f"<strong>{escape(topic)}</strong>: {escape(short_content)}"
@@ -1077,7 +1735,7 @@ async def delete_search(request: Request, q: str = Form("")):
             preview = escape(node.content[:120]) + ("..." if len(node.content) > 120 else "")
         full_content = escape(node.content).replace("\n", "<br>")
         topic_escaped = escape(topic) if topic else ""
-        
+
         cards_html += f"""
         <div class="delete-card" onclick="showDeleteModal({i}, '{escape(node.luhmann_id)}', `{full_content}`, `{topic_escaped}`)">
             <div class="card-header">
@@ -1087,19 +1745,20 @@ async def delete_search(request: Request, q: str = Form("")):
             <div class="card-preview">{preview}</div>
         </div>
         """
-    
+
     DELETE_CACHE[token] = cached
-    
+
     body = f"""
     <div class="container">
-        <a href="/home" class="back-link">← На главную</a>
+        {project_nav(scope)}
+        <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
         <div class="page-header"><h2>🗑 Удалить заметку</h2></div>
         
         <div class="msg-box">Найдено {len(cached)} заметок. Нажмите на карточку, чтобы просмотреть и удалить.</div>
         
         <div class="delete-cards">{cards_html}</div>
         
-        <form id="deleteForm" action="/delete/confirm" method="post" style="display:none">
+        <form id="deleteForm" action="/p/{escape(slug)}/delete/confirm" method="post" style="display:none">
             <input type="hidden" name="token" value="{token}">
             <input type="hidden" name="idx" id="deleteIdx">
         </form>
@@ -1118,10 +1777,10 @@ async def delete_search(request: Request, q: str = Form("")):
             </div>
         </div>
         
-        <a href="/delete" class="btn btn-outline" style="text-decoration:none;text-align:center;display:block;margin-top:20px">Новый поиск</a>
+        <a href="/p/{escape(slug)}/delete" class="btn btn-outline" style="text-decoration:none;text-align:center;display:block;margin-top:20px">Новый поиск</a>
     </div>
     """
-    
+
     js = """
     let pendingDeleteIdx = null;
     
@@ -1152,12 +1811,10 @@ async def delete_search(request: Request, q: str = Form("")):
         }
     }
     
-    // Close modal on backdrop click
     document.getElementById('deleteModal').addEventListener('click', function(e) {
         if (e.target === this) hideDeleteModal();
     });
     
-    // Close on Escape
     document.addEventListener('keydown', function(e) {
         if (e.key === 'Escape') hideDeleteModal();
     });
@@ -1165,28 +1822,27 @@ async def delete_search(request: Request, q: str = Form("")):
     return HTMLResponse(html_page("Найденные заметки", body, js))
 
 
-@app.post("/delete/confirm")
-async def delete_confirm(request: Request, token: str = Form(""), idx: int = Form(0)):
-    if not check_auth(request):
-        return RedirectResponse("/login", status_code=303)
-    
-    user = get_user(request)
-    uid = build_user_id(user or "demo")
+@app.post("/p/{slug}/delete/confirm")
+async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    uid = scope["graph_id"]
     cands = DELETE_CACHE.pop(token, [])
-    
+
     if not cands or idx < 1 or idx > len(cands):
-        return RedirectResponse("/delete?msg=Данные устарели. Повторите поиск.&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/delete?msg=Данные устарели. Повторите поиск.&st=err", status_code=303)
+
     sel = cands[idx - 1]
     res = linker.repository.delete_zettel(uid, sel["zettel_id"])
-    
+
     if not res:
-        return RedirectResponse("/delete?msg=Не удалось удалить&st=err", status_code=303)
-    
+        return RedirectResponse(f"/p/{slug}/delete?msg=Не удалось удалить&st=err", status_code=303)
+
     stats = linker.get_user_stats(uid)
     msg = f"🗑 Удалено [{res['luhmann_id']}]\nУдалено: {res['deleted_count']} мысль(ей)\n📚 Осталось: {stats['total_cards']}"
-    log_event(user or "demo", f"Удаление: {sel['content'][:50]}", "delete_query", msg)
-    return RedirectResponse(f"/delete?msg={escape(msg)}&st=ok", status_code=303)
+    log_event(slug, f"Удаление: {sel['content'][:50]}", "delete_query", msg)
+    return RedirectResponse(f"/p/{slug}/delete?msg={escape(msg)}&st=ok", status_code=303)
 
 
 if __name__ == "__main__":

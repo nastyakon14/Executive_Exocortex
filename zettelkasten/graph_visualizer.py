@@ -460,24 +460,40 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
   }}
   .spray-dot {{
     position: fixed;
-    width: 8px;
-    height: 8px;
+    width: 110px;
+    height: 110px;
     border-radius: 50%;
-    background: radial-gradient(circle, rgba(125, 211, 252, 0.9) 0%, rgba(56, 189, 248, 0.35) 65%, rgba(56, 189, 248, 0) 100%);
+    background: radial-gradient(circle, rgba(56, 189, 248, 0.2) 0%, rgba(14, 165, 233, 0.1) 40%, transparent 72%);
     transform: translate(-50%, -50%);
-    animation: spray-burst 680ms ease-out forwards;
-    will-change: transform, opacity;
+    filter: blur(22px);
+    animation: spray-haze 1.55s ease-out forwards;
+    will-change: transform, opacity, filter;
+    pointer-events: none;
   }}
   body.light-theme .spray-dot {{
-    background: radial-gradient(circle, rgba(14, 165, 233, 0.75) 0%, rgba(56, 189, 248, 0.25) 65%, rgba(56, 189, 248, 0) 100%);
+    background: radial-gradient(circle, rgba(14, 165, 233, 0.18) 0%, rgba(56, 189, 248, 0.08) 42%, transparent 72%);
   }}
-  @keyframes spray-burst {{
-    0% {{ opacity: 0.85; transform: translate(-50%, -50%) scale(0.9); }}
-    100% {{ opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(0.2); }}
+  .spray-follow {{
+    position: fixed;
+    width: 160px;
+    height: 160px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(56, 189, 248, 0.16) 0%, rgba(14, 165, 233, 0.08) 45%, transparent 70%);
+    transform: translate(-50%, -50%);
+    filter: blur(28px);
+    pointer-events: none;
+    opacity: 0;
+  }}
+  body.light-theme .spray-follow {{
+    background: radial-gradient(circle, rgba(14, 165, 233, 0.14) 0%, rgba(56, 189, 248, 0.06) 45%, transparent 72%);
+  }}
+  @keyframes spray-haze {{
+    0% {{ opacity: 0.5; transform: translate(-50%, -50%) scale(0.55); filter: blur(16px); }}
+    100% {{ opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(1.85); filter: blur(34px); }}
   }}
 </style>
 </head>
-<body>
+<body class="light-theme">
 <div id="header">
   <h1>🧠 Цифровой экзокортекс</h1>
   <div id="header-right">
@@ -486,7 +502,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
       Сущности: <span>{total_e}</span> &nbsp;|&nbsp;
       Связи: <span>{total_r}</span>
     </div>
-    <button id="theme-toggle" type="button">Светлая тема</button>
+    <button id="theme-toggle" type="button">Темная тема</button>
   </div>
 </div>
 <div id="search-box">
@@ -562,63 +578,75 @@ network.once('stabilizationIterationsDone', function() {{
 
 // переключатель темы (светлая / тёмная)
 const themeToggleBtn = document.getElementById('theme-toggle');
-const savedTheme = localStorage.getItem('exocortex_theme');
-if (savedTheme === 'light') {{
-  document.body.classList.add('light-theme');
-  themeToggleBtn.textContent = 'Темная тема';
+const savedTheme = localStorage.getItem('theme') || localStorage.getItem('exocortex_theme') || 'light';
+if (savedTheme === 'dark') {{
+  document.body.classList.remove('light-theme');
+  themeToggleBtn.textContent = 'Светлая тема';
 }}
 
 themeToggleBtn.addEventListener('click', function() {{
   const isLight = document.body.classList.toggle('light-theme');
-  if (isLight) {{
-    themeToggleBtn.textContent = 'Темная тема';
-    localStorage.setItem('exocortex_theme', 'light');
-  }} else {{
-    themeToggleBtn.textContent = 'Светлая тема';
-    localStorage.setItem('exocortex_theme', 'dark');
-  }}
+  const next = isLight ? 'light' : 'dark';
+  themeToggleBtn.textContent = isLight ? 'Темная тема' : 'Светлая тема';
+  localStorage.setItem('exocortex_theme', next);
+  localStorage.setItem('theme', next);
 }});
 
-// мягкий "спрей" за курсором
+// мягкая дымка за курсором
 (function() {{
   const layer = document.getElementById('spray-layer');
   if (!layer) return;
   if (window.matchMedia('(pointer: coarse)').matches) return;
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
-  let lastSpawn = 0;
-  const spawnEveryMs = 18;
+  const follow = document.createElement('div');
+  follow.className = 'spray-follow';
+  layer.appendChild(follow);
 
-  function spawnSpray(x, y, count) {{
-    for (let i = 0; i < count; i++) {{
-      const dot = document.createElement('div');
-      dot.className = 'spray-dot';
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 8 + Math.random() * 24;
-      const dx = Math.cos(angle) * radius;
-      const dy = Math.sin(angle) * radius;
-      const size = 4 + Math.random() * 7;
-      dot.style.left = x + 'px';
-      dot.style.top = y + 'px';
-      dot.style.width = size + 'px';
-      dot.style.height = size + 'px';
-      dot.style.setProperty('--dx', dx.toFixed(2) + 'px');
-      dot.style.setProperty('--dy', dy.toFixed(2) + 'px');
-      layer.appendChild(dot);
-      dot.addEventListener('animationend', () => dot.remove(), {{ once: true }});
-    }}
+  let lastSpawn = 0;
+  let tx = 0, ty = 0, cx = 0, cy = 0, hasMove = false;
+
+  function spawnHaze(x, y) {{
+    const puff = document.createElement('div');
+    puff.className = 'spray-dot';
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 6 + Math.random() * 18;
+    const size = 80 + Math.random() * 70;
+    puff.style.left = x + 'px';
+    puff.style.top = y + 'px';
+    puff.style.width = size + 'px';
+    puff.style.height = size + 'px';
+    puff.style.setProperty('--dx', (Math.cos(angle) * radius).toFixed(2) + 'px');
+    puff.style.setProperty('--dy', (Math.sin(angle) * radius - 8).toFixed(2) + 'px');
+    layer.appendChild(puff);
+    puff.addEventListener('animationend', () => puff.remove(), {{ once: true }});
   }}
 
   window.addEventListener('mousemove', function(e) {{
+    tx = e.clientX;
+    ty = e.clientY;
+    if (!hasMove) {{
+      cx = tx;
+      cy = ty;
+      hasMove = true;
+      follow.style.opacity = '1';
+    }}
     const now = performance.now();
-    if (now - lastSpawn < spawnEveryMs) return;
+    if (now - lastSpawn < 42) return;
     lastSpawn = now;
-    spawnSpray(e.clientX, e.clientY, 2);
+    spawnHaze(e.clientX, e.clientY);
   }});
 
-  window.addEventListener('click', function(e) {{
-    spawnSpray(e.clientX, e.clientY, 10);
-  }});
+  function tick() {{
+    if (hasMove) {{
+      cx += (tx - cx) * 0.14;
+      cy += (ty - cy) * 0.14;
+      follow.style.left = cx + 'px';
+      follow.style.top = cy + 'px';
+    }}
+    requestAnimationFrame(tick);
+  }}
+  tick();
 }})();
 
 // панель деталей выбранного узла
@@ -752,6 +780,24 @@ def generate_graph_html(user_id: str, output_path: str | None = None) -> str:
     graph_data = repo.export_graph_data(user_id)
 
     html_content = _build_html(graph_data, user_label=user_id)
+
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix=".html", prefix="graph_")
+        os.close(fd)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return output_path
+
+
+def generate_graph_html_from_data(
+    graph_data: dict,
+    user_label: str = "",
+    output_path: str | None = None,
+) -> str:
+    """Собирает HTML-граф из уже выгруженных данных."""
+    html_content = _build_html(graph_data, user_label=user_label)
 
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".html", prefix="graph_")

@@ -1,4 +1,4 @@
-# добавить инфу из ссылки со страницы confluence
+# добавить инфу по ссылке со страницы confluence
 
 from atlassian import Confluence
 from atlassian.errors import ApiError, ApiPermissionError
@@ -10,22 +10,30 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# создаем соединение конфлюенс
-def connect_Confluence():
-    login = ''
-    pswd = os.getenv('CONFLUENCE_PASSWORD')
-    
-    os.environ['NO_PROXY'] = 'https://confluence.ru'
-    
-    # создаем соединение конфлюенс
-    confluence = Confluence(
-            url='https://confluence.mts.ru',
-            username=login,
-            password=pswd,
-            verify_ssl=False)
-    return confluence
+CONFLUENCE_DOMAIN = os.getenv("CONFLUENCE_DOMAIN", "mts")
+CONFLUENCE_HOST = os.getenv("CONFLUENCE_HOST", f"confluence.{CONFLUENCE_DOMAIN}.ru")
+CONFLUENCE_URL = os.getenv("CONFLUENCE_URL", f"https://{CONFLUENCE_HOST}")
 
-confluence = connect_Confluence()
+_confluence = None
+
+
+def connect_Confluence():
+    login = os.getenv("CONFLUENCE_LOGIN", "")
+    pswd = os.getenv("CONFLUENCE_PASSWORD")
+    os.environ["NO_PROXY"] = CONFLUENCE_URL
+    return Confluence(
+        url=CONFLUENCE_URL,
+        username=login,
+        password=pswd,
+        verify_ssl=False,
+    )
+
+
+def get_confluence():
+    global _confluence
+    if _confluence is None:
+        _confluence = connect_Confluence()
+    return _confluence
 
 def extract_page_info_from_url(url):
     """Парсит URL-ссылку Confluence для извлечения ID страницы или Space Key + Title."""
@@ -60,12 +68,12 @@ def get_confluence_page_content(url):
         # Запрашиваем страницу у Confluence (с расширением body.storage, где лежит весь текст)
         if info["type"] == "id":
             print(f"Запрос по Page ID: {info['value']}")
-            page = confluence.get_page_by_id(
+            page = get_confluence().get_page_by_id(
                 info["value"], expand="body.storage"
             )
         else:
             print(f"Запрос по Space: {info['space']}, Title: {info['title']}")
-            page = confluence.get_page_by_title(
+            page = get_confluence().get_page_by_title(
                 space=info["space"], title=info["title"], expand="body.storage"
             )
 
