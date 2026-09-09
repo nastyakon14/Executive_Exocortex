@@ -1,0 +1,124 @@
+{
+  "uid": "exocortex-by-project",
+  "title": "Exocortex / By Project",
+  "tags": ["exocortex", "projects"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "project",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, project)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Стоимость и токены по проектам за период",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{project}}",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (project) (increase(exocortex_llm_cost_usd_total{project=~\"$project\"}[$__range]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "{{project}}",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (project) (increase(exocortex_llm_tokens_total{direction=\"input\",project=~\"$project\"}[$__range]))"
+        },
+        {
+          "refId": "C",
+          "legendFormat": "{{project}}",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (project) (increase(exocortex_llm_tokens_total{direction=\"output\",project=~\"$project\"}[$__range]))"
+        },
+        {
+          "refId": "D",
+          "legendFormat": "{{project}}",
+          "format": "table",
+          "instant": true,
+          "expr": "sum by (project) (increase(exocortex_llm_requests_total{project=~\"$project\"}[$__range]))"
+        }
+      ],
+      "options": { "showHeader": true },
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "renameByName": {
+              "Value #A": "USD",
+              "Value #B": "input tokens",
+              "Value #C": "output tokens",
+              "Value #D": "requests"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Стоимость по проектам",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{project}}",
+          "expr": "sum(rate(exocortex_llm_cost_usd_total{project=~\"$project\"}[5m])) by (project)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Поиск и добавление заметок по проектам",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{project}} / {{event}}",
+          "expr": "sum(rate(exocortex_app_events_total{project=~\"$project\"}[5m])) by (project, event)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "E2E p95 по проектам",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{project}}",
+          "expr": "histogram_quantile(0.95, sum by (le, project) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}

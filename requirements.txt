@@ -25,6 +25,7 @@ torch
 pydantic
 pydantic-settings
 
+prometheus_client
 fastapi 
 uvicorn 
 python-multipart

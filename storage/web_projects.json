@@ -21,7 +21,7 @@
       "name": "test project",
       "graph_id": "proj_test_project",
       "description": "exocortex",
-      "archived": false,
+      "archived": true,
       "created_at": "2026-09-07T14:41:26.895253+00:00"
     },
     {
@@ -31,6 +31,14 @@
       "description": "великий",
       "archived": false,
       "created_at": "2026-09-07T14:42:05.424621+00:00"
+    },
+    {
+      "slug": "news",
+      "name": "news",
+      "graph_id": "proj_news",
+      "description": "",
+      "archived": false,
+      "created_at": "2026-09-08T07:44:57.091415+00:00"
     }
   ]
 }

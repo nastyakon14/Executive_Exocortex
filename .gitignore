@@ -35,3 +35,5 @@ storage/chromadb/data/
 
 coursework.docx
 storage/langfuse/db
+storage/prometheus/
+storage/grafana/

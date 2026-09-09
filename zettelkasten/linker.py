@@ -1,19 +1,17 @@
 # линкер — встраивает новые zettel-карточки в граф знаний (neo4j)
 # изоляция по user_id: у каждого пользователя свой граф
 
-import os
 import sys
 import time
 import re
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 from enum import Enum
 from dataclasses import dataclass
 
 import torch
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
@@ -22,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
+from observability.llm import make_chat_openai
 from storage.neo4j.client import get_neo4j_client
 from storage.neo4j.schema import init_schema
 from storage.neo4j.repository import ZettelRepository, ZettelNode, GraphContext
@@ -211,10 +210,9 @@ class GraphLinker:
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
         
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            api_key=os.getenv("LLM_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL"),
+        self.llm = make_chat_openai(
+            component="linker",
+            model_name=self.model_name,
             temperature=temperature,
         )
         self.structured_llm = self.llm.with_structured_output(LinkDecision)
@@ -242,21 +240,27 @@ class GraphLinker:
                 print(f"[Neo4j] Удалено кросс-пользовательских связей: {removed}")
         return self._repository
     
-    def link_and_insert(self, user_id: str, new_cards: List[ZettelCard]) -> List[LinkResult]:
+    def link_and_insert(
+        self,
+        user_id: str,
+        new_cards: List[ZettelCard],
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[LinkResult]:
         """
         Обрабатывает список карточек от Atomizer и встраивает в граф пользователя.
         
         Args:
             user_id: ID пользователя (из Telegram)
             new_cards: Список карточек от Atomizer
+            on_progress: callback(index, total, topic) перед каждой карточкой
         """
         results: List[LinkResult] = []
         self._luhmann_remap = {}
+        total = len(new_cards)
         
-        for card in new_cards:
-            # print(f"\n{'─' * 55}")
-            # print(f"📋 [{card.luhmann_id}] {card.content[:55]}...")
-            # print(f"   root={card.is_root_topic}, parent={card.parent_luhmann_id}")
+        for i, card in enumerate(new_cards, 1):
+            if on_progress:
+                on_progress(i, total, card.topic or "")
             
             embedding = self.embedding_model.embed_passage(card.content)
             

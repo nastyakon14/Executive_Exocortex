@@ -1,0 +1,185 @@
+{
+  "uid": "exocortex-llm-overview",
+  "title": "Exocortex / LLM Overview",
+  "tags": ["exocortex", "llm", "cost"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "project",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, project)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, model)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "component",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, component)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Стоимость за период, USD",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(exocortex_llm_cost_usd_total{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Входные токены",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(exocortex_llm_tokens_total{direction=\"input\",project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Выходные токены",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(exocortex_llm_tokens_total{direction=\"output\",project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "LLM-запросы / ошибки",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "ok",
+          "expr": "sum(increase(exocortex_llm_requests_total{status=\"ok\",project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "error",
+          "expr": "sum(increase(exocortex_llm_requests_total{status=\"error\",project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Стоимость, USD/мин",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "expr": "sum(rate(exocortex_llm_cost_usd_total{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])) by (component) * 60"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "custom": { "fillOpacity": 12 } } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Токены в секунду (input / output)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{direction}}",
+          "expr": "sum(rate(exocortex_llm_tokens_total{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])) by (direction)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Стоимость по моделям",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "sum(rate(exocortex_llm_cost_usd_total{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])) by (model)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 8,
+      "type": "piechart",
+      "title": "Токены по этапам пайплайна",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "expr": "sum(increase(exocortex_llm_tokens_total{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[$__range])) by (component)"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Продуктовые события (заметки / поиск)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{event}} / {{status}}",
+          "expr": "sum(rate(exocortex_app_events_total{project=~\"$project\"}[5m])) by (event, status)"
+        }
+      ]
+    }
+  ]
+}

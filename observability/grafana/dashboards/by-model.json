@@ -1,0 +1,101 @@
+{
+  "uid": "exocortex-by-model",
+  "title": "Exocortex / By Model and Pipeline",
+  "tags": ["exocortex", "models"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, model)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Стоимость по моделям",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "sum(rate(exocortex_llm_cost_usd_total{model=~\"$model\"}[5m])) by (model)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Стоимость по этапам: atomizer / linker / graphrag",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "expr": "sum(rate(exocortex_llm_cost_usd_total{model=~\"$model\"}[5m])) by (component)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Error rate по моделям",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "sum(rate(exocortex_llm_requests_total{status=\"error\",model=~\"$model\"}[5m])) by (model) / clamp_min(sum(rate(exocortex_llm_requests_total{model=~\"$model\"}[5m])) by (model), 1e-9)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "USD на 1k выходных токенов",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "(sum(rate(exocortex_llm_cost_usd_total{model=~\"$model\"}[1h])) by (model) * 1000) / clamp_min(sum(rate(exocortex_llm_tokens_total{direction=\"output\",model=~\"$model\"}[1h])) by (model), 1)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 5 } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Доля входных vs выходных токенов",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}} / {{direction}}",
+          "expr": "sum(rate(exocortex_llm_tokens_total{model=~\"$model\"}[5m])) by (model, direction)"
+        }
+      ]
+    }
+  ]
+}

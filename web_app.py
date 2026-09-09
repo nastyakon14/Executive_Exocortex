@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -13,14 +14,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from config.settings import settings
+from observability.context import reset_obs_context, set_obs_context
+from observability.metrics import record_app_event
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
-from telegram_bot.handlers import asr
 from telegram_bot.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
-from telegram_bot.handlers.pdf_reader import read_pdf
-from telegram_bot.handlers.txt_reader import read_txt
+from telegram_bot.handlers.folders import extract_file_text, list_folder_files
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG
 from zettelkasten.graph_visualizer import generate_graph_html_from_data, generate_graph_html_from_repo
@@ -29,6 +31,26 @@ from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
 load_dotenv()
 
 app = FastAPI(title="Project Exocortex Web App")
+
+
+@app.middleware("http")
+async def observability_context(request: Request, call_next):
+    path = request.url.path
+    project = "hub"
+    if path.startswith("/p/"):
+        parts = path.split("/")
+        if len(parts) > 2 and parts[2]:
+            project = parts[2]
+    tokens = set_obs_context(project=project, source="web")
+    try:
+        return await call_next(request)
+    finally:
+        reset_obs_context(tokens)
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 create_database()
 create_tables()
@@ -221,15 +243,39 @@ def resolve_scope(slug: str) -> dict | None:
     }
 
 
-def save_user_note(user_id: str, text: str) -> tuple[bool, str]:
+def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
+    def stage(key: str, title: str, sub: str = "") -> None:
+        if on_stage:
+            on_stage(key, title, sub)
+
+    def atom_progress(index: int, total: int) -> None:
+        detail = (
+            f"Фрагмент {index} из {total}"
+            if total > 1
+            else "Атомизатор разбирает текст на мысли"
+        )
+        stage("atomize", "Извлечение атомарных мыслей", detail)
+
+    stage("atomize", "Извлечение атомарных мыслей", "Атомизатор разбирает текст на мысли")
     raw_cards = atomizer.atomize(
         text=text,
         current_db_max_root_id=linker.repository.get_max_root_id(user_id),
+        on_progress=atom_progress,
     )
     if isinstance(raw_cards, str):
+        record_app_event("note_add", "error")
         return False, f"Ошибка: {raw_cards}"
-    linker.link_and_insert(user_id=user_id, new_cards=raw_cards)
+
+    total = len(raw_cards)
+
+    def link_progress(index: int, count: int, topic: str = "") -> None:
+        hint = f" · «{topic}»" if topic else ""
+        stage("link", "Связывание в граф", f"Карточка {index} из {count}{hint}")
+
+    stage("link", "Связывание в граф", f"Линкер встраивает {total} карточек")
+    linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
     stats = linker.get_user_stats(user_id)
+    record_app_event("note_add", "ok")
     return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
 
 
@@ -469,6 +515,19 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .tab-content { display: none; }
 .tab-content.active { display: block; }
+.file-modes { display: flex; gap: 8px; margin-bottom: 14px; }
+.file-mode { flex: 1; padding: 10px 12px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 13px; text-align: center; cursor: pointer; }
+.file-mode.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.tick-check { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; cursor: pointer; color: var(--text2); font-size: 13px; user-select: none; }
+.tick-check input { position: absolute; opacity: 0; width: 0; height: 0; }
+.tick-box { width: 18px; height: 18px; border: 1.5px solid var(--border); border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; color: transparent; background: var(--card); flex-shrink: 0; }
+.tick-box svg { width: 12px; height: 12px; }
+.tick-check input:checked + .tick-box { border-color: var(--accent); background: rgba(99,102,241,0.12); color: var(--accent); }
+.folder-log { display: none; margin-top: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; max-height: 240px; overflow-y: auto; font-size: 13px; line-height: 1.55; }
+.folder-log.active { display: block; }
+.folder-log .log-ok { color: var(--success); }
+.folder-log .log-err { color: var(--error); }
+.folder-log .log-info { color: var(--muted); }
 
 /* Alerts */
 .alert { padding: 14px 16px; border-radius: 12px; margin-bottom: 16px; font-size: 14px; display: flex; align-items: flex-start; gap: 10px; }
@@ -511,16 +570,36 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .loading-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(248,250,252,0.92); display: none; align-items: center; justify-content: center; z-index: 1100; backdrop-filter: blur(8px); }
 [data-theme="dark"] .loading-overlay { background: rgba(10,10,15,0.92); }
 .loading-overlay.active { display: flex; }
-.loading-box { text-align: center; }
+.loading-box { text-align: center; min-width: 280px; max-width: 440px; padding: 8px 12px; }
 .spinner { width: 56px; height: 56px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .loading-text { color: var(--text); font-size: 15px; font-weight: 500; }
-.loading-subtext { color: var(--muted); font-size: 13px; margin-top: 8px; }
+.loading-subtext { color: var(--muted); font-size: 13px; margin-top: 8px; min-height: 18px; }
 .loading-dots::after { content: ''; animation: dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
 .loading-progress { width: 200px; height: 4px; background: var(--border); border-radius: 2px; margin: 16px auto 0; overflow: hidden; }
 .loading-progress-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); width: 30%; animation: progress 1.5s ease-in-out infinite; }
 @keyframes progress { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+.loading-overlay.has-batch .loading-progress { display: none; }
+.loading-file-progress { display: none; margin: 16px 0 0; text-align: left; }
+.loading-file-progress.active { display: block; }
+.loading-file-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.loading-file-count { font-weight: 600; color: var(--text); font-size: 13px; }
+.loading-file-bar { height: 10px; background: var(--border); border-radius: 99px; overflow: hidden; }
+.loading-file-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 99px; transition: width 0.35s ease; }
+.loading-file-name { margin-top: 8px; font-size: 13px; color: var(--text2); word-break: break-word; }
+.loading-stages { display: none; text-align: left; margin: 18px 0 0; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
+.loading-stages.active { display: block; }
+.loading-stage { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; font-size: 13px; color: var(--muted); line-height: 1.35; }
+.loading-stage + .loading-stage { border-top: 1px solid var(--border); }
+.loading-stage.current { color: var(--text); font-weight: 500; }
+.loading-stage.done { color: var(--success); }
+.loading-stage-mark { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; border-radius: 50%; border: 1.5px solid var(--border); box-sizing: border-box; position: relative; }
+.loading-stage.current .loading-stage-mark { border-color: var(--accent); border-top-color: transparent; animation: spin 0.8s linear infinite; }
+.loading-stage.done .loading-stage-mark { background: var(--success); border-color: var(--success); }
+.loading-stage.done .loading-stage-mark::after { content: ''; position: absolute; left: 4px; top: 1px; width: 5px; height: 8px; border: solid #fff; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
+.loading-stage-copy { flex: 1; min-width: 0; }
+.loading-stage-detail { display: block; color: var(--muted); font-weight: 400; font-size: 12px; margin-top: 2px; }
 
 /* Particles */
 .particles { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; z-index: -1; opacity: 0.5; }
@@ -636,14 +715,91 @@ document.addEventListener('keydown', function(e) {
 });
 
 // Loading
-function showLoading(text, subtext) {
+function showLoading(text, subtext, stages) {
     document.getElementById('loadingText').textContent = text || 'Обработка';
     const sub = document.getElementById('loadingSubtext');
     if (sub) sub.textContent = subtext || '';
+    renderLoadingStages(stages || []);
     document.getElementById('loadingOverlay').classList.add('active');
 }
 function hideLoading() {
     document.getElementById('loadingOverlay').classList.remove('active');
+    clearBatchProgress();
+}
+function setBatchProgress(index, total, name, completed) {
+    const overlay = document.getElementById('loadingOverlay');
+    const wrap = document.getElementById('loadingFileProgress');
+    const count = document.getElementById('loadingFileCount');
+    const pct = document.getElementById('loadingFilePct');
+    const fill = document.getElementById('loadingFileBarFill');
+    const fname = document.getElementById('loadingFileName');
+    if (!overlay || !wrap || !total) return;
+    overlay.classList.add('has-batch');
+    wrap.classList.add('active');
+    const done = completed != null ? completed : Math.max(0, (index || 0) - 1);
+    const percent = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+    if (count) {
+        count.textContent = index
+            ? ('Файл ' + index + ' из ' + total)
+            : ('0 из ' + total);
+    }
+    if (pct) pct.textContent = percent + '%';
+    if (fill) fill.style.width = percent + '%';
+    if (fname) fname.textContent = name ? ('«' + name + '»') : 'Ожидание файлов';
+}
+function clearBatchProgress() {
+    const overlay = document.getElementById('loadingOverlay');
+    const wrap = document.getElementById('loadingFileProgress');
+    const fill = document.getElementById('loadingFileBarFill');
+    if (overlay) overlay.classList.remove('has-batch');
+    if (wrap) wrap.classList.remove('active');
+    if (fill) fill.style.width = '0%';
+}
+function setLoadingHeadline(text, subtext) {
+    const title = document.getElementById('loadingText');
+    if (title && text) title.textContent = text;
+    const sub = document.getElementById('loadingSubtext');
+    if (sub) sub.textContent = subtext || '';
+}
+function renderLoadingStages(stages) {
+    const el = document.getElementById('loadingStages');
+    if (!el) return;
+    if (!stages || !stages.length) {
+        el.classList.remove('active');
+        el.innerHTML = '';
+        return;
+    }
+    el.classList.add('active');
+    el.innerHTML = stages.map(function(s) {
+        const status = s.status || 'pending';
+        const detail = s.detail ? '<span class="loading-stage-detail">' + s.detail + '</span>' : '<span class="loading-stage-detail"></span>';
+        return '<div class="loading-stage ' + status + '" data-key="' + s.key + '">'
+            + '<span class="loading-stage-mark"></span>'
+            + '<span class="loading-stage-copy"><span class="loading-stage-label">' + (s.label || '') + '</span>' + detail + '</span>'
+            + '</div>';
+    }).join('');
+}
+function activateLoadingStage(key, title, detail) {
+    const el = document.getElementById('loadingStages');
+    if (!el) return;
+    const items = Array.from(el.querySelectorAll('.loading-stage'));
+    if (!items.length) return;
+    let found = false;
+    items.forEach(function(item) {
+        if (item.dataset.key === key) {
+            found = true;
+            item.className = 'loading-stage current';
+            const label = item.querySelector('.loading-stage-label');
+            if (label && title) label.textContent = title;
+            const d = item.querySelector('.loading-stage-detail');
+            if (d) d.textContent = detail || '';
+        } else if (!found) {
+            item.className = 'loading-stage done';
+        } else if (!item.classList.contains('done')) {
+            item.className = 'loading-stage pending';
+        }
+    });
+    if (found) setLoadingHeadline(title || key, detail || '');
 }
 function submitWithLoading(form, text, subtext) {
     const textarea = form.querySelector('textarea');
@@ -658,6 +814,27 @@ function submitWithLoading(form, text, subtext) {
     showLoading(text, subtext);
     return true;
 }
+async function readSseEvents(resp, onEvent) {
+    if (!resp.ok || !resp.body) return false;
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split('\\n\\n');
+        buf = parts.pop() || '';
+        for (const part of parts) {
+            const line = part.split('\\n').find(function(l) { return l.startsWith('data: '); });
+            if (!line) continue;
+            let data;
+            try { data = JSON.parse(line.slice(6)); } catch (err) { continue; }
+            onEvent(data);
+        }
+    }
+    return true;
+}
 
 // Enter to submit
 document.addEventListener('keydown', function(e) {
@@ -667,9 +844,7 @@ document.addEventListener('keydown', function(e) {
             const form = active.closest('form');
             if (form && form.dataset.enterSubmit === 'true') {
                 e.preventDefault();
-                if (submitWithLoading(form, form.dataset.loadingText || 'Обработка', form.dataset.loadingSubtext || '')) {
-                    form.submit();
-                }
+                form.requestSubmit();
             }
         }
     }
@@ -769,6 +944,15 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         <div class="spinner"></div>
         <div class="loading-text"><span id="loadingText">Обработка</span><span class="loading-dots"></span></div>
         <div class="loading-subtext" id="loadingSubtext"></div>
+        <div class="loading-file-progress" id="loadingFileProgress">
+            <div class="loading-file-meta">
+                <span class="loading-file-count" id="loadingFileCount">Файл 0 из 0</span>
+                <span id="loadingFilePct">0%</span>
+            </div>
+            <div class="loading-file-bar"><div class="loading-file-bar-fill" id="loadingFileBarFill"></div></div>
+            <div class="loading-file-name" id="loadingFileName"></div>
+        </div>
+        <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
     </div>
 </div>
@@ -1248,38 +1432,53 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
         
         {alert}
         
-        <div class="msg-box">Отправьте текст или загрузите файл для записи в базу знаний проекта.</div>
+        <div class="msg-box">Отправьте текст, файл, путь к папке или ссылку Confluence — заметка попадёт в граф проекта.</div>
         
         <div class="tabs">
             <div class="tab active" onclick="showTab('text', this)">📝 Текст</div>
             <div class="tab" onclick="showTab('file', this)">📄 Файл</div>
-            <div class="tab" onclick="showTab('voice', this)">🎤 Голос</div>
             <div class="tab" onclick="showTab('confluence', this)">🔗 Confluence</div>
         </div>
         
         <div id="tab-text" class="tab-content active">
-            <form action="/p/{escape(slug)}/add/text" method="post" data-enter-submit="true" data-loading-text="Сохранение заметки" data-loading-subtext="Анализ и добавление в граф знаний" onsubmit="return submitWithLoading(this, 'Сохранение заметки', 'Анализ и добавление в граф знаний')">
+            <form action="/p/{escape(slug)}/add/text" method="post" data-enter-submit="true" onsubmit="return submitIngest(event, this, PIPELINES.text, 'Добавление заметки', 'Готовим текст к разбору')">
                 <div class="form-group"><textarea name="note_text" placeholder="Введите заметку..." required></textarea></div>
                 <button type="submit" class="btn">Сохранить</button>
             </form>
         </div>
         
         <div id="tab-file" class="tab-content">
-            <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Обработка файла', 'Извлечение текста и анализ содержимого')">
-                <div class="form-group"><label>Файл (.pdf / .txt)</label><input type="file" name="file" accept=".pdf,.txt" required></div>
-                <button type="submit" class="btn">Обработать</button>
-            </form>
-        </div>
-        
-        <div id="tab-voice" class="tab-content">
-            <form action="/p/{escape(slug)}/add/voice" method="post" enctype="multipart/form-data" onsubmit="return submitWithLoading(this, 'Распознавание речи', 'Конвертация и транскрибация аудио')">
-                <div class="form-group"><label>Аудиофайл</label><input type="file" name="file" accept="audio/*" required></div>
-                <button type="submit" class="btn">Распознать</button>
-            </form>
+            <div class="file-modes">
+                <button type="button" class="file-mode active" data-mode="upload" onclick="setFileMode('upload', this)">Загрузить файл</button>
+                <button type="button" class="file-mode" data-mode="folder" onclick="setFileMode('folder', this)">Путь к директории</button>
+            </div>
+            <div id="file-mode-upload">
+                <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitFileIngest(event, this)">
+                    <div class="form-group"><label>Файл (.pdf / .txt)</label><input type="file" name="file" accept=".pdf,.txt" required></div>
+                    <button type="submit" class="btn">Обработать</button>
+                </form>
+            </div>
+            <div id="file-mode-folder" style="display:none">
+                <form id="folderForm" action="/p/{escape(slug)}/add/folder" method="post" onsubmit="return submitFolder(event, this)">
+                    <div class="form-group">
+                        <label>Извлечь из директории</label>
+                        <input type="text" name="folder_path" placeholder="Вставьте путь до директории..." required>
+                    </div>
+                    <label class="tick-check">
+                        <input type="checkbox" name="extract_child_content" value="1">
+                        <span class="tick-box">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>
+                        </span>
+                        извлечь все дочерние файлы
+                    </label>
+                    <button type="submit" class="btn">Обработать</button>
+                </form>
+                <div class="folder-log" id="folderLog"></div>
+            </div>
         </div>
         
         <div id="tab-confluence" class="tab-content">
-            <form action="/p/{escape(slug)}/add/confluence" method="post" onsubmit="return submitConfluence(this)">
+            <form action="/p/{escape(slug)}/add/confluence" method="post" onsubmit="return submitIngest(event, this, PIPELINES.confluence, 'Загрузка Confluence', 'Подключаемся к странице')">
                 <div class="form-group">
                     <label>Извлечь из страницы Confluence</label>
                     <input type="text" name="url" placeholder="Вставьте ссылку на страницу Confluence..." required>
@@ -1291,20 +1490,175 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
     """
 
     js = """
+    const PIPELINES = {
+        text: [
+            {key: 'prepare', label: 'Подготовка заметки'},
+            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'link', label: 'Связывание в граф'}
+        ],
+        file: [
+            {key: 'read', label: 'Чтение файла'},
+            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'link', label: 'Связывание в граф'}
+        ],
+        confluence: [
+            {key: 'fetch', label: 'Загрузка страницы Confluence'},
+            {key: 'read', label: 'Разбор содержимого'},
+            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'link', label: 'Связывание в граф'}
+        ],
+        folder: [
+            {key: 'scan', label: 'Поиск файлов в директории'},
+            {key: 'read', label: 'Чтение файла'},
+            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'link', label: 'Связывание в граф'}
+        ]
+    };
     function showTab(name, el) {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         el.classList.add('active');
         document.getElementById('tab-' + name).classList.add('active');
     }
-    function submitConfluence(form) {
-        const inp = form.querySelector('input[name="url"]');
+    function setFileMode(mode, el) {
+        document.querySelectorAll('.file-mode').forEach(b => b.classList.remove('active'));
+        el.classList.add('active');
+        document.getElementById('file-mode-upload').style.display = mode === 'upload' ? '' : 'none';
+        document.getElementById('file-mode-folder').style.display = mode === 'folder' ? '' : 'none';
+    }
+    function addPageUrl(form) {
+        return form.action.replace(/\\/add\\/[^/]+$/, '/add');
+    }
+    function applyStage(data) {
+        if (!data || data.type !== 'stage') return;
+        activateLoadingStage(data.key, data.title, data.sub || '');
+    }
+    async function submitIngest(e, form, stages, title, subtext) {
+        e.preventDefault();
+        const textarea = form.querySelector('textarea');
+        const textInp = form.querySelector('input[type="text"]');
+        if (textarea && !textarea.value.trim()) { textarea.focus(); return false; }
+        if (textInp && textInp.required && !textInp.value.trim()) { textInp.focus(); return false; }
+        const btn = form.querySelector('button[type="submit"]');
+        if (btn) btn.disabled = true;
+        showLoading(title, subtext, stages);
+        if (stages && stages[0]) activateLoadingStage(stages[0].key, stages[0].label, subtext || '');
+        try {
+            const resp = await fetch(form.action, {
+                method: 'POST',
+                body: new FormData(form),
+                headers: { 'Accept': 'text/event-stream' }
+            });
+            const ct = (resp.headers.get('content-type') || '');
+            if (!resp.ok || !resp.body || !ct.includes('event-stream')) {
+                hideLoading();
+                if (btn) btn.disabled = false;
+                if (resp.redirected) location.href = resp.url;
+                return false;
+            }
+            let finished = false;
+            await readSseEvents(resp, function(data) {
+                if (data.type === 'stage') {
+                    applyStage(data);
+                } else if (data.type === 'result' || data.type === 'error') {
+                    finished = true;
+                    const ok = data.type === 'result' && data.ok;
+                    const msg = data.message || (ok ? 'Готово' : 'Ошибка');
+                    location.href = addPageUrl(form) + '?msg=' + encodeURIComponent(msg) + '&st=' + (ok ? 'ok' : 'err');
+                }
+            });
+            if (!finished) hideLoading();
+        } catch (err) {
+            hideLoading();
+        }
+        if (btn) btn.disabled = false;
+        return false;
+    }
+    function submitFileIngest(e, form) {
+        const fileInput = form.querySelector('input[type="file"]');
+        if (!fileInput || fileInput.files.length === 0) {
+            if (fileInput) fileInput.focus();
+            return false;
+        }
+        const name = fileInput.files[0].name;
+        return submitIngest(e, form, PIPELINES.file, 'Обработка файла', '«' + name + '»');
+    }
+    function appendFolderLog(text, cls) {
+        const log = document.getElementById('folderLog');
+        if (!log) return;
+        log.classList.add('active');
+        const line = document.createElement('div');
+        if (cls) line.className = cls;
+        line.textContent = text;
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
+    }
+    async function submitFolder(e, form) {
+        e.preventDefault();
+        const inp = form.querySelector('input[name="folder_path"]');
         if (!inp || !inp.value.trim()) {
             if (inp) inp.focus();
             return false;
         }
-        showLoading('Загрузка Confluence', 'Извлечение текста и добавление в граф знаний');
-        return true;
+        const btn = form.querySelector('button[type="submit"]');
+        if (btn) btn.disabled = true;
+        const log = document.getElementById('folderLog');
+        if (log) { log.innerHTML = ''; log.classList.add('active'); }
+        showLoading('Обработка директории', 'Ищем файлы в папке', PIPELINES.folder);
+        activateLoadingStage('scan', 'Поиск файлов в директории', 'Смотрим содержимое папки');
+        appendFolderLog('Поиск файлов в директории...', 'log-info');
+        let batchTotal = 0;
+        let batchIndex = 0;
+        try {
+            const resp = await fetch(form.action, {
+                method: 'POST',
+                body: new FormData(form),
+                headers: { 'Accept': 'text/event-stream' }
+            });
+            if (!resp.ok || !resp.body) {
+                hideLoading();
+                appendFolderLog('Не удалось начать обработку', 'log-err');
+                if (btn) btn.disabled = false;
+                return false;
+            }
+            await readSseEvents(resp, function(data) {
+                if (data.type === 'stage') {
+                    applyStage(data);
+                } else if (data.type === 'start') {
+                    batchTotal = data.total || 0;
+                    appendFolderLog('Найдено файлов: ' + batchTotal, 'log-info');
+                    setBatchProgress(0, batchTotal, '', 0);
+                    setLoadingHeadline('Обработка файлов', 'Найдено ' + batchTotal);
+                } else if (data.type === 'file_start') {
+                    batchIndex = data.index || (batchIndex + 1);
+                    batchTotal = data.total || batchTotal;
+                    renderLoadingStages(PIPELINES.file);
+                    setBatchProgress(batchIndex, batchTotal, data.name);
+                    setLoadingHeadline('Обработка файлов', 'Файл ' + batchIndex + ' из ' + batchTotal);
+                    appendFolderLog('Выполняется обработка файла «' + data.name + '»', 'log-info');
+                } else if (data.type === 'file') {
+                    const idx = data.index || batchIndex;
+                    const tot = data.total || batchTotal;
+                    setBatchProgress(idx, tot, data.name, idx);
+                    appendFolderLog(
+                        data.ok
+                            ? 'Файл «' + data.name + '» обработан'
+                            : 'Файл «' + data.name + '»: ' + (data.message || 'ошибка'),
+                        data.ok ? 'log-ok' : 'log-err'
+                    );
+                } else if (data.type === 'error') {
+                    appendFolderLog(data.message || 'Ошибка', 'log-err');
+                } else if (data.type === 'done') {
+                    if (batchTotal) setBatchProgress(batchTotal, batchTotal, '', batchTotal);
+                    appendFolderLog('Готово. Успешно: ' + data.ok + ', с ошибкой: ' + data.fail, data.fail ? 'log-info' : 'log-ok');
+                }
+            });
+        } catch (err) {
+            appendFolderLog('Ошибка соединения', 'log-err');
+        }
+        hideLoading();
+        if (btn) btn.disabled = false;
+        return false;
     }
     """
     return HTMLResponse(html_page("Добавить", body, js))
@@ -1319,21 +1673,87 @@ def _writable_scope(slug: str):
     return scope, None
 
 
+def _wants_sse(request: Request) -> bool:
+    return "text/event-stream" in (request.headers.get("accept") or "").lower()
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _sse_response(generate):
+    return StreamingResponse(
+        generate,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _stream_queue_job(run_sync):
+    loop = asyncio.get_running_loop()
+    q: queue.Queue = queue.Queue()
+
+    def runner():
+        try:
+            run_sync(q)
+        except Exception as e:
+            q.put({"type": "error", "message": str(e)})
+        finally:
+            q.put(None)
+
+    fut = loop.run_in_executor(None, runner)
+
+    async def generate():
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is None:
+                break
+            yield _sse(item)
+        await fut
+
+    return _sse_response(generate())
+
+
+def _stage_put(q: queue.Queue):
+    def on_stage(key: str, title: str, sub: str = "") -> None:
+        q.put({"type": "stage", "key": key, "title": title, "sub": sub})
+
+    return on_stage
+
+
 @app.post("/p/{slug}/add/text")
-async def add_text(slug: str, note_text: str = Form("")):
+async def add_text(slug: str, request: Request, note_text: str = Form("")):
     scope, err = _writable_scope(slug)
     if err:
         return err
     text = note_text.strip()
     if not text:
         return RedirectResponse(f"/p/{slug}/add?msg=Введите текст заметки&st=err", status_code=303)
-    ok, ans = save_user_note(scope["graph_id"], text)
-    log_event(slug, text, "text_artifact", ans)
-    return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+
+    def work(on_stage):
+        if on_stage:
+            on_stage("prepare", "Подготовка заметки", "Проверяем текст")
+        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+        log_event(slug, text, "text_artifact", ans)
+        return ok, ans
+
+    if not _wants_sse(request):
+        ok, ans = work(None)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+
+    def run(q):
+        ok, ans = work(_stage_put(q))
+        q.put({"type": "result", "ok": bool(ok), "message": ans})
+
+    return await _stream_queue_job(run)
 
 
 @app.post("/p/{slug}/add/file")
-async def add_file(slug: str, file: UploadFile = File(None)):
+async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -1345,56 +1765,85 @@ async def add_file(slug: str, file: UploadFile = File(None)):
     if ext not in {".pdf", ".txt"}:
         return RedirectResponse(f"/p/{slug}/add?msg=Поддерживаются .pdf и .txt&st=err", status_code=303)
 
+    filename = file.filename
+    fmt = "PDF" if ext == ".pdf" else "TXT"
     tmp = Path(tempfile.gettempdir()) / f"web_{uuid.uuid4().hex}{ext}"
-    try:
-        with tmp.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        if ext == ".pdf":
-            data = read_pdf(str(tmp))
-            text = "\n".join(str(v) for v in data.values() if v)
-        else:
-            text = read_txt(str(tmp))
-        if not text.strip():
-            return RedirectResponse(f"/p/{slug}/add?msg=Текст не извлечен&st=err", status_code=303)
-        ok, ans = save_user_note(scope["graph_id"], text)
-        log_event(slug, f"[{file.filename}]", ext[1:].upper(), ans)
+    with tmp.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    def work(on_stage):
+        try:
+            if on_stage:
+                on_stage("read", f"Чтение {fmt}", f"«{filename}»")
+            text = extract_file_text(str(tmp))
+            if not (text or "").strip():
+                return False, "Текст не извлечен"
+            ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+            log_event(slug, f"[{filename}]", ext[1:].upper(), ans)
+            return ok, ans
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    if not _wants_sse(request):
+        ok, ans = work(None)
         return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
-    finally:
-        tmp.unlink(missing_ok=True)
+
+    def run(q):
+        ok, ans = work(_stage_put(q))
+        q.put({"type": "result", "ok": bool(ok), "message": ans})
+
+    return await _stream_queue_job(run)
 
 
-@app.post("/p/{slug}/add/voice")
-async def add_voice(slug: str, file: UploadFile = File(None)):
+@app.post("/p/{slug}/add/folder")
+async def add_folder(
+    slug: str,
+    folder_path: str = Form(""),
+    extract_child_content: str = Form(""),
+):
     scope, err = _writable_scope(slug)
     if err:
         return err
 
-    if not file or not file.filename:
-        return RedirectResponse(f"/p/{slug}/add?msg=Выберите аудиофайл&st=err", status_code=303)
+    child = extract_child_content.strip().lower() in {"1", "on", "true", "yes"}
+    uid = scope["graph_id"]
 
-    ext = Path(file.filename).suffix.lower() or ".bin"
-    inp = Path(tempfile.gettempdir()) / f"web_v_{uuid.uuid4().hex}{ext}"
-    wav = Path(tempfile.gettempdir()) / f"web_v_{uuid.uuid4().hex}.wav"
-    try:
-        with inp.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        if ext != ".wav":
-            proc = await asyncio.create_subprocess_exec("ffmpeg", "-i", str(inp), str(wav), "-y",
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            await proc.communicate()
-            if proc.returncode != 0:
-                return RedirectResponse(f"/p/{slug}/add?msg=Ошибка конвертации аудио&st=err", status_code=303)
-        else:
-            wav = inp
-        text = await asyncio.get_running_loop().run_in_executor(None, asr.recognize_audio, str(wav))
-        ok, ans = save_user_note(scope["graph_id"], text)
-        msg = f"🎤 \"{text[:100]}{'...' if len(text)>100 else ''}\"\n\n{ans}"
-        log_event(slug, text, "voice", ans)
-        return RedirectResponse(f"/p/{slug}/add?msg={escape(msg)}&st={'ok' if ok else 'err'}", status_code=303)
-    finally:
-        inp.unlink(missing_ok=True)
-        if wav != inp:
-            wav.unlink(missing_ok=True)
+    def run(q):
+        on_stage = _stage_put(q)
+        on_stage("scan", "Поиск файлов в директории", "Смотрим содержимое папки")
+        files, error = list_folder_files(folder_path, extract_child_content=child)
+        if error:
+            q.put({"type": "error", "message": error})
+            q.put({"type": "done", "ok": 0, "fail": 0})
+            return
+
+        q.put({"type": "start", "total": len(files)})
+        ok_n = 0
+        fail_n = 0
+        total = len(files)
+        for i, path in enumerate(files, 1):
+            name = Path(path).name
+            ext = Path(path).suffix.lower()
+            fmt = "PDF" if ext == ".pdf" else "TXT"
+            q.put({"type": "file_start", "name": name, "index": i, "total": total})
+            try:
+                on_stage("read", f"Чтение {fmt}", f"«{name}»")
+                text = extract_file_text(path)
+                if not (text or "").strip():
+                    ok, ans = False, "Текст не извлечен"
+                else:
+                    ok, ans = save_user_note(uid, text, on_stage=on_stage)
+            except Exception as e:
+                ok, ans = False, str(e)
+            if ok:
+                ok_n += 1
+            else:
+                fail_n += 1
+            log_event(slug, f"[{name}]", "folder", ans)
+            q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
+        q.put({"type": "done", "ok": ok_n, "fail": fail_n})
+
+    return await _stream_queue_job(run)
 
 
 def _is_confluence_fetch_error(text: str) -> bool:
@@ -1408,7 +1857,7 @@ def _is_confluence_fetch_error(text: str) -> bool:
 
 
 @app.post("/p/{slug}/add/confluence")
-async def add_confluence(slug: str, url: str = Form("")):
+async def add_confluence(slug: str, request: Request, url: str = Form("")):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -1423,15 +1872,29 @@ async def add_confluence(slug: str, url: str = Form("")):
             status_code=303,
         )
 
-    text = await asyncio.get_running_loop().run_in_executor(None, get_confluence_page_content, page_url)
-    if _is_confluence_fetch_error(text):
-        err_text = text.strip() or "Не удалось извлечь текст со страницы Confluence"
-        log_event(slug, page_url, "confluence", err_text)
-        return RedirectResponse(f"/p/{slug}/add?msg={escape(err_text)}&st=err", status_code=303)
+    def work(on_stage):
+        if on_stage:
+            on_stage("fetch", "Загрузка страницы Confluence", "Запрашиваем содержимое")
+        text = get_confluence_page_content(page_url)
+        if _is_confluence_fetch_error(text):
+            err_text = text.strip() or "Не удалось извлечь текст со страницы Confluence"
+            log_event(slug, page_url, "confluence", err_text)
+            return False, err_text
+        if on_stage:
+            on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
+        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+        log_event(slug, page_url, "confluence", ans)
+        return ok, ans
 
-    ok, ans = save_user_note(scope["graph_id"], text)
-    log_event(slug, page_url, "confluence", ans)
-    return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+    if not _wants_sse(request):
+        ok, ans = work(None)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+
+    def run(q):
+        ok, ans = work(_stage_put(q))
+        q.put({"type": "result", "ok": bool(ok), "message": ans})
+
+    return await _stream_queue_job(run)
 
 
 # ========== SEARCH (Chat style with formatting) ==========
@@ -1594,6 +2057,7 @@ async def api_search(slug: str, request: Request):
         project_labels=labels if scope["readonly"] else None,
     )
     log_event(slug, query, "search_query", resp.answer)
+    record_app_event("search", "ok")
     formatted = format_llm_response(resp.answer)
     sources = []
     if scope["readonly"] and labels:

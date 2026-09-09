@@ -1,0 +1,200 @@
+{
+  "uid": "exocortex-llm-latency",
+  "title": "Exocortex / Latency TTFT Prefill Decode",
+  "tags": ["exocortex", "llm", "latency"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "project",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, project)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, model)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "component",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(exocortex_llm_requests_total, component)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "E2E p95",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 2 } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "TTFT p95",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_ttft_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 2 } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Prefill p95",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_prefill_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 2 } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Decode tok/s p50",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(exocortex_llm_decode_tokens_per_second_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1 } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "E2E latency p50 / p95 / p99",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        },
+        {
+          "refId": "C",
+          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "TTFT / prefill / decode p95",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "TTFT p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_ttft_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "prefill p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_prefill_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        },
+        {
+          "refId": "C",
+          "legendFormat": "decode p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(exocortex_llm_decode_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "TTFT p95 по моделям",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{model}}",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(exocortex_llm_ttft_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Decode tokens/s по этапам",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "expr": "histogram_quantile(0.50, sum by (le, component) (rate(exocortex_llm_decode_tokens_per_second_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Latency p95 по этапам пайплайна",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "expr": "histogram_quantile(0.95, sum by (le, component) (rate(exocortex_llm_latency_seconds_bucket{project=~\"$project\",model=~\"$model\",component=~\"$component\"}[5m])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}
