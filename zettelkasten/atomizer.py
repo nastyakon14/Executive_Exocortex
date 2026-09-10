@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from dotenv import load_dotenv
 from config.settings import settings
-from observability.llm import make_chat_openai
+from observability.llm import make_chat_openai, print_llm_request
 
 load_dotenv()
 
@@ -436,6 +436,7 @@ class NoteAtomizer:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=preamble + body),
         ]
+        print_llm_request("atomizer", messages, model_name=self.model_name)
         return self.structured_llm.invoke(messages)
 
     def _build_cards(

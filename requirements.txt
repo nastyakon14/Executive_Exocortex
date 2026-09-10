@@ -30,3 +30,5 @@ fastapi
 uvicorn 
 python-multipart
 
+natasha
+faker

@@ -4,10 +4,12 @@
 """
 
 import json
+import math
 import os
 import re
 import tempfile
-from typing import Dict, Any
+from collections import defaultdict
+from typing import Dict, Any, Tuple
 
 from storage.neo4j.client import Neo4jClient
 from storage.neo4j.repository import ZettelRepository
@@ -66,6 +68,116 @@ def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
         root: _BRANCH_PALETTE[i % len(_BRANCH_PALETTE)]
         for i, root in enumerate(roots)
     }
+
+
+def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
+    """
+    Быстрая раскладка дерева без vis.js physics.
+    Мысли — лес по CHILD_OF, сущности — рядом с упоминающими их узлами.
+    """
+    zettels = graph_data.get("zettels") or []
+    entities = graph_data.get("entities") or []
+    edges = graph_data.get("edges") or []
+
+    children: dict[str, list[str]] = defaultdict(list)
+    luhmann_to_id: dict[str, str] = {}
+    parent_of: dict[str, str | None] = {}
+    order: list[str] = []
+    for z in zettels:
+        lid = z["luhmann_id"]
+        luhmann_to_id[lid] = z["zettel_id"]
+        order.append(lid)
+        parent = z.get("parent_luhmann")
+        parent_of[lid] = parent
+        if parent:
+            children[parent].append(lid)
+
+    known = set(luhmann_to_id)
+    roots: list[str] = []
+    seen_roots = set()
+    for lid in order:
+        parent = parent_of.get(lid)
+        if (not parent or parent not in known) and lid not in seen_roots:
+            seen_roots.add(lid)
+            roots.append(lid)
+    roots.sort(key=_luhmann_sort_key)
+
+    x_unit = 150
+    y_gap = 165
+    leaf_memo: dict[str, int] = {}
+
+    def leaf_count(lid: str, stack: set[str]) -> int:
+        cached = leaf_memo.get(lid)
+        if cached is not None:
+            return cached
+        if lid in stack:
+            return 1
+        stack.add(lid)
+        kids = [c for c in children[lid] if c in known]
+        total = sum(leaf_count(c, stack) for c in kids) if kids else 1
+        stack.remove(lid)
+        leaf_memo[lid] = max(total, 1)
+        return leaf_memo[lid]
+
+    pos: Dict[str, Tuple[float, float]] = {}
+
+    def place(lid: str, x_left: float, y: float) -> None:
+        width = leaf_count(lid, set()) * x_unit
+        zid = luhmann_to_id.get(lid)
+        if zid:
+            pos[zid] = (x_left + width / 2, y)
+        cursor = x_left
+        for child in children[lid]:
+            if child not in known:
+                continue
+            child_w = leaf_count(child, set()) * x_unit
+            place(child, cursor, y + y_gap)
+            cursor += child_w
+
+    def tree_depth(lid: str, stack: set[str]) -> int:
+        if lid in stack:
+            return 0
+        stack.add(lid)
+        kids = [c for c in children[lid] if c in known]
+        depth = 1 + max((tree_depth(c, stack) for c in kids), default=0)
+        stack.remove(lid)
+        return depth
+
+    row_limit = 3200
+    x_cursor = 0.0
+    y_cursor = 0.0
+    row_h = 0.0
+    for root in roots:
+        width = leaf_count(root, set()) * x_unit
+        height = tree_depth(root, set()) * y_gap
+        if x_cursor > 0 and x_cursor + width > row_limit:
+            x_cursor = 0.0
+            y_cursor += row_h + 260
+            row_h = 0.0
+        place(root, x_cursor, y_cursor)
+        x_cursor += width + 110
+        row_h = max(row_h, height)
+
+    neighbors: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        to_id = str(edge.get("to_id") or "")
+        from_id = edge.get("from_id")
+        if to_id.startswith("entity:") and from_id:
+            neighbors[to_id].append(from_id)
+
+    for i, entity in enumerate(entities):
+        eid = f"entity:{entity['name']}"
+        pts = [pos[zid] for zid in neighbors.get(eid, []) if zid in pos]
+        if pts:
+            ax = sum(p[0] for p in pts) / len(pts)
+            ay = sum(p[1] for p in pts) / len(pts)
+            pos[eid] = (
+                ax + 34 * math.cos(i * 1.7),
+                ay + 72 + 34 * math.sin(i * 1.7),
+            )
+        else:
+            pos[eid] = (i * 88.0, y_cursor + row_h + 220)
+    return pos
 
 
 def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
@@ -156,6 +268,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         return 24
 
     branch_colors = _assign_branch_colors(graph_data["zettels"], parent_by_luhmann)
+    positions = _compute_node_positions(graph_data)
 
     for z in graph_data["zettels"]:
         nid = z["zettel_id"]
@@ -189,11 +302,17 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
         root_luhmann = _find_root_luhmann(z["luhmann_id"], parent_by_luhmann)
         branch = branch_colors[root_luhmann]
 
+        xy = positions.get(nid, (0.0, 0.0))
         vis_nodes.append({
             "id": nid,
             "label": label,
             "preview": f"{topic}: {_short_text(z['content'], 100)}" if topic else _short_text(z["content"], 120),
             "title": title,
+            "searchText": " ".join([
+                z["luhmann_id"], topic, z["content"], tags_str, tt, z.get("parent_luhmann") or "",
+            ]).lower(),
+            "x": xy[0],
+            "y": xy[1],
             "color": {
                 "background": branch["bg"],
                 "border": branch["border"],
@@ -220,11 +339,15 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
             f"<i>Упоминаний:</i> {mentions}"
         )
 
+        xy = positions.get(eid, (0.0, 0.0))
         vis_nodes.append({
             "id": eid,
             "label": make_entity_label(e["display_name"]),
             "preview": e["display_name"],
             "title": title,
+            "searchText": f"{e['display_name']} {e.get('entity_type', '')} {e.get('name', '')}".lower(),
+            "x": xy[0],
+            "y": xy[1],
             "color": {
                 "background": _ENTITY_NODE_BG,
                 "border": _ENTITY_BORDER,
@@ -234,13 +357,6 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
             "shape": "circle",
             "font": {"size": 11, "color": "#0c4a6e", "face": "Arial", "multi": True},
             "borderWidth": 3,
-            "shadow": {
-                "enabled": True,
-                "color": "rgba(56, 189, 248, 0.65)",
-                "size": 16,
-                "x": 0,
-                "y": 0,
-            },
             "group": "entity",
         })
 
@@ -529,35 +645,21 @@ const edges = new vis.DataSet(edgesData);
 const container = document.getElementById('graph');
 const data = {{ nodes, edges }};
 const options = {{
-  physics: {{
-    enabled: true,
-    solver: 'barnesHut',
-    barnesHut: {{
-      gravitationalConstant: -3000,
-      centralGravity: 0.15,
-      springLength: 150,
-      springConstant: 0.02,
-      damping: 0.3,
-      avoidOverlap: 0.8,
-    }},
-    stabilization: {{
-      enabled: true,
-      iterations: 400,
-      fit: true,
-    }},
-  }},
+  physics: {{ enabled: false }},
   interaction: {{
-    hover: true,
-    tooltipDelay: 150,
-    zoomSpeed: 0.18,
+    hover: nodesData.length < 800,
+    tooltipDelay: 220,
+    zoomSpeed: 0.22,
     zoomView: true,
     dragView: true,
     dragNodes: true,
     navigationButtons: false,
     keyboard: true,
+    hideEdgesOnDrag: nodesData.length > 400,
+    hideEdgesOnZoom: nodesData.length > 400,
   }},
   edges: {{
-    smooth: {{ type: 'continuous' }},
+    smooth: {{ enabled: nodesData.length < 600, type: 'continuous' }},
     selectionWidth: 1.5,
     hoverWidth: 1.2,
   }},
@@ -565,16 +667,13 @@ const options = {{
     shadow: false,
   }},
   layout: {{
-    improvedLayout: true,
+    improvedLayout: false,
     hierarchical: false,
   }},
 }};
 
 const network = new vis.Network(container, data, options);
-network.once('stabilizationIterationsDone', function() {{
-  network.setOptions({{ physics: {{ enabled: false }} }});
-  network.fit();
-}});
+network.fit({{ animation: false }});
 
 // переключатель темы (светлая / тёмная)
 const themeToggleBtn = document.getElementById('theme-toggle');
@@ -739,35 +838,55 @@ network.on('doubleClick', function(params) {{
 
 // фильтрация узлов по тексту поиска
 const searchInput = document.getElementById('searchInput');
-searchInput.addEventListener('input', function() {{
-  const q = this.value.toLowerCase().trim();
+const adj = new Map();
+edgesData.forEach(e => {{
+  if (!adj.has(e.from)) adj.set(e.from, []);
+  if (!adj.has(e.to)) adj.set(e.to, []);
+  adj.get(e.from).push(e.to);
+  adj.get(e.to).push(e.from);
+}});
+const searchIndex = nodesData.map(n => ({{
+  id: n.id,
+  hay: (n.searchText || ((n.label || '') + ' ' + (n.preview || '') + ' ' + (n.title || ''))).toLowerCase()
+}}));
+let searchTimer = 0;
+function applyGraphSearch(raw) {{
+  const q = (raw || '').toLowerCase().trim();
   if (!q) {{
-    nodes.forEach(n => nodes.update({{ id: n.id, hidden: false, opacity: 1 }}));
-    edges.forEach(e => edges.update({{ id: e.id, hidden: false }}));
+    nodes.update(nodesData.map(n => ({{ id: n.id, hidden: false }})));
+    edges.update(edges.getIds().map(id => ({{ id, hidden: false }})));
     return;
   }}
   const matched = new Set();
-  nodes.forEach(n => {{
-    const text = (n.label + ' ' + (n.title || '')).toLowerCase();
-    if (text.includes(q)) matched.add(n.id);
-  }});
-  // Also show neighbors of matched nodes
-  const extended = new Set(matched);
+  for (const item of searchIndex) {{
+    if (item.hay.includes(q)) matched.add(item.id);
+  }}
+  const visible = new Set(matched);
   matched.forEach(nid => {{
-    network.getConnectedNodes(nid).forEach(cid => extended.add(cid));
+    const nbrs = adj.get(nid);
+    if (nbrs) nbrs.forEach(cid => visible.add(cid));
   }});
-  nodes.forEach(n => {{
-    nodes.update({{ id: n.id, hidden: !extended.has(n.id) }});
-  }});
+  nodes.update(nodesData.map(n => ({{ id: n.id, hidden: !visible.has(n.id) }})));
+  const edgeUpdates = [];
   edges.forEach(e => {{
-    const vis = extended.has(e.from) && extended.has(e.to);
-    edges.update({{ id: e.id, hidden: !vis }});
+    edgeUpdates.push({{ id: e.id, hidden: !(visible.has(e.from) && visible.has(e.to)) }});
   }});
+  edges.update(edgeUpdates);
+}}
+searchInput.addEventListener('input', function() {{
+  const value = this.value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(function() {{ applyGraphSearch(value); }}, 60);
 }});
 </script>
 </body>
 </html>"""
     return html
+
+
+def render_graph_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
+    """Собирает HTML-граф в память — без временного файла."""
+    return _build_html(graph_data, user_label=user_label)
 
 
 def generate_graph_html(user_id: str, output_path: str | None = None) -> str:
@@ -779,7 +898,7 @@ def generate_graph_html(user_id: str, output_path: str | None = None) -> str:
     repo = ZettelRepository(client)
     graph_data = repo.export_graph_data(user_id)
 
-    html_content = _build_html(graph_data, user_label=user_id)
+    html_content = render_graph_html(graph_data, user_label=user_id)
 
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".html", prefix="graph_")
@@ -797,7 +916,7 @@ def generate_graph_html_from_data(
     output_path: str | None = None,
 ) -> str:
     """Собирает HTML-граф из уже выгруженных данных."""
-    html_content = _build_html(graph_data, user_label=user_label)
+    html_content = render_graph_html(graph_data, user_label=user_label)
 
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".html", prefix="graph_")
@@ -814,7 +933,7 @@ def generate_graph_html_from_repo(
 ) -> str:
     """Вариант без создания нового клиента — переиспользует существующий repository."""
     graph_data = repo.export_graph_data(user_id)
-    html_content = _build_html(graph_data, user_label=user_id)
+    html_content = render_graph_html(graph_data, user_label=user_id)
 
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".html", prefix="graph_")

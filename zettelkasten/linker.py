@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
-from observability.llm import make_chat_openai
+from observability.llm import make_chat_openai, print_llm_request
 from storage.neo4j.client import get_neo4j_client
 from storage.neo4j.schema import init_schema
 from storage.neo4j.repository import ZettelRepository, ZettelNode, GraphContext
@@ -202,9 +202,11 @@ class GraphLinker:
         user_prompt_template: str = settings.linker_user_prompt_template,
         similarity_threshold: float = settings.linker_similarity_threshold,
         max_candidates: int = settings.linker_max_candidates,
+        privacy_anonymizer=None,
     ):
         self._embedding_model = embedding_model
         self._repository = repository
+        self._privacy_anonymizer = privacy_anonymizer
         
         self.model_name = model_name
         self.system_prompt = system_prompt
@@ -351,7 +353,6 @@ class GraphLinker:
     
     def _ask_llm(self, card: ZettelCard, contexts: List[GraphContext]) -> LinkDecision:
         """Формирует промпт с контекстом графа и спрашивает LLM."""
-        
         candidates_text = ""
         for ctx in contexts:
             cand = ctx.candidate
@@ -376,11 +377,16 @@ class GraphLinker:
             content=card.content,
             candidates_text=candidates_text,
         )
-        
-        return self.structured_llm.invoke([
+        if self._privacy_anonymizer:
+            from zettelkasten.anonymizer import EntityMap
+            user_prompt = self._privacy_anonymizer.mask(user_prompt, EntityMap())
+
+        messages = [
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
-        ])
+        ]
+        print_llm_request("linker", messages, model_name=self.model_name)
+        return self.structured_llm.invoke(messages)
     
     def _apply_new_root(
         self,

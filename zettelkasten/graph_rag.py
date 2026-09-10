@@ -255,10 +255,12 @@ class RAGGenerator:
         system_prompt: str = settings.graphrag_system_prompt,
         user_prompt_template: str = settings.graphrag_user_prompt_template,
         no_context_response: str = settings.graphrag_no_context_response,
+        privacy_anonymizer=None,
     ):
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
         self.no_context_response = no_context_response
+        self._privacy_anonymizer = privacy_anonymizer
 
         self.model_name = model_name
         self.llm = make_chat_openai(
@@ -276,7 +278,6 @@ class RAGGenerator:
             return self.no_context_response
         
         context_str = context.to_context_string()
-        
         user_prompt = self.user_prompt_template.format(
             context=context_str,
             query=query,
@@ -286,6 +287,12 @@ class RAGGenerator:
                 "\nЕсли у мыслей указан проект, в ответе явно называй, "
                 "из какого проекта взята мысль."
             )
+
+        entity_map = None
+        if self._privacy_anonymizer:
+            from zettelkasten.anonymizer import EntityMap
+            entity_map = EntityMap()
+            user_prompt = self._privacy_anonymizer.mask(user_prompt, entity_map)
         
         response = invoke_chat_stream(
             self.llm,
@@ -296,7 +303,9 @@ class RAGGenerator:
             component="graphrag",
             model_name=self.model_name,
         )
-        
+
+        if entity_map:
+            response = entity_map.unmask(response)
         return response
 
 
@@ -318,6 +327,7 @@ class GraphRAG:
         user_prompt_template: str = settings.graphrag_user_prompt_template,
         no_context_response: str = settings.graphrag_no_context_response,
         similarity_threshold: float = settings.graphrag_similarity_threshold,
+        privacy_anonymizer=None,
     ):
         self.similarity_threshold = similarity_threshold
         self.retriever = GraphRetriever(
@@ -330,6 +340,7 @@ class GraphRAG:
             system_prompt=system_prompt,
             user_prompt_template=user_prompt_template,
             no_context_response=no_context_response,
+            privacy_anonymizer=privacy_anonymizer,
         )
     
     def query(

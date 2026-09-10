@@ -14,12 +14,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 
 from config.settings import settings
-from observability.context import reset_obs_context, set_obs_context
-from observability.metrics import record_app_event
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
 from telegram_bot.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
 from telegram_bot.handlers.folders import extract_file_text, list_folder_files
@@ -32,26 +29,6 @@ from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
 load_dotenv()
 
 app = FastAPI(title="Project Exocortex Web App")
-
-
-@app.middleware("http")
-async def observability_context(request: Request, call_next):
-    path = request.url.path
-    project = "hub"
-    if path.startswith("/p/"):
-        parts = path.split("/")
-        if len(parts) > 2 and parts[2]:
-            project = parts[2]
-    tokens = set_obs_context(project=project, source="web")
-    try:
-        return await call_next(request)
-    finally:
-        reset_obs_context(tokens)
-
-
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 create_database()
 create_tables()
@@ -278,7 +255,6 @@ def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
         on_progress=atom_progress,
     )
     if isinstance(raw_cards, str):
-        record_app_event("note_add", "error")
         return False, f"Ошибка: {raw_cards}"
 
     for card in raw_cards:
@@ -293,7 +269,6 @@ def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
     stage("link", "Связывание в граф", f"Линкер встраивает {total} карточек")
     linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
     stats = linker.get_user_stats(user_id)
-    record_app_event("note_add", "ok")
     return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
 
 
@@ -303,7 +278,7 @@ def log_event(scope_key: str, message_text: str, message_type: str, bot_answer: 
         update_history_messages(numeric, int(time.time() * 1000),
             message_text, datetime.now(), message_type, bot_answer)
     except Exception as e:
-        print(f"[web_app] log warning: {e}")
+        print(f"[web_app_v2] log warning: {e}")
 
 
 def project_nav(scope: dict) -> str:
@@ -2079,7 +2054,6 @@ async def api_search(slug: str, request: Request):
         project_labels=labels if scope["readonly"] else None,
     )
     log_event(slug, query, "search_query", resp.answer)
-    record_app_event("search", "ok")
     formatted = format_llm_response(resp.answer)
     sources = []
     if scope["readonly"] and labels:
@@ -2327,4 +2301,4 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("WEB_APP_PORT", "8008"))
-    uvicorn.run("web_app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=port, reload=False)

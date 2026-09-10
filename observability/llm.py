@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Any, Sequence
 
@@ -6,6 +7,25 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 
 from observability.metrics import record_llm_call
+
+
+def print_llm_request(component: str, messages: Sequence[BaseMessage], *, model_name: str = "") -> None:
+    """Печатает то, что уходит в chat-LLM. Выключается: DEBUG_LLM_PROMPTS=0."""
+    if os.getenv("DEBUG_LLM_PROMPTS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    model_bit = f"  model={model_name}" if model_name else ""
+    print(f"\n{'=' * 72}", flush=True)
+    print(f"LLM REQUEST  [{component}]{model_bit}", flush=True)
+    print("=" * 72, flush=True)
+    for msg in messages:
+        role = getattr(msg, "type", None) or msg.__class__.__name__
+        content = getattr(msg, "content", "") or ""
+        if role in {"system", "SystemMessage"}:
+            print(f"--- system ({len(content)} символов, статический промпт) ---", flush=True)
+            continue
+        print(f"--- {role} ---", flush=True)
+        print(content, flush=True)
+    print("=" * 72 + "\n", flush=True)
 
 
 def _usage_from_response(response: Any) -> tuple[int, int, float | None]:
@@ -127,6 +147,7 @@ def invoke_chat_stream(
     model_name: str,
 ) -> str:
     """Стрим с TTFT/prefill/decode. Callback на модели лучше отключить, чтобы не двойнить метрики."""
+    print_llm_request(component, messages, model_name=model_name)
     t0 = time.perf_counter()
     ttft = None
     parts: list[str] = []

@@ -719,62 +719,9 @@ class ZettelRepository:
         """
         Экспортирует полный граф пользователя для визуализации:
         zettel-узлы, entity-узлы и все связи (CHILD_OF, RELATED_TO, MENTIONS).
+        Эмбеддинги не выгружаются — они раздувают ответ Neo4j и не нужны vis.js.
         """
-        nodes_query = """
-        MATCH (z:Zettel {user_id: $user_id})
-        OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel {user_id: $user_id})
-        RETURN z, parent.luhmann_id as parent_luhmann
-        """
-        nodes_result = self.client.execute_read(nodes_query, {"user_id": user_id})
-
-        edges_query = """
-        MATCH (a:Zettel {user_id: $user_id})-[r]->(b)
-        WHERE (b:Zettel AND b.user_id = $user_id) OR (b:Entity AND b.user_id = $user_id)
-        RETURN a.zettel_id AS from_id,
-               type(r) AS rel_type,
-               CASE WHEN b:Zettel THEN b.zettel_id ELSE 'entity:' + b.name END AS to_id
-        """
-        edges_result = self.client.execute_read(edges_query, {"user_id": user_id})
-
-        entities_query = """
-        MATCH (z:Zettel {user_id: $user_id})-[:MENTIONS]->(e:Entity {user_id: $user_id})
-        RETURN DISTINCT e
-        """
-        entities_result = self.client.execute_read(entities_query, {"user_id": user_id})
-
-        zettels = []
-        for row in nodes_result:
-            z = row["z"]
-            zettels.append({
-                "zettel_id": z["zettel_id"],
-                "luhmann_id": z["luhmann_id"],
-                "topic": z.get("topic", ""),
-                "content": z["content"],
-                "thought_type": z["thought_type"],
-                "tags": list(z.get("tags", [])),
-                "is_root_topic": z.get("is_root_topic", False),
-                "parent_luhmann": row["parent_luhmann"],
-            })
-
-        entities = []
-        for row in entities_result:
-            e = row["e"]
-            entities.append({
-                "name": e["name"],
-                "display_name": e.get("display_name", e["name"]),
-                "entity_type": e.get("entity_type", "tag"),
-                "mention_count": e.get("mention_count", 0),
-            })
-
-        edges = []
-        for row in edges_result:
-            edges.append({
-                "from_id": row["from_id"],
-                "to_id": row["to_id"],
-                "rel_type": row["rel_type"],
-            })
-
-        return {"zettels": zettels, "entities": entities, "edges": edges}
+        return self._export_graph_data_for_users([user_id], labels=None, prefix_luhmann=False)
 
     def export_graph_data_combined(
         self,
@@ -782,35 +729,115 @@ class ZettelRepository:
         labels: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Собирает графы нескольких проектов в один, без пересечения Luhmann ID."""
-        labels = labels or {}
-        zettels, entities, edges = [], [], []
-        seen_entities = set()
+        return self._export_graph_data_for_users(user_ids, labels=labels or {}, prefix_luhmann=True)
 
-        for uid in user_ids:
-            data = self.export_graph_data(uid)
-            label = labels.get(uid, uid)
-            short = re.sub(r"\s+", " ", label).strip()[:18] or uid
-            for z in data["zettels"]:
-                item = dict(z)
-                item["luhmann_id"] = f"{short}/{z['luhmann_id']}"
-                if z.get("parent_luhmann"):
-                    item["parent_luhmann"] = f"{short}/{z['parent_luhmann']}"
-                zettels.append(item)
-            for e in data["entities"]:
-                key = f"{uid}::{e['name']}"
-                if key in seen_entities:
-                    continue
-                seen_entities.add(key)
-                item = dict(e)
-                item["name"] = key
-                item["display_name"] = e.get("display_name", e["name"])
-                entities.append(item)
-            for edge in data["edges"]:
-                item = dict(edge)
-                if str(item.get("to_id", "")).startswith("entity:"):
-                    raw = item["to_id"][7:]
-                    item["to_id"] = f"entity:{uid}::{raw}"
-                edges.append(item)
+    def _export_graph_data_for_users(
+        self,
+        user_ids: List[str],
+        labels: Optional[Dict[str, str]] = None,
+        prefix_luhmann: bool = False,
+    ) -> Dict[str, Any]:
+        if not user_ids:
+            return {"zettels": [], "entities": [], "edges": []}
+
+        labels = labels or {}
+        params = {"user_ids": user_ids}
+
+        nodes_query = """
+        MATCH (z:Zettel)
+        WHERE z.user_id IN $user_ids
+        OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
+        WHERE parent.user_id = z.user_id
+        RETURN z.user_id AS user_id,
+               z.zettel_id AS zettel_id,
+               z.luhmann_id AS luhmann_id,
+               z.topic AS topic,
+               z.content AS content,
+               z.thought_type AS thought_type,
+               z.tags AS tags,
+               z.is_root_topic AS is_root_topic,
+               parent.luhmann_id AS parent_luhmann
+        """
+        edges_query = """
+        MATCH (a:Zettel)-[r]->(b)
+        WHERE a.user_id IN $user_ids
+          AND (
+            (b:Zettel AND b.user_id = a.user_id)
+            OR (b:Entity AND b.user_id = a.user_id)
+          )
+        RETURN a.user_id AS user_id,
+               a.zettel_id AS from_id,
+               type(r) AS rel_type,
+               CASE WHEN b:Zettel THEN b.zettel_id ELSE 'entity:' + b.name END AS to_id
+        """
+        entities_query = """
+        MATCH (z:Zettel)-[:MENTIONS]->(e:Entity)
+        WHERE z.user_id IN $user_ids AND e.user_id = z.user_id
+        RETURN DISTINCT z.user_id AS user_id,
+               e.name AS name,
+               e.display_name AS display_name,
+               e.entity_type AS entity_type,
+               e.mention_count AS mention_count
+        """
+
+        nodes_result = self.client.execute_read(nodes_query, params)
+        edges_result = self.client.execute_read(edges_query, params)
+        entities_result = self.client.execute_read(entities_query, params)
+
+        prefix_by_uid: Dict[str, str] = {}
+        if prefix_luhmann:
+            for uid in user_ids:
+                label = labels.get(uid, uid)
+                prefix_by_uid[uid] = re.sub(r"\s+", " ", label).strip()[:18] or uid
+
+        zettels = []
+        for row in nodes_result:
+            uid = row.get("user_id") or ""
+            luhmann = row.get("luhmann_id") or ""
+            parent_luhmann = row.get("parent_luhmann")
+            if prefix_luhmann:
+                short = prefix_by_uid.get(uid, uid)
+                luhmann = f"{short}/{luhmann}"
+                if parent_luhmann:
+                    parent_luhmann = f"{short}/{parent_luhmann}"
+            zettels.append({
+                "zettel_id": row["zettel_id"],
+                "luhmann_id": luhmann,
+                "topic": row.get("topic") or "",
+                "content": row.get("content") or "",
+                "thought_type": row.get("thought_type") or "",
+                "tags": list(row.get("tags") or []),
+                "is_root_topic": bool(row.get("is_root_topic")),
+                "parent_luhmann": parent_luhmann,
+            })
+
+        entities = []
+        seen_entities = set()
+        for row in entities_result:
+            uid = row.get("user_id") or ""
+            raw_name = row.get("name") or ""
+            key = f"{uid}::{raw_name}" if prefix_luhmann else raw_name
+            if key in seen_entities:
+                continue
+            seen_entities.add(key)
+            entities.append({
+                "name": key,
+                "display_name": row.get("display_name") or raw_name,
+                "entity_type": row.get("entity_type") or "tag",
+                "mention_count": row.get("mention_count") or 0,
+            })
+
+        edges = []
+        for row in edges_result:
+            to_id = row["to_id"]
+            if prefix_luhmann and str(to_id).startswith("entity:"):
+                uid = row.get("user_id") or ""
+                to_id = f"entity:{uid}::{to_id[7:]}"
+            edges.append({
+                "from_id": row["from_id"],
+                "to_id": to_id,
+                "rel_type": row["rel_type"],
+            })
 
         return {"zettels": zettels, "entities": entities, "edges": edges}
 
