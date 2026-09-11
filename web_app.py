@@ -26,7 +26,7 @@ from telegram_bot.handlers.folders import extract_file_text, list_folder_files
 from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG
-from zettelkasten.graph_visualizer import render_graph_html
+from zettelkasten.graph_visualizer import encode_graph_html, render_graph_html
 from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
 
 load_dotenv()
@@ -2104,8 +2104,16 @@ async def api_search(slug: str, request: Request):
 
 # ========== VIEW ==========
 
+def _graph_page(request: Request, data, user_label: str):
+    body, headers = encode_graph_html(
+        render_graph_html(data, user_label=user_label),
+        request.headers.get("accept-encoding", ""),
+    )
+    return Response(content=body, headers=headers)
+
+
 @app.get("/p/{slug}/view", response_class=HTMLResponse)
-async def view_page(slug: str):
+async def view_page(slug: str, request: Request):
     scope = resolve_scope(slug)
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -2125,7 +2133,7 @@ async def view_page(slug: str):
             return HTMLResponse(html_page("Общий граф", body))
         labels = scope.get("project_labels") or {}
         data = linker.repository.export_graph_data_combined(graph_ids, labels)
-        return HTMLResponse(render_graph_html(data, user_label="Все проекты"))
+        return _graph_page(request, data, scope["name"])
 
     stats = linker.get_user_stats(scope["graph_id"])
     if stats["total_cards"] == 0:
@@ -2141,7 +2149,7 @@ async def view_page(slug: str):
         return HTMLResponse(html_page("База знаний", body))
 
     data = linker.repository.export_graph_data(scope["graph_id"])
-    return HTMLResponse(render_graph_html(data, user_label=scope["graph_id"]))
+    return _graph_page(request, data, scope["name"])
 
 
 # ========== DELETE (Card-based) ==========
