@@ -105,8 +105,8 @@ flowchart TB
         I3["③ unmask_card\nкарточки снова с настоящими именами"]
         I4["④ Embedding локально\nвектор от реального текста"]
         I5["⑤ Linker: vector_search в Neo4j\nкандидаты — настоящие карточки"]
-        I6["⑥ Linker LLM\nмаска всего промпта\nновая пустая EntityMap"]
-        I7["⑦ LinkDecision\nNEW_ROOT / CHILD_OF / UPDATE_OF"]
+        I6["⑥ Anonymizer.mask промпта линкера\nновая мысль + кандидаты, новый EntityMap"]
+        I7["⑦ Linker LLM\nвидит только [ИМЯ_1] → LinkDecision"]
         I8["⑧ Запись в Neo4j\ncontent + embedding без масок"]
         I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8
     end
@@ -148,9 +148,9 @@ flowchart TB
     classDef llm fill:#fef3c7,stroke:#b45309,color:#111
     classDef real fill:#dcfce7,stroke:#15803d,color:#111
     classDef pii fill:#e0e7ff,stroke:#4338ca,color:#111
-    class I2,I6,R5 llm
-    class I3,I4,I5,I7,I8,R1,R2,R3,R6,NEO real
-    class I1,R4 pii
+    class I2,I7,R5 llm
+    class I3,I4,I5,I8,R1,R2,R3,R6,NEO real
+    class I1,I6,R4 pii
 ```
 
 ### Кто что видит
@@ -635,8 +635,9 @@ flowchart TD
     F --> G{"Есть кандидаты\nsimilarity >= 0.5?"}
     G -->|Нет| H["_apply_new_root"]
     G -->|Да| I["get_context: настоящие\nкарточки из графа"]
-    I --> J["mask(user_prompt, EntityMap())\nзатем Linker LLM"]
-    J --> K{LinkDecision}
+    I --> MASK["⑥ Anonymizer.mask(user_prompt)\nновая пустая EntityMap"]
+    MASK --> LLM["⑦ Linker LLM\nвидит только маски"]
+    LLM --> K{LinkDecision}
     K -->|NEW_ROOT| H
     K -->|CHILD_OF| L["_apply_child_of"]
     K -->|UPDATE_OF| M["_apply_update_of"]
