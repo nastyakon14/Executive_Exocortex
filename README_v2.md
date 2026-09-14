@@ -57,7 +57,7 @@
 - классифицирует каждую мысль по типу (факт, решение, задача, риск, идея, вопрос, контекст);
 - встраивает каждую мысль в правильное место графа проекта;
 - обеспечивает семантический поиск с учётом связей (GraphRAG) и демаскирует ответ;
-- визуализирует накопленные знания в интерактивном графе (vis.js);
+- визуализирует накопленные знания в интерактивном графе (Canvas);
 - позволяет удалять мысли вместе с дочерними ветками;
 - отдаёт метрики LLM и продуктовых событий в Prometheus (`GET /metrics`).
 
@@ -85,66 +85,86 @@
 
 ## 2. Верхнеуровневая архитектура
 
-Система состоит из веб-слоя, пайплайна Zettelkasten, хранилища, GraphRAG и observability:
+Система состоит из веб-слоя, пайплайна записи в граф, поиска GraphRAG, хранилища и observability. Это **два независимых контура**. У них разные вызовы Anonymizer: нельзя рисовать одну общую вершину `MASK`, иначе поиск визуально «впадает» в атомайзер.
+
+**Жёлтый** — chat-LLM (видит только `[ИМЯ_1]`). **Зелёный** — настоящие имена (эмбеддинги, Neo4j, UI). **Синий** — маска / демаскировка.
 
 ```mermaid
 flowchart TB
-    subgraph WEB["Веб-приложение (web_app.py)"]
+    subgraph WEB["Веб-слой · web_app.py / web_app_v2.py"]
         HUB["Хаб проектов"]
-        INPUT["Ввод: текст / PDF / TXT / папка / Confluence"]
+        ADD["Добавить заметку\nтекст / PDF / TXT / папка / Confluence"]
         SEARCH["Поиск GraphRAG"]
-        VIEW["Дашборд графа"]
+        VIEW["Дашборд графа\nCanvas, без LLM"]
     end
 
-    subgraph PII["Обезличивание"]
-        MASK["Anonymizer\nregex + Natasha NER\n[ИМЯ_1], [ОРГАНИЗАЦИЯ_2]"]
-        UNMASK["EntityMap\nдемаскировка карточек и ответа"]
+    subgraph INGEST["Запись в граф"]
+        direction TB
+        I1["① Anonymizer.mask\nEntityMap этого запроса"]
+        I2["② Atomizer LLM\nтекст → ZettelCard"]
+        I3["③ unmask_card\nкарточки снова с настоящими именами"]
+        I4["④ Embedding локально\nвектор от реального текста"]
+        I5["⑤ Linker: vector_search в Neo4j\nкандидаты — настоящие карточки"]
+        I6["⑥ Linker LLM\nмаска всего промпта\nновая пустая EntityMap"]
+        I7["⑦ LinkDecision\nNEW_ROOT / CHILD_OF / UPDATE_OF"]
+        I8["⑧ Запись в Neo4j\ncontent + embedding без масок"]
+        I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8
     end
 
-    subgraph ZP["Zettelkasten Pipeline"]
-        A["1. Atomizer\nТекст → атомарные мысли (LLM)"]
-        B["2. Embedding\nМысли → векторы (локальная модель)"]
-        C["3. Linker\nВстраивание в граф (LLM + Neo4j)"]
+    subgraph RAG["Поиск GraphRAG"]
+        direction TB
+        R1["① embed_query вопроса\nбез маски, локально"]
+        R2["② Retriever\nvector_search + обход графа"]
+        R3["③ RetrievedContext\nнастоящие тексты из Neo4j"]
+        R4["④ Anonymizer.mask\nвесь user_prompt генерации"]
+        R5["⑤ Generator LLM"]
+        R6["⑥ EntityMap.unmask ответа"]
+        R1 --> R2 --> R3 --> R4 --> R5 --> R6
     end
 
-    subgraph DB["Хранилище"]
-        NEO["Neo4j Graph Database\nУзлы: Zettel, Entity\nСвязи: CHILD_OF, MENTIONS, RELATED_TO"]
-        PG["PostgreSQL\nЛогирование истории"]
-        REG["storage/web_projects.json\nРеестр проектов"]
+    subgraph STORE["Хранилище · только настоящие данные"]
+        NEO["Neo4j\nZettel, Entity\nCHILD_OF, MENTIONS, RELATED_TO"]
+        PG["PostgreSQL\nжурнал сообщений"]
+        REG["web_projects.json"]
     end
 
-    subgraph RAG["GraphRAG Pipeline"]
-        R["1. Retriever\nВекторный поиск + граф-обход\nпо настоящим данным"]
-        G["2. Generator\nОтвет LLM по замаскированному контексту"]
+    subgraph OBS["Observability · только web_app.py"]
+        MET["GET /metrics"] --> PROM["Prometheus"] --> GRAF["Grafana"]
     end
 
-    subgraph OBS["Observability"]
-        M["GET /metrics"]
-        PR["Prometheus"]
-        GR["Grafana"]
-    end
-
-    HUB --> INPUT
-    INPUT --> MASK
-    MASK --> A
-    A --> UNMASK
-    UNMASK --> B
-    B --> C
-    C --> NEO
-    INPUT --> PG
+    HUB --> ADD
+    HUB --> SEARCH
+    HUB --> VIEW
     HUB --> REG
-    SEARCH --> R
-    NEO --> R
-    R --> MASK
-    MASK --> G
-    G --> UNMASK
-    UNMASK --> SEARCH
+    ADD --> I1
+    ADD --> PG
+    I8 --> NEO
+    SEARCH --> R1
+    NEO --> R2
+    R6 --> SEARCH
     NEO --> VIEW
-    WEB --> M
-    M --> PR --> GR
+    HUB -.-> MET
+
+    classDef llm fill:#fef3c7,stroke:#b45309,color:#111
+    classDef real fill:#dcfce7,stroke:#15803d,color:#111
+    classDef pii fill:#e0e7ff,stroke:#4338ca,color:#111
+    class I2,I6,R5 llm
+    class I3,I4,I5,I7,I8,R1,R2,R3,R6,NEO real
+    class I1,R4 pii
 ```
 
+### Кто что видит
 
+| Этап | Данные | Зачем |
+| --- | --- | --- |
+| Atomizer LLM | **маски** исходного текста | PII не уходит в модель |
+| `unmask_card` | карточки **демаскируются** | дальше нужны настоящие имена |
+| Embedding и поиск кандидатов Linker | **настоящий** текст | иначе вопрос «Иван Петров» не совпадёт с `[ИМЯ_1]` в базе |
+| Linker LLM | промпт **маскируется заново** (пустой `EntityMap`) | решение — структура `LinkDecision`, не проза с именами |
+| После Linker | **демаскировки нет** | карточки уже настоящие с шага ③; LLM не вернула текст с плейсхолдерами |
+| Neo4j / дашборд | **настоящие** имена | маски в графе не хранятся |
+| GraphRAG Retriever | **настоящие** вопрос, эмбеддинги, узлы | retrieval без LLM |
+| GraphRAG Generator | контекст+вопрос **маскируются**, ответ **демаскируется** | пользователь видит исходные имена |
 
 Изоляция графа: `user_id` в Neo4j совпадает с `graph_id` проекта (`proj_...`). Общий контур `/p/all` читает несколько графов без записи.
 
@@ -167,7 +187,7 @@ Executive_Exocortex/
 │   ├── atomizer.py                # NoteAtomizer — LLM-декомпозиция на ZettelCard
 │   ├── linker.py                  # GraphLinker — embedding + LLM-встраивание в граф
 │   ├── graph_rag.py               # GraphRAG — retrieval + generation
-│   ├── graph_visualizer.py        # Интерактивный HTML-дашборд графа (vis.js)
+│   ├── graph_visualizer.py        # Интерактивный HTML-дашборд графа (Canvas)
 │   └── exocortex.py               # CLI-демо скрипт
 ├── observability/
 │   ├── llm.py                     # make_chat_openai, invoke_chat_stream, метрики LLM
@@ -287,18 +307,36 @@ results = linker.link_and_insert(graph_id, raw_cards)  # LLM линкера ви
 
 Падежи («Иван Петров» / «Ивана Петрова», «Газпром» / «Газпрому») схлопываются в один токен в рамках запроса.
 
+Три LLM вызывают маскировку **по отдельности**. Общий ящик «Atomizer / Linker / GraphRAG» на одной стрелке `unmask → Neo4j` неверен.
+
 ```mermaid
-flowchart LR
-    IN["Исходный текст"] --> M["mask"]
-    M --> LLM["Atomizer / Linker / GraphRAG LLM"]
-    LLM --> U["unmask"]
-    U --> NEO["Neo4j + UI: настоящие данные"]
+flowchart TB
+    subgraph ATOM["Atomizer"]
+        A1["исходный текст"] --> A2["mask + EntityMap запроса"]
+        A2 --> A3["Atomizer LLM"]
+        A3 --> A4["unmask_card"]
+        A4 --> A5["карточки с настоящими именами"]
+    end
+
+    subgraph LINK["Linker"]
+        L1["те же карточки, уже без масок"] --> L2["embedding + Neo4j search"]
+        L2 --> L3["mask всего промпта\nновая EntityMap"]
+        L3 --> L4["Linker LLM → LinkDecision"]
+        L4 --> L5["запись в Neo4j без unmask"]
+    end
+
+    subgraph GRAG["GraphRAG"]
+        G1["вопрос + граф, настоящие имена"] --> G2["Retriever, без LLM"]
+        G2 --> G3["mask user_prompt генерации"]
+        G3 --> G4["Generator LLM"]
+        G4 --> G5["unmask ответа → UI"]
+    end
+
+    A5 --> L1
 ```
 
-
-
-- **Загрузка:** маска → атомайзер → демаскировка карточек → эмбеддинги и Neo4j на реальном тексте; промпт линкера маскируется целиком.
-- **RAG:** retrieval по настоящим эмбеддингам и именам; весь user-prompt генерации маскируется; ответ демаскируется.
+- **Загрузка:** маска → атомайзер → демаскировка карточек → эмбеддинги и Neo4j на реальном тексте; промпт линкера маскируется целиком, после него демаскировать нечего.
+- **RAG:** retrieval по настоящим эмбеддингам и именам; весь user-prompt генерации маскируется; ответ демаскируется. Атомайзер в поиске **не участвует**.
 - **Граф:** читает Neo4j, токены не показывает.
 
 В базе **не** хранятся маски: иначе вопрос «Иван Петров» не совпал бы с карточкой `[ИМЯ_1]`.
@@ -313,7 +351,7 @@ flowchart LR
 
 ### 4.5 Просмотр базы знаний
 
-`GET /p/{slug}/view` вызывает `render_graph_html(...)` в память (без временного файла) и отдаёт HTML. Экспорт из Neo4j **без эмбеддингов**. Координаты узлов считаются заранее, физика vis.js выключена — граф открывается сразу даже на большом объёме. Поиск по дашборду — с дебаунсом и пакетным обновлением узлов.
+`GET /p/{slug}/view` вызывает `render_graph_html(...)` в память (без временного файла) и отдаёт HTML. Экспорт из Neo4j **без эмбеддингов**. Координаты считаются заранее, рисуется Canvas 2D — граф открывается и при тысячах узлов.
 
 ### 4.6 Удаление заметки
 
@@ -449,7 +487,7 @@ class ZettelCard(BaseModel):
 
 ```mermaid
 flowchart TD
-    IN["Входной текст"] --> LLM["1. _invoke_llm(text)\nLLM + structured_output(AtomicThoughtList)"]
+    IN["Текст уже после Anonymizer.mask"] --> LLM["1. _invoke_llm(text)\nLLM + structured_output(AtomicThoughtList)"]
     LLM --> BUILD["2. _build_cards(thoughts, max_root_id)\nДля каждой мысли:\n• UUID\n• Разрешение parent_hint → parent_uuid\n• Генерация Luhmann ID\n• Очистка content\n• Нормализация тегов"]
     BUILD --> VALIDATE["3. _validate_and_fix(cards)\n• Удаление пустых карточек\n• Обнуление битых parent_hint\n• Если нет корневой → первая становится корнем"]
     VALIDATE --> OUT["list[ZettelCard]"]
@@ -588,20 +626,21 @@ embed_query("query: Кто отвечает за звонок в Т-Банк?")
 
 ```mermaid
 flowchart TD
-    A["Список ZettelCard от Atomizer"] --> B{"Карточка имеет родителя\nвнутри текущего сообщения?"}
-    B -->|"is_root_topic=False\nparent в luhmann_remap"| C["_handle_inner_child\n(без LLM)"]
+    A["ZettelCard уже после unmask_card\nнастоящие имена и теги"] --> EMB["embed_passage / embed_query\nлокально, без маски"]
+    EMB --> B{"Карточка имеет родителя\nвнутри текущего сообщения?"}
+    B -->|"is_root_topic=False\nparent в luhmann_remap"| C["_handle_inner_child\nбез LLM"]
     B -->|Иначе| D["_handle_root_card"]
-    C --> E["Пересчитать Luhmann ID\n→ записать CHILD_OF"]
-    D --> F["vector_search\nв графе пользователя"]
+    C --> E["Пересчитать Luhmann ID\n→ CHILD_OF"]
+    D --> F["vector_search в Neo4j\nпо реальному вектору"]
     F --> G{"Есть кандидаты\nsimilarity >= 0.5?"}
     G -->|Нет| H["_apply_new_root"]
-    G -->|Да| I["get_context для каждого\nкандидата"]
-    I --> J["_ask_llm:\nNEW_ROOT / CHILD_OF / UPDATE_OF"]
-    J --> K{Решение LLM}
+    G -->|Да| I["get_context: настоящие\nкарточки из графа"]
+    I --> J["mask(user_prompt, EntityMap())\nзатем Linker LLM"]
+    J --> K{LinkDecision}
     K -->|NEW_ROOT| H
     K -->|CHILD_OF| L["_apply_child_of"]
     K -->|UPDATE_OF| M["_apply_update_of"]
-    H --> N["Neo4j"]
+    H --> N["Neo4j: content + embedding\nбез масок, без unmask после LLM"]
     L --> N
     M --> N
     E --> N
@@ -801,16 +840,18 @@ GraphRAG — второй ключевой пайплайн системы. Ес
 
 ```mermaid
 flowchart LR
-    Q["Вопрос пользователя"] --> E["embed_query"]
-    E --> VS["vector_search"]
+    Q["Вопрос\nнастоящий текст"] --> E["embed_query\nлокально"]
+    E --> VS["vector_search Neo4j"]
     VS --> EP["entry_points"]
     EP --> GC["get_context × N"]
-    GC --> RC["RetrievedContext"]
+    GC --> RC["RetrievedContext\nнастоящие узлы"]
     RC --> FMT["to_context_string"]
-    FMT --> LLM["RAGGenerator"]
-    LLM --> A["Ответ"]
+    FMT --> MASK["Anonymizer.mask\nвесь user_prompt"]
+    MASK --> LLM["Generator LLM"]
+    LLM --> U["unmask ответа"]
+    U --> A["Ответ в UI"]
 
-    subgraph retriever ["GraphRetriever"]
+    subgraph retriever ["GraphRetriever · без LLM"]
         E
         VS
         GC
@@ -819,7 +860,9 @@ flowchart LR
 
     subgraph generator ["RAGGenerator"]
         FMT
+        MASK
         LLM
+        U
     end
 ```
 
@@ -843,60 +886,48 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph WEB["Веб-приложение (web_app.py)"]
-        U["Пользователь\nвводит вопрос"]
-        UID["graph_id проекта\nизоляция данных"]
+    subgraph WEB["Веб-приложение"]
+        U["Пользователь вводит вопрос"]
+        UID["graph_id проекта"]
     end
 
-    subgraph FACADE["GraphRAG — фасад (graph_rag.py)"]
+    subgraph FACADE["GraphRAG · graph_rag.py"]
         Q["query(user_id, user_query)"]
-        Q --> R1["retriever.retrieve()"]
-        R1 --> G1["generator.generate()"]
-        G1 --> OUT["RAGResponse\nanswer + context + latency"]
+        R1["retriever.retrieve()"]
+        G1["generator.generate()"]
+        OUT["RAGResponse"]
+        Q --> R1 --> G1 --> OUT
     end
 
-    subgraph RET["GraphRetriever — retrieval"]
-        EMB_Q["LocalEmbeddingModel.embed_query()\nпрефикс: query:"]
-        VS["vector_search()\nlimit=5, threshold≥0.3"]
-        EP["entry_points\nдо 5 ZettelNode"]
-        LOOP["для каждой entry point:\nget_context(hops=1)"]
-        EXP["expanded_nodes\n+ entities + paths"]
+    subgraph RET["GraphRetriever · без LLM"]
+        EMB_Q["embed_query · префикс query:"]
+        VS["vector_search · top-5, порог 0.3"]
+        EP["entry_points"]
+        LOOP["get_context hops=1\nCHILD_OF / MENTIONS / RELATED_TO"]
         RC["RetrievedContext"]
-        EMB_Q --> VS --> EP --> LOOP --> EXP --> RC
+        EMB_Q --> VS --> EP --> LOOP --> RC
     end
 
-    subgraph NEO["Neo4j (ZettelRepository)"]
-        DB_Z["Zettel\ncontent, embedding[768],\nluhmann_id, thought_type"]
-        DB_E["Entity\nname, mention_count"]
-        E1["CHILD_OF → parent / children"]
-        E2["MENTIONS → entities"]
-        E3["RELATED_TO → related\n(читается, если есть)"]
+    subgraph NEO["Neo4j"]
+        DB_Z["Zettel: content, embedding"]
+        DB_E["Entity"]
     end
 
-    subgraph GEN["RAGGenerator — generation"]
-        MASK["Anonymizer.mask(весь user_prompt)"]
-        FMT["to_context_string()\nгруппировка по типам"]
-        LLM["ChatOpenAI\ngoogle/gemini-2.5-flash\nT=0.3"]
-        DEMASK["EntityMap.unmask(ответ)"]
+    subgraph GEN["RAGGenerator"]
+        FMT["to_context_string"]
+        MASK["Anonymizer.mask user_prompt"]
+        LLM["gemini-2.5-flash T=0.3"]
+        DEMASK["EntityMap.unmask ответа"]
         FMT --> MASK --> LLM --> DEMASK
-    end
-
-    subgraph EMB["Embedding (локально)"]
-        M["intfloat/multilingual-e5-base\n768 dim · CUDA/MPS/CPU"]
     end
 
     U --> UID --> Q
     R1 --> EMB_Q
     VS --> DB_Z
-    LOOP --> E1 & E2 & E3
-    E1 & E2 & E3 --> DB_Z & DB_E
+    LOOP --> DB_Z
+    LOOP --> DB_E
     RC --> FMT
-    FMT --> MASK
-    MASK --> LLM
-    LLM --> DEMASK
     DEMASK --> OUT --> U
-    M -.-> EMB_Q
-    M -.-> DB_Z
 ```
 
 
@@ -1003,13 +1034,17 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    RC["RetrievedContext"] --> FMT["to_context_string()"]
-    FMT --> S1["## FACT / ACTION / RISK / ..."]
-    FMT --> S2["## СВЯЗАННЫЕ СУЩНОСТИ\nдо 10"]
-    FMT --> S3["## СВЯЗИ МЕЖДУ МЫСЛЯМИ\nдо 5 paths"]
-    S1 & S2 & S3 --> PROMPT["user_prompt_template\n{context} + {query}"]
-    PROMPT --> LLM["gemini-2.5-flash\nsystem + user messages"]
-    LLM --> HTML["Ответ → HTML\nв чате поиска"]
+    RC["RetrievedContext\nнастоящие имена"] --> FMT["to_context_string()"]
+    FMT --> S1["## FACT / ACTION / RISK"]
+    FMT --> S2["## СВЯЗАННЫЕ СУЩНОСТИ"]
+    FMT --> S3["## СВЯЗИ МЕЖДУ МЫСЛЯМИ"]
+    S1 --> PROMPT["user_prompt\ncontext + query"]
+    S2 --> PROMPT
+    S3 --> PROMPT
+    PROMPT --> MASK["Anonymizer.mask"]
+    MASK --> LLM["gemini-2.5-flash"]
+    LLM --> UNMASK["unmask ответа"]
+    UNMASK --> HTML["HTML в чате поиска"]
 ```
 
 
@@ -1064,8 +1099,8 @@ web_app.py POST /p/{slug}/api/search
 GraphRAG:
   Вопрос → embed → top-K entry points
          → обход графа (родители, дети, related, entity)
-         → структурированный контекст → LLM
-  (LLM видит не только «похожие фразы», но и иерархию и сущности)
+         → маска user_prompt → LLM → unmask ответа
+  (retrieval по настоящим данным; LLM видит плейсхолдеры, пользователь — исходные имена)
 ```
 
 **Пример.** Пользователь спрашивает: «Кто курирует DevSummit?»
@@ -1225,16 +1260,11 @@ Temperature = `0.3` — выше, чем у atomizer/linker (`0.0`), чтобы 
 
 ```mermaid
 flowchart TD
-    EX["export_graph_data(graph_id) из Neo4j\nбез эмбеддингов"] --> DATA["Все Zettel + Entity + рёбра"]
-    DATA --> POS["_compute_node_positions\nлес по CHILD_OF"]
-    DATA --> BUILD["_build_html / render_graph_html"]
-    POS --> BUILD
-    BUILD --> Z["Для каждой мысли:\n• calc_depth(luhmann_id)\n• size по глубине\n• label по глубине\n• цвет ветки"]
-    BUILD --> E["Для каждой Entity:\n• size = 18\n• label до 9 символов\n• голубой цвет"]
-    BUILD --> EDGE["Для каждого ребра:\n• CHILD_OF: сплошная серая\n• RELATED_TO: пунктирная\n• MENTIONS: пунктирная тонкая"]
-    Z --> HTML["HTML + vis.js (embedded)"]
-    E --> HTML
-    EDGE --> HTML
+    EX["export_graph_data из Neo4j\nбез эмбеддингов"] --> DATA["Zettel + Entity + рёбра"]
+    DATA --> POS["раскладка на сервере\nлес CHILD_OF"]
+    DATA --> PACK["компактный JSON узлов и рёбер"]
+    POS --> PACK
+    PACK --> HTML["HTML + Canvas 2D\nбез vis.js, без LLM"]
 ```
 
 
@@ -1260,7 +1290,7 @@ flowchart TD
 - **Стрелки** в панели: `→` = дочерняя (вглубь), `←` = родитель (уровень выше). Теги — без стрелок.
 - **Поиск** по тексту (поле в левом верхнем углу) — фильтрация графа с дебаунсом; обновление узлов пакетом.
 - **Переключатель темы** «Светлая / Тёмная» — сохраняется в `localStorage`.
-- **Раскладка:** координаты считаются на сервере; физика vis.js выключена, поэтому большой граф открывается сразу. Узлы по-прежнему можно перетаскивать.
+- **Раскладка:** координаты считаются на сервере; Canvas рисует только видимую область. Панорама — перетаскивание холста, масштаб — колесо мыши.
 
 Страница `/p/{slug}/view` отдаёт HTML из памяти (`render_graph_html`), без записи временного файла.
 
