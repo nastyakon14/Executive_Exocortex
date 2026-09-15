@@ -2,11 +2,13 @@ import os
 from pathlib import Path
 
 try:
-    from telegram_bot.handlers.txt_reader import read_txt
-    from telegram_bot.handlers.pdf_reader import read_pdf
+    from app.handlers.txt_reader import read_txt
+    from app.handlers.pdf_reader import read_pdf
+    from app.handlers.size_checker import check_size
 except ImportError:
     from txt_reader import read_txt
     from pdf_reader import read_pdf
+    from size_checker import check_size
 
 try:
     from tqdm import tqdm
@@ -14,9 +16,26 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-# Читалки есть только для txt/pdf; остальные расширения пропускаются.
-EXTRACTABLE_EXTENSIONS = (".txt", ".pdf")
+
+EXTRACTABLE_EXTENSIONS = (
+    ".txt",
+    ".pdf",
+    ".pptx",
+    ".ppt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".doc",
+    ".docx",
+)
 extensions = EXTRACTABLE_EXTENSIONS
+
+TOO_LARGE_MESSAGE = "Превышен максимальный размер файла (50 МБ)"
+
+
+class FileTooLargeError(ValueError):
+    def __init__(self, message: str = TOO_LARGE_MESSAGE):
+        super().__init__(message)
 
 
 def extract_paths(root_path):
@@ -57,20 +76,47 @@ def list_folder_files(folder_path, extract_child_content=False):
         files.sort()
 
     if not files:
-        return [], "В директории нет файлов .pdf или .txt"
+        return [], (
+            "В директории нет поддерживаемых файлов "
+            "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg)"
+        )
     return files, None
+
+
+def _pdf_text(data) -> str:
+    if isinstance(data, dict):
+        return "\n".join(str(v) for v in data.values() if v)
+    return str(data or "")
 
 
 def extract_file_text(file_path: str) -> str:
     """Достаёт текст из одного файла для пайплайна заметок."""
     ext = os.path.splitext(file_path)[1].lower()
+    if not check_size(file_path, ext.lstrip(".")):
+        raise FileTooLargeError()
+
     if ext == ".pdf":
-        data = read_pdf(file_path)
-        if isinstance(data, dict):
-            return "\n".join(str(v) for v in data.values() if v)
-        return str(data or "")
+        return _pdf_text(read_pdf(file_path))
     if ext == ".txt":
         return read_txt(file_path) or ""
+    if ext in {".pptx", ".ppt"}:
+        try:
+            from app.handlers.pptx_reader import pptx_to_pdf
+        except ImportError:
+            from pptx_reader import pptx_to_pdf
+        return _pdf_text(pptx_to_pdf(file_path))
+    if ext in {".doc", ".docx"}:
+        try:
+            from app.handlers.word_reader import read_word
+        except ImportError:
+            from word_reader import read_word
+        return _pdf_text(read_word(file_path))
+    if ext in {".png", ".jpg", ".jpeg"}:
+        try:
+            from app.handlers.image_reader import process_image
+        except ImportError:
+            from image_reader import process_image
+        return process_image(file_path) or ""
     raise ValueError(f"Неподдерживаемый формат: {ext}")
 
 
@@ -97,6 +143,8 @@ def folder_processing(folder_path, extract_child_content=False):
                 item["error"] = "Текст не извлечен"
             else:
                 item["text"] = text
+        except FileTooLargeError as e:
+            item["error"] = str(e)
         except Exception as e:
             item["error"] = str(e)
         results.append(item)

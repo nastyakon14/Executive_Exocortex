@@ -25,6 +25,7 @@ class ZettelNode:
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     similarity: Optional[float] = None
+    source_input: str = ""
 
 
 @dataclass
@@ -75,6 +76,7 @@ class ZettelRepository:
         embedding: List[float],
         is_root_topic: bool = True,
         zettel_id: str = None,
+        source_input: str = "text",
     ) -> ZettelNode:
         """
         Создаёт новый узел Zettel (корневой или без связей).
@@ -93,6 +95,7 @@ class ZettelRepository:
             tags: $tags,
             embedding: $embedding,
             is_root_topic: $is_root_topic,
+            source_input: $source_input,
             created_at: datetime($created_at),
             updated_at: datetime($created_at)
         })
@@ -109,6 +112,7 @@ class ZettelRepository:
             "tags": tags,
             "embedding": embedding,
             "is_root_topic": is_root_topic,
+            "source_input": source_input or "text",
             "created_at": now,
         })
         
@@ -131,6 +135,7 @@ class ZettelRepository:
             tags=tags,
             is_root_topic=is_root_topic,
             embedding=embedding,
+            source_input=source_input or "text",
         )
     
     def create_child_of(
@@ -144,6 +149,7 @@ class ZettelRepository:
         embedding: List[float],
         parent_zettel_id: str,
         zettel_id: str = None,
+        source_input: str = "text",
     ) -> ZettelNode:
         """
         Создаёт дочерний узел Zettel и связывает его с родителем через CHILD_OF.
@@ -163,6 +169,7 @@ class ZettelRepository:
             tags: $tags,
             embedding: $embedding,
             is_root_topic: false,
+            source_input: $source_input,
             created_at: datetime($created_at),
             updated_at: datetime($created_at)
         })
@@ -180,6 +187,7 @@ class ZettelRepository:
             "tags": tags,
             "embedding": embedding,
             "parent_id": parent_zettel_id,
+            "source_input": source_input or "text",
             "created_at": now,
         })
         
@@ -198,6 +206,7 @@ class ZettelRepository:
             tags=tags,
             is_root_topic=False,
             embedding=embedding,
+            source_input=source_input or "text",
         )
     
     def update_zettel_content(
@@ -622,6 +631,7 @@ class ZettelRepository:
             tags=list(node_dict.get("tags", [])),
             is_root_topic=node_dict.get("is_root_topic", False),
             embedding=list(node_dict.get("embedding", [])) if node_dict.get("embedding") else None,
+            source_input=node_dict.get("source_input") or "text",
         )
     
     def get_graph_text(self, user_id: str, max_line_len: int = 120) -> str:
@@ -756,6 +766,7 @@ class ZettelRepository:
                z.thought_type AS thought_type,
                z.tags AS tags,
                z.is_root_topic AS is_root_topic,
+               z.source_input AS source_input,
                parent.luhmann_id AS parent_luhmann
         """
         edges_query = """
@@ -809,6 +820,7 @@ class ZettelRepository:
                 "tags": list(row.get("tags") or []),
                 "is_root_topic": bool(row.get("is_root_topic")),
                 "parent_luhmann": parent_luhmann,
+                "source_input": row.get("source_input") or "text",
             })
 
         entities = []

@@ -19,6 +19,7 @@ from config.prompts import (
     linker_user_prompt_template,
     zettel_atomizer_system_prompt,
     zettel_atomizer_user_prompt_template,
+    image_vlm_system_prompt
 )
 
 
@@ -38,6 +39,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # vlm images
+    image_vlm_moel: str = 'kimi-k2-instruct'  # внутрення vlm модель для извлечения таблиц из изображений
+
+    image_vlm_system_prompt: str = Field(
+        default=image_vlm_system_prompt,
+        description="System prompt для vlm",
+    )
+
     # embedding
     embedding_model_name: str = "intfloat/multilingual-e5-base"
 
@@ -46,6 +55,8 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = os.getenv('NEO4J_PASSWORD')  # задайте в .env: NEO4J_PASSWORD
     neo4j_database: str = "neo4j"
+
+
 
     # atomizer llm
     zettel_atomizer_model_name: str = Field(

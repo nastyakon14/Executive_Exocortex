@@ -18,12 +18,22 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Resp
 
 from config.settings import settings
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
-from telegram_bot.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
-from telegram_bot.handlers.folders import extract_file_text, list_folder_files
+from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
+from app.handlers.folders import (
+    EXTRACTABLE_EXTENSIONS,
+    FileTooLargeError,
+    extract_file_text,
+    list_folder_files,
+)
 from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG
-from zettelkasten.graph_visualizer import encode_graph_html, render_graph_html
+from zettelkasten.graph_visualizer_v2 import (
+    encode_graph_html,
+    encode_graph_payload,
+    pack_graph_payload,
+    render_graph_html,
+)
 from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
 
 load_dotenv()
@@ -231,7 +241,12 @@ def resolve_scope(slug: str) -> dict | None:
     }
 
 
-def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
+def save_user_note(
+    user_id: str,
+    text: str,
+    on_stage=None,
+    source_input: str = "text",
+) -> tuple[bool, str]:
     def stage(key: str, title: str, sub: str = "") -> None:
         if on_stage:
             on_stage(key, title, sub)
@@ -259,6 +274,7 @@ def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
 
     for card in raw_cards:
         unmask_card(card, entity_map)
+        card.source_input = (source_input or "").strip() or "text"
 
     total = len(raw_cards)
 
@@ -270,6 +286,69 @@ def save_user_note(user_id: str, text: str, on_stage=None) -> tuple[bool, str]:
     linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
     stats = linker.get_user_stats(user_id)
     return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
+
+
+SUPPORTED_UPLOAD_EXTS = set(EXTRACTABLE_EXTENSIONS)
+
+FILE_FORMAT_LABELS = {
+    ".pdf": "PDF",
+    ".txt": "TXT",
+    ".pptx": "PPTX",
+    ".ppt": "PPT",
+    ".doc": "DOC",
+    ".docx": "DOCX",
+    ".png": "PNG",
+    ".jpg": "JPG",
+    ".jpeg": "JPEG",
+}
+
+
+def _file_format_label(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    return FILE_FORMAT_LABELS.get(ext, ext.lstrip(".").upper() or "файл")
+
+
+def describe_source_input(raw: str) -> dict:
+    value = (raw or "").strip() or "text"
+    if value.lower().startswith(("http://", "https://")):
+        return {
+            "kind": "confluence",
+            "title": "Страница Confluence",
+            "label": value,
+            "href": value,
+        }
+    if value == "text":
+        return {
+            "kind": "text",
+            "title": "Текст",
+            "label": "введённый текст",
+            "href": None,
+        }
+    path = Path(value)
+    href = None
+    if path.is_absolute():
+        try:
+            href = path.as_uri()
+        except ValueError:
+            href = None
+    return {
+        "kind": "file",
+        "title": "Файл",
+        "label": value,
+        "href": href,
+    }
+
+
+def collect_input_sources(nodes) -> list[dict]:
+    seen = set()
+    items = []
+    for node in nodes:
+        raw = (getattr(node, "source_input", None) or "").strip() or "text"
+        if raw in seen:
+            continue
+        seen.add(raw)
+        items.append(describe_source_input(raw))
+    return items
 
 
 def log_event(scope_key: str, message_text: str, message_type: str, bot_answer: str) -> None:
@@ -535,6 +614,20 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .chat-msg.user { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
 .chat-msg.bot { background: var(--card); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 4px; color: var(--text); }
 .chat-msg .meta { font-size: 11px; color: var(--muted); margin-top: 8px; opacity: 0.8; }
+.rag-sources { margin-top: 12px; font-size: 13px; }
+.rag-sources summary {
+    cursor: pointer; color: var(--accent); font-weight: 600; list-style: none;
+    display: inline-flex; align-items: center; gap: 6px;
+}
+.rag-sources summary::-webkit-details-marker { display: none; }
+.rag-sources summary::before { content: "▸"; font-size: 12px; }
+.rag-sources[open] summary::before { content: "▾"; }
+.rag-sources ul { margin: 10px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.rag-sources li { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 10px; background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.22); }
+.rag-sources .src-kind { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.rag-sources a { color: var(--accent); word-break: break-all; text-decoration: none; }
+.rag-sources a:hover { text-decoration: underline; }
+.rag-sources .src-label { color: var(--text2); word-break: break-all; }
 .chat-msg h2, .chat-msg h3, .chat-msg h4 { margin: 12px 0 8px; font-size: 15px; }
 .chat-msg h2 { font-size: 17px; }
 .chat-msg ul { margin: 8px 0; padding-left: 20px; }
@@ -1447,7 +1540,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             </div>
             <div id="file-mode-upload">
                 <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitFileIngest(event, this)">
-                    <div class="form-group"><label>Файл (.pdf / .txt)</label><input type="file" name="file" accept=".pdf,.txt" required></div>
+                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.png,.jpg,.jpeg" required></div>
                     <button type="submit" class="btn">Обработать</button>
                 </form>
             </div>
@@ -1734,7 +1827,7 @@ async def add_text(slug: str, request: Request, note_text: str = Form("")):
     def work(on_stage):
         if on_stage:
             on_stage("prepare", "Подготовка заметки", "Проверяем текст")
-        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage, source_input="text")
         log_event(slug, text, "text_artifact", ans)
         return ok, ans
 
@@ -1759,11 +1852,14 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
         return RedirectResponse(f"/p/{slug}/add?msg=Выберите файл&st=err", status_code=303)
 
     ext = Path(file.filename).suffix.lower()
-    if ext not in {".pdf", ".txt"}:
-        return RedirectResponse(f"/p/{slug}/add?msg=Поддерживаются .pdf и .txt&st=err", status_code=303)
+    if ext not in SUPPORTED_UPLOAD_EXTS:
+        return RedirectResponse(
+            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg&st=err",
+            status_code=303,
+        )
 
     filename = file.filename
-    fmt = "PDF" if ext == ".pdf" else "TXT"
+    fmt = _file_format_label(filename)
     tmp = Path(tempfile.gettempdir()) / f"web_{uuid.uuid4().hex}{ext}"
     with tmp.open("wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -1775,9 +1871,17 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
             text = extract_file_text(str(tmp))
             if not (text or "").strip():
                 return False, "Текст не извлечен"
-            ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+            ok, ans = save_user_note(
+                scope["graph_id"],
+                text,
+                on_stage=on_stage,
+                source_input=filename,
+            )
             log_event(slug, f"[{filename}]", ext[1:].upper(), ans)
             return ok, ans
+        except FileTooLargeError as e:
+            log_event(slug, f"[{filename}]", ext[1:].upper(), str(e))
+            return False, str(e)
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -1820,8 +1924,7 @@ async def add_folder(
         total = len(files)
         for i, path in enumerate(files, 1):
             name = Path(path).name
-            ext = Path(path).suffix.lower()
-            fmt = "PDF" if ext == ".pdf" else "TXT"
+            fmt = _file_format_label(path)
             q.put({"type": "file_start", "name": name, "index": i, "total": total})
             try:
                 on_stage("read", f"Чтение {fmt}", f"«{name}»")
@@ -1829,7 +1932,14 @@ async def add_folder(
                 if not (text or "").strip():
                     ok, ans = False, "Текст не извлечен"
                 else:
-                    ok, ans = save_user_note(uid, text, on_stage=on_stage)
+                    ok, ans = save_user_note(
+                        uid,
+                        text,
+                        on_stage=on_stage,
+                        source_input=os.path.abspath(path),
+                    )
+            except FileTooLargeError as e:
+                ok, ans = False, str(e)
             except Exception as e:
                 ok, ans = False, str(e)
             if ok:
@@ -1879,7 +1989,12 @@ async def add_confluence(slug: str, request: Request, url: str = Form("")):
             return False, err_text
         if on_stage:
             on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
-        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage)
+        ok, ans = save_user_note(
+            scope["graph_id"],
+            text,
+            on_stage=on_stage,
+            source_input=page_url,
+        )
         log_event(slug, page_url, "confluence", ans)
         return ok, ans
 
@@ -1982,7 +2097,7 @@ async def search_page(slug: str):
             if (data.error) {{
                 addMessage('Ошибка: ' + data.error, 'bot');
             }} else {{
-                addMessageHtml(data.answer_html, data.meta, data.sources);
+                addMessageHtml(data.answer_html, data.meta, data.sources, data.input_sources);
             }}
         }} catch (err) {{
             document.getElementById(loadingId).remove();
@@ -2002,7 +2117,7 @@ async def search_page(slug: str):
         chatMessages.scrollTop = chatMessages.scrollHeight;
     }}
     
-    function addMessageHtml(html, meta, sources) {{
+    function addMessageHtml(html, meta, sources, inputSources) {{
         const div = document.createElement('div');
         div.className = 'chat-msg bot';
         div.innerHTML = html;
@@ -2016,6 +2131,37 @@ async def search_page(slug: str):
                 wrap.appendChild(chip);
             }});
             div.appendChild(wrap);
+        }}
+        if (inputSources && inputSources.length) {{
+            const details = document.createElement('details');
+            details.className = 'rag-sources';
+            const summary = document.createElement('summary');
+            summary.textContent = 'Посмотреть источники';
+            details.appendChild(summary);
+            const list = document.createElement('ul');
+            inputSources.forEach(function(src) {{
+                const li = document.createElement('li');
+                const kind = document.createElement('span');
+                kind.className = 'src-kind';
+                kind.textContent = src.title || 'Источник';
+                li.appendChild(kind);
+                if (src.href) {{
+                    const a = document.createElement('a');
+                    a.href = src.href;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.textContent = src.label || src.href;
+                    li.appendChild(a);
+                }} else {{
+                    const span = document.createElement('span');
+                    span.className = 'src-label';
+                    span.textContent = src.label || '';
+                    li.appendChild(span);
+                }}
+                list.appendChild(li);
+            }});
+            details.appendChild(list);
+            div.appendChild(details);
         }}
         if (meta) {{
             const metaDiv = document.createElement('div');
@@ -2069,18 +2215,20 @@ async def api_search(slug: str, request: Request):
     )
     if sources:
         meta += " · из: " + ", ".join(sources)
+    input_sources = collect_input_sources(resp.context.all_nodes)
     return JSONResponse({
         "answer_html": formatted,
         "meta": meta,
         "sources": sources,
+        "input_sources": input_sources,
     })
 
 
 # ========== VIEW ==========
 
-def _graph_page(request: Request, data, user_label: str):
+def _graph_page(request: Request, user_label: str, data_url: str):
     body, headers = encode_graph_html(
-        render_graph_html(data, user_label=user_label),
+        render_graph_html(None, user_label=user_label, data_url=data_url),
         request.headers.get("accept-encoding", ""),
     )
     return Response(content=body, headers=headers)
@@ -2105,9 +2253,7 @@ async def view_page(slug: str, request: Request):
             </div>
             """
             return HTMLResponse(html_page("Общий граф", body))
-        labels = scope.get("project_labels") or {}
-        data = linker.repository.export_graph_data_combined(graph_ids, labels)
-        return _graph_page(request, data, scope["name"])
+        return _graph_page(request, scope["name"], f"/p/{slug}/api/graph")
 
     stats = linker.get_user_stats(scope["graph_id"])
     if stats["total_cards"] == 0:
@@ -2122,8 +2268,22 @@ async def view_page(slug: str, request: Request):
         """
         return HTMLResponse(html_page("База знаний", body))
 
-    data = linker.repository.export_graph_data(scope["graph_id"])
-    return _graph_page(request, data, scope["name"])
+    return _graph_page(request, scope["name"], f"/p/{slug}/api/graph")
+
+
+@app.get("/p/{slug}/api/graph")
+async def api_graph(slug: str, request: Request):
+    scope = resolve_scope(slug)
+    if not scope:
+        return JSONResponse({"error": "Проект не найден"}, status_code=404)
+    if scope["readonly"]:
+        labels = scope.get("project_labels") or {}
+        data = linker.repository.export_graph_data_combined(scope["graph_ids"], labels)
+    else:
+        data = linker.repository.export_graph_data(scope["graph_id"])
+    payload = pack_graph_payload(data)
+    body, headers = encode_graph_payload(payload, request.headers.get("accept-encoding", ""))
+    return Response(content=body, headers=headers)
 
 
 # ========== DELETE (Card-based) ==========
@@ -2308,5 +2468,5 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("WEB_APP_PORT", "8008"))
+    port = int(os.getenv("WEB_APP_PORT", "8009"))
     uvicorn.run("web_app_v2:app", host="0.0.0.0", port=port, reload=False)

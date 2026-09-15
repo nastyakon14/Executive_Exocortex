@@ -171,6 +171,18 @@ def _short_text(content: str, max_len: int) -> str:
     return text[: max_len - 1] + "…"
 
 
+def _node_label(text: str) -> str:
+    """Подпись узла: 2 слова, или 3 если среди них есть короткое (≤3 символа)."""
+    words = (text or "").split()
+    if not words:
+        return ""
+    take = 3 if any(len(w) <= 3 for w in words[:2]) else 2
+    take = min(take, 3)
+    if len(words) <= take:
+        return " ".join(words)
+    return " ".join(words[:take]) + "…"
+
+
 def _thought_size(depth: int) -> int:
     if depth <= 0:
         return 62
@@ -235,7 +247,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "r": _thought_size(depth),
             "g": 0,
             "c": color_index[root],
-            "l": _short_text(display, _label_len(depth)),
+            "l": _node_label(display),
         })
         preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
         meta.append([
@@ -246,7 +258,8 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             ", ".join(tags),
             _short_text(content, 2500),
             preview,
-            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt]).lower(),
+            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or ""]).lower(),
+            z.get("source_input") or "text",
         ])
 
     for e in graph_data["entities"]:
@@ -262,7 +275,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "r": 18,
             "g": 1,
             "c": 0,
-            "l": _short_text(name, 9),
+            "l": _node_label(name),
         })
         meta.append([
             "",
@@ -273,6 +286,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             f"Упоминаний: {e.get('mention_count') or 0}",
             name,
             f"{name} {e.get('entity_type', '')} {e.get('name', '')}".lower(),
+            "",
         ])
 
     kind = {"CHILD_OF": 0, "MENTIONS": 1, "RELATED_TO": 2}
@@ -490,6 +504,18 @@ function showDetail(idx) {
     if (m[2]) html += '<div class="field"><div class="field-label">Тема</div><div class="field-value">' + esc(m[2]) + '</div></div>';
     html += '<div class="field"><div class="field-label">Тип</div><div class="field-value">' + esc(m[3]) + '</div></div>';
     html += '<div class="field"><div class="field-label">Теги</div><div class="field-value">' + esc(m[4] || '—') + '</div></div>';
+    const src = (m[8] || '').trim();
+    if (src) {
+      html += '<div class="field"><div class="field-label">Источник</div><div class="field-value">';
+      if (/^https?:\/\//i.test(src)) {
+        html += '<a href="' + esc(src) + '" target="_blank" rel="noopener noreferrer">' + esc(src) + '</a>';
+      } else if (src === 'text') {
+        html += 'текст';
+      } else {
+        html += esc(src);
+      }
+      html += '</div></div>';
+    }
     html += '<hr/><div class="field-value">' + esc(m[5]) + '</div>';
   } else {
     html += '<div class="field-value">🏷 ' + esc(m[2]) + '</div>';
@@ -690,6 +716,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
   #detail-panel .field {{ margin: 6px 0; }}
   #detail-panel .field-label {{ color: #94a3b8; font-size: 12px; }}
   #detail-panel .field-value {{ color: #e2e8f0; font-size: 13px; line-height: 1.5; }}
+  #detail-panel a {{ color: #93c5fd; word-break: break-all; }}
   #detail-panel .close-btn {{ position: absolute; top: 10px; right: 14px; cursor: pointer; color: #94a3b8; font-size: 20px; }}
   #detail-panel .neighbors {{ margin-top: 12px; }}
   #detail-panel .neighbor-item {{
@@ -719,6 +746,7 @@ def _build_html(graph_data: Dict[str, Any], user_label: str = "") -> str:
   body.light-theme #detail-panel {{ background: #ffffff; border: 1px solid #e5e7eb; }}
   body.light-theme #detail-panel h2, body.light-theme #detail-panel .field-value {{ color: #1f2937; }}
   body.light-theme #detail-panel .field-label, body.light-theme #graph-hint {{ color: #6b7280; }}
+  body.light-theme #detail-panel a {{ color: #2563eb; }}
   body.light-theme #detail-panel .neighbor-item {{ background: #f3f4f6; color: #374151; }}
   body.light-theme #search-box input {{ background: #ffffff; border: 1px solid #d1d5db; color: #374151; }}
 </style>

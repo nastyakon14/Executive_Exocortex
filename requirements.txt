@@ -8,6 +8,7 @@ openpyxl
 speech_recognition
 pytesseract
 pdfplumber
+img2table
 
 psycopg2
 chromadb

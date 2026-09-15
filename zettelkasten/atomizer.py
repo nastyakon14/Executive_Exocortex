@@ -112,6 +112,7 @@ class ZettelCard(BaseModel):
     is_root_topic: bool = Field(description="True если эта мысль открывает новую независимую тему") # True если эта мысль открывает новую независимую тему False если она развивает,раскрывает или уточняет другую мысль из этого текста преложенную раньше.
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Дата время создания карточки") # дата время создания карточки
     embedding: Optional[list[float]] = Field(default=None, description="Векторное представление карточки") # векторное представление карточки
+    source_input: str = Field(default="text", description="Источник входных данных: путь к файлу, URL Confluence или text")
 
     class Config:
         use_enum_values = True

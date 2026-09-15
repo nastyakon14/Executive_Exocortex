@@ -153,18 +153,24 @@ flowchart TB
     class I1,I6,R4 pii
 ```
 
+
+
+
+
 ### Кто что видит
 
-| Этап | Данные | Зачем |
-| --- | --- | --- |
-| Atomizer LLM | **маски** исходного текста | PII не уходит в модель |
-| `unmask_card` | карточки **демаскируются** | дальше нужны настоящие имена |
-| Embedding и поиск кандидатов Linker | **настоящий** текст | иначе вопрос «Иван Петров» не совпадёт с `[ИМЯ_1]` в базе |
-| Linker LLM | промпт **маскируется заново** (пустой `EntityMap`) | решение — структура `LinkDecision`, не проза с именами |
-| После Linker | **демаскировки нет** | карточки уже настоящие с шага ③; LLM не вернула текст с плейсхолдерами |
-| Neo4j / дашборд | **настоящие** имена | маски в графе не хранятся |
-| GraphRAG Retriever | **настоящие** вопрос, эмбеддинги, узлы | retrieval без LLM |
-| GraphRAG Generator | контекст+вопрос **маскируются**, ответ **демаскируется** | пользователь видит исходные имена |
+
+| Этап                                | Данные                                                   | Зачем                                                                  |
+| ----------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Atomizer LLM                        | **маски** исходного текста                               | PII не уходит в модель                                                 |
+| `unmask_card`                       | карточки **демаскируются**                               | дальше нужны настоящие имена                                           |
+| Embedding и поиск кандидатов Linker | **настоящий** текст                                      | иначе вопрос «Иван Петров» не совпадёт с `[ИМЯ_1]` в базе              |
+| Linker LLM                          | промпт **маскируется заново** (пустой `EntityMap`)       | решение — структура `LinkDecision`, не проза с именами                 |
+| После Linker                        | **демаскировки нет**                                     | карточки уже настоящие с шага ③; LLM не вернула текст с плейсхолдерами |
+| Neo4j / дашборд                     | **настоящие** имена                                      | маски в графе не хранятся                                              |
+| GraphRAG Retriever                  | **настоящие** вопрос, эмбеддинги, узлы                   | retrieval без LLM                                                      |
+| GraphRAG Generator                  | контекст+вопрос **маскируются**, ответ **демаскируется** | пользователь видит исходные имена                                      |
+
 
 Изоляция графа: `user_id` в Neo4j совпадает с `graph_id` проекта (`proj_...`). Общий контур `/p/all` читает несколько графов без записи.
 
@@ -205,12 +211,16 @@ Executive_Exocortex/
 │   └── postgres/
 │       ├── db_connect.py          # Логирование истории
 │       └── cleaner.py             # Утилита очистки логов
-├── telegram_bot/
+├── app/
 │   └── handlers/
 │       ├── confluence.py          # Загрузка страницы Confluence
-│       ├── folders.py             # Обход директории, PDF/TXT
+│       ├── folders.py             # Обход директории, PDF/TXT/PPTX/Word/изображения
 │       ├── pdf_reader.py          # PDF-извлечение (pdfplumber + OCR)
-│       └── txt_reader.py          # Чтение plain text
+│       ├── txt_reader.py          # Чтение plain text
+│       ├── word_reader.py         # Word через win32 → PDF
+│       ├── pptx_reader.py         # PPTX через pptxtopdf → PDF
+│       ├── image_reader.py        # PNG/JPG: pytesseract + VLM
+│       └── size_checker.py        # Проверка максимального размера файла
 ├── eval/                          # Пайплайн оценки качества
 │   ├── generate_data.ipynb        # Генерация синтетических данных + прогоны моделей
 │   ├── calculate_metrics.ipynb    # Расчёт метрик Atomizer
@@ -274,7 +284,7 @@ Executive_Exocortex/
 | Текст                | `POST /p/{slug}/add/text` → `save_user_note`                                                                    |
 | Файл `.pdf` / `.txt` | `pdfplumber` + OCR / чтение текста → `save_user_note`                                                           |
 | Путь к директории    | `list_folder_files` + `extract_file_text`, опционально дочерние файлы; каждый файл — отдельный прогон пайплайна |
-| URL Confluence       | страница с хоста из `telegram_bot/handlers/confluence.py` → текст → `save_user_note`                            |
+| URL Confluence       | страница с хоста из `app/handlers/confluence.py` → текст → `save_user_note`                            |
 
 
 Голосовой ввод в веб-интерфейсе не используется.
@@ -334,6 +344,8 @@ flowchart TB
 
     A5 --> L1
 ```
+
+
 
 - **Загрузка:** маска → атомайзер → демаскировка карточек → эмбеддинги и Neo4j на реальном тексте; промпт линкера маскируется целиком, после него демаскировать нечего.
 - **RAG:** retrieval по настоящим эмбеддингам и именам; весь user-prompt генерации маскируется; ответ демаскируется. Атомайзер в поиске **не участвует**.
@@ -883,57 +895,64 @@ flowchart LR
 
 ### 10.1.1 Подробная схема работы GraphRAG (по компонентам)
 
-Ниже — полная карта пайплайна: от вопроса в браузере до ответа LLM. Все параметры соответствуют `config/settings.py` и `zettelkasten/graph_rag.py`.
+Ниже — карта пайплайна: от вопроса в браузере до ответа. Параметры из `config/settings.py` и `zettelkasten/graph_rag.py`.
+
+`retriever.retrieve()` **не вызывает** генератор. Фасад `GraphRAG.query()` делает два шага подряд: сначала retrieve возвращает `RetrievedContext`, затем `generate(вопрос, context)`. В генератор уходит и контекст, и **тот же исходный вопрос** (ещё без маски). Маскируется уже собранный user-prompt.
+
+Если entry points пусты, LLM **не вызывается** — отдаётся `graphrag_no_context_response`.
 
 ```mermaid
 flowchart TB
-    subgraph WEB["Веб-приложение"]
-        U["Пользователь вводит вопрос"]
-        UID["graph_id проекта"]
+    U["Пользователь задаёт вопрос\nнастоящий текст, без маски"]
+
+    subgraph FACADE["GraphRAG.query(graph_id, вопрос)"]
+        direction TB
+        Q["фасад оркестрирует два вызова"]
     end
 
-    subgraph FACADE["GraphRAG · graph_rag.py"]
-        Q["query(user_id, user_query)"]
-        R1["retriever.retrieve()"]
-        G1["generator.generate()"]
-        OUT["RAGResponse"]
-        Q --> R1 --> G1 --> OUT
+    subgraph RET["Шаг A · GraphRetriever · LLM нет"]
+        direction TB
+        EMB["embed_query локально\nпрефикс query:"]
+        VS["Чтение Zettel из Neo4j\ncosine в Python\ntop-5, порог ≥ 0.3"]
+        EP["entry_points ≤ 5"]
+        EXP["Для каждой точки входа:\nget_context hops=1"]
+        RC["RetrievedContext\nentry_points\nexpanded_nodes — родители/дети/related\nentities, paths"]
+        EMB --> VS --> EP --> EXP --> RC
     end
 
-    subgraph RET["GraphRetriever · без LLM"]
-        EMB_Q["embed_query · префикс query:"]
-        VS["vector_search · top-5, порог 0.3"]
-        EP["entry_points"]
-        LOOP["get_context hops=1\nCHILD_OF / MENTIONS / RELATED_TO"]
-        RC["RetrievedContext"]
-        EMB_Q --> VS --> EP --> LOOP --> RC
-    end
-
-    subgraph NEO["Neo4j"]
-        DB_Z["Zettel: content, embedding"]
+    subgraph NEO["Neo4j только чтение"]
+        DB_Z["Zettel + embedding"]
         DB_E["Entity"]
     end
 
-    subgraph GEN["RAGGenerator"]
-        FMT["to_context_string"]
-        MASK["Anonymizer.mask user_prompt"]
+    EMPTY{"entry_points пусты?"}
+    SKIP["Ответ без LLM\nno_context_response"]
+
+    subgraph GEN["Шаг B · RAGGenerator"]
+        direction TB
+        FMT["Шаблон: вопрос + to_context_string()"]
+        MASK["Anonymizer.mask\nвесь user_prompt, новый EntityMap"]
         LLM["gemini-2.5-flash T=0.3"]
-        DEMASK["EntityMap.unmask ответа"]
-        FMT --> MASK --> LLM --> DEMASK
+        UN["EntityMap.unmask ответа"]
+        FMT --> MASK --> LLM --> UN
     end
 
-    U --> UID --> Q
-    R1 --> EMB_Q
+    OUT["HTML в чате поиска\nнастоящие имена"]
+
+    U --> Q
+    Q -->|"1. retrieve(вопрос)"| EMB
     VS --> DB_Z
-    LOOP --> DB_Z
-    LOOP --> DB_E
-    RC --> FMT
-    DEMASK --> OUT --> U
+    EXP --> DB_Z
+    EXP --> DB_E
+    RC --> EMPTY
+    EMPTY -->|да| SKIP --> OUT
+    EMPTY -->|нет: context + исходный вопрос| FMT
+    UN --> OUT
 ```
 
 
 
-
+Стрелка «retrieve → generate» на старой схеме была порядком вызовов в `query()`, а не потоком внутри retriever. Данные между шагами A и B — объект `RetrievedContext` плюс исходная строка вопроса.
 
 #### Компоненты и их связь
 

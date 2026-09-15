@@ -302,6 +302,7 @@ class GraphLinker:
             tags=card.tags,
             embedding=embedding,
             parent_zettel_id=parent_node.zettel_id,
+            source_input=card.source_input or "text",
         )
         
         # print(f"   ✅ Дочерняя → [{new_luhmann}] ← [{real_parent_luhmann}]")
@@ -415,6 +416,7 @@ class GraphLinker:
             tags=card.tags,
             embedding=embedding,
             is_root_topic=True,
+            source_input=card.source_input or "text",
         )
         
         # print(f"   ✅ NEW_ROOT → [{new_luhmann}]")
@@ -459,6 +461,7 @@ class GraphLinker:
             tags=card.tags,
             embedding=embedding,
             parent_zettel_id=parent_node.zettel_id,
+            source_input=card.source_input or "text",
         )
         
         # print(f"   ✅ CHILD_OF [{parent_node.luhmann_id}] → [{new_luhmann}]")
@@ -498,6 +501,7 @@ class GraphLinker:
                     thought_type=str(card.thought_type),
                     tags=card.tags,
                     is_root_topic=False,
+                    source_input=card.source_input or "text",
                 ),
                 action=LinkAction.UPDATE_OF,
                 reasoning=f"Ошибка: карточка {decision.target_zettel_id} не найдена",

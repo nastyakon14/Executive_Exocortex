@@ -21,8 +21,8 @@ from config.settings import settings
 from observability.context import reset_obs_context, set_obs_context
 from observability.metrics import record_app_event
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
-from telegram_bot.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
-from telegram_bot.handlers.folders import extract_file_text, list_folder_files
+from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
+from app.handlers.folders import extract_file_text, list_folder_files
 from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG

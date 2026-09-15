@@ -127,12 +127,19 @@ Executive_Exocortex/
 │   └── postgres/
 │       ├── db_connect.py          # Логирование истории
 │       └── cleaner.py             # Утилита очистки логов
-├── telegram_bot/
+├── app/
 │   ├── texts.py                   # UI-тексты
+│   ├── html_format.py             # Форматирование HTML для Telegram
 │   └── handlers/
 │       ├── asr.py                 # Google ASR для голоса
 │       ├── pdf_reader.py          # PDF-извлечение (pdfplumber + OCR)
-│       └── txt_reader.py          # Чтение plain text
+│       ├── txt_reader.py          # Чтение plain text
+│       ├── word_reader.py         # Word через win32 → PDF
+│       ├── pptx_reader.py         # PPTX через pptxtopdf → PDF
+│       ├── image_reader.py        # PNG/JPG: pytesseract + VLM
+│       ├── folders.py             # Обход директории и извлечение текста
+│       ├── confluence.py          # Загрузка страницы Confluence
+│       └── size_checker.py        # Проверка максимального размера файла
 ├── eval/                          # Пайплайн оценки качества
 │   ├── generate_data.ipynb        # Генерация синтетических данных + прогоны моделей
 │   ├── calculate_metrics.ipynb    # Расчёт метрик Atomizer
