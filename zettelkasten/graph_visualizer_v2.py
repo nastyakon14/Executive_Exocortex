@@ -754,17 +754,42 @@ window.addEventListener('mousemove', function(e) {
   }
   requestDraw();
 });
-wrap.addEventListener('wheel', function(e) {
-  e.preventDefault();
-  const rect = wrap.getBoundingClientRect();
-  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+function zoomAt(mx, my, factor) {
   const beforeX = wx(mx), beforeY = wy(my);
-  const factor = e.deltaY > 0 ? 0.9 : 1.11;
   zoom = Math.max(0.03, Math.min(3.5, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
   camY = beforeY - (my - H / 2) / zoom;
   requestDraw();
+}
+function pointerOnWrap(e) {
+  const rect = wrap.getBoundingClientRect();
+  return { mx: e.clientX - rect.left, my: e.clientY - rect.top };
+}
+wrap.addEventListener('wheel', function(e) {
+  e.preventDefault();
+  const { mx, my } = pointerOnWrap(e);
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 16;
+  if (e.deltaMode === 2) dy *= 120;
+  // ctrlKey: щипок тачпада в Chrome/Safari приходит как Ctrl+wheel
+  const k = e.ctrlKey ? 0.01 : 0.0025;
+  zoomAt(mx, my, Math.exp(-dy * k));
 }, { passive: false });
+let pinchZoom0 = 1;
+wrap.addEventListener('gesturestart', function(e) {
+  e.preventDefault();
+  pinchZoom0 = zoom;
+}, { passive: false });
+wrap.addEventListener('gesturechange', function(e) {
+  e.preventDefault();
+  const { mx, my } = pointerOnWrap(e);
+  const beforeX = wx(mx), beforeY = wy(my);
+  zoom = Math.max(0.03, Math.min(3.5, pinchZoom0 * e.scale));
+  camX = beforeX - (mx - W / 2) / zoom;
+  camY = beforeY - (my - H / 2) / zoom;
+  requestDraw();
+}, { passive: false });
+wrap.addEventListener('gestureend', function(e) { e.preventDefault(); }, { passive: false });
 wrap.addEventListener('dblclick', function(e) {
   const rect = wrap.getBoundingClientRect();
   const i = hit(e.clientX - rect.left, e.clientY - rect.top);
@@ -933,7 +958,7 @@ def _build_html(
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
   .leg-dot-entity {{ background: #38BDF8; border-color: #FFFFFF; }}
-  #graph-wrap {{ position: relative; width: 100%; height: calc(100vh - 56px); cursor: grab; }}
+  #graph-wrap {{ position: relative; width: 100%; height: calc(100vh - 56px); cursor: grab; touch-action: none; overscroll-behavior: none; }}
   #graph-wrap:active {{ cursor: grabbing; }}
   #graph {{ position: absolute; inset: 0; width: 100%; height: 100%; display: block; }}
   #load-hint {{
@@ -997,7 +1022,7 @@ def _build_html(
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
   </div>
-  <div id="graph-hint">Колесо — масштаб. Пустое место — панорама. Узел можно перетащить. На большом графе теги лучше включать после приближения.</div>
+  <div id="graph-hint">Щипок или два пальца на тачпаде — масштаб. Пустое место — панорама. Узел можно перетащить. На большом графе теги лучше включать после приближения.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>

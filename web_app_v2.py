@@ -1474,7 +1474,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
     body = f"""
     <div class="container hub">
         <div class="hub-hero">
-            <h1>Project Exocortex</h1>
+            <h1>BVA Exocortex</h1>
             <p>Пространство проектов: у каждого свой граф знаний, общий слой собирает всё вместе.</p>
         </div>
         {alert}
