@@ -1,6 +1,7 @@
 # линкер — встраивает новые zettel-карточки в граф знаний (neo4j)
 # изоляция по user_id: у каждого пользователя свой граф
 
+import os
 import sys
 import time
 import re
@@ -13,6 +14,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,13 +22,27 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
-from observability.llm import invoke_structured, make_chat_openai
 from storage.neo4j.client import get_neo4j_client
 from storage.neo4j.schema import init_schema
 from storage.neo4j.repository import ZettelRepository, ZettelNode, GraphContext
 from zettelkasten.atomizer import ZettelCard
 
 load_dotenv()
+
+
+def invoke_structured(structured_llm, messages):
+    return structured_llm.invoke(messages)
+
+
+def make_chat_openai(model_name, temperature):
+    return ChatOpenAI(
+        model=model_name,
+        api_key=os.getenv("LLM_API_KEY"),
+        base_url=os.getenv("LLM_BASE_URL"),
+        temperature=temperature,
+        timeout=float(os.getenv("LLM_TIMEOUT", "180")),
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
+    )
 
 
 # локальная модель эмбеддингов (multilingual-e5)
@@ -212,11 +228,7 @@ class GraphLinker:
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
         
-        self.llm = make_chat_openai(
-            component="linker",
-            model_name=self.model_name,
-            temperature=temperature,
-        )
+        self.llm = make_chat_openai(self.model_name, temperature)
         self.structured_llm = self.llm.with_structured_output(LinkDecision)
         
         self.similarity_threshold = similarity_threshold
@@ -387,14 +399,7 @@ class GraphLinker:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
         ]
-        return invoke_structured(
-            self.structured_llm,
-            messages,
-            component="linker",
-            model_name=self.model_name,
-            llm=self.llm,
-            schema=LinkDecision,
-        )
+        return invoke_structured(self.structured_llm, messages)
     
     def _apply_new_root(
         self,

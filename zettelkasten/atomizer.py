@@ -1,6 +1,7 @@
 # декомпозиция заметки на атомарные мысли (zettel-карточки)
 # метод zettelkasten: одна мысль = одна карточка
 
+import os
 import uuid
 import re
 from dataclasses import dataclass
@@ -11,10 +12,10 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from dotenv import load_dotenv
 from config.settings import settings
-from observability.llm import invoke_structured, make_chat_openai, sanitize_llm_error
 
 load_dotenv()
 
@@ -22,6 +23,21 @@ ATOMIZER_CHUNK_CHARS = 5000
 ATOMIZER_CHUNK_OVERLAP = 1200
 ATOMIZER_PRIOR_THOUGHTS = 16
 ATOMIZER_PRIOR_CHARS = 4000
+
+
+def invoke_structured(structured_llm, messages):
+    return structured_llm.invoke(messages)
+
+
+def make_chat_openai(model_name, temperature):
+    return ChatOpenAI(
+        model=model_name,
+        api_key=os.getenv("LLM_API_KEY"),
+        base_url=os.getenv("LLM_BASE_URL"),
+        temperature=temperature,
+        timeout=float(os.getenv("LLM_TIMEOUT", "180")),
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
+    )
 
 
 @dataclass
@@ -170,11 +186,7 @@ class NoteAtomizer:
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
 
-        self.llm = make_chat_openai(
-            component="atomizer",
-            model_name=self.model_name,
-            temperature=self.temperature,
-        )
+        self.llm = make_chat_openai(self.model_name, self.temperature)
         self.structured_llm = self.llm.with_structured_output(AtomicThoughtList)
 
     def atomize(
@@ -211,7 +223,7 @@ class NoteAtomizer:
             cards = self._build_cards(all_thoughts, current_db_max_root_id)
             return self._validate_and_fix(cards)
         except Exception as e:
-            return (f"Ошибка при извлечении атомарных мыслей: {sanitize_llm_error(e)}")
+            return (f"Ошибка при извлечении атомарных мыслей: {e}")
 
     @staticmethod
     def _is_length_limit_error(exc: Exception) -> bool:
@@ -438,14 +450,7 @@ class NoteAtomizer:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=preamble + body),
         ]
-        return invoke_structured(
-            self.structured_llm,
-            messages,
-            component="atomizer",
-            model_name=self.model_name,
-            llm=self.llm,
-            schema=AtomicThoughtList,
-        )
+        return invoke_structured(self.structured_llm, messages)
 
     def _build_cards(
         self,

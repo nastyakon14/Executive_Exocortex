@@ -1,6 +1,7 @@
 # graphrag — поиск и генерация ответов по графу знаний
 # изоляция по user_id: каждый пользователь ищет только в своём графе
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -8,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,12 +17,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
-from observability.llm import invoke_chat_stream, make_chat_openai
 from storage.neo4j.client import get_neo4j_client, Neo4jClient
 from storage.neo4j.repository import ZettelRepository, ZettelNode, EntityNode
 from zettelkasten.linker import LocalEmbeddingModel
 
 load_dotenv()
+
+
+def invoke_chat_stream(llm, messages) -> str:
+    parts = []
+    for chunk in llm.stream(messages):
+        parts.append(getattr(chunk, "content", None) or "")
+    return "".join(parts)
+
+
+def make_chat_openai(model_name, temperature, streaming=False):
+    return ChatOpenAI(
+        model=model_name,
+        api_key=os.getenv("LLM_API_KEY"),
+        base_url=os.getenv("LLM_BASE_URL"),
+        temperature=temperature,
+        timeout=float(os.getenv("LLM_TIMEOUT", "180")),
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
+        streaming=streaming,
+    )
 
 
 # структуры данных контекста и ответа
@@ -276,13 +296,7 @@ class RAGGenerator:
         self._privacy_anonymizer = privacy_anonymizer
 
         self.model_name = model_name
-        self.llm = make_chat_openai(
-            component="graphrag",
-            model_name=model_name,
-            temperature=temperature,
-            streaming=True,
-            instrument=False,
-        )
+        self.llm = make_chat_openai(model_name, temperature, streaming=True)
     
     def generate(self, query: str, context: RetrievedContext) -> str:
         """Генерирует ответ на основе контекста."""
@@ -313,8 +327,6 @@ class RAGGenerator:
                 SystemMessage(content=self.system_prompt),
                 HumanMessage(content=user_prompt),
             ],
-            component="graphrag",
-            model_name=self.model_name,
         )
 
         if entity_map:
