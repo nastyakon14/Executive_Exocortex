@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     )
 
     # vlm images
-    image_vlm_moel: str = 'kimi-k2-instruct'  # внутрення vlm модель для извлечения таблиц из изображений
+    image_vlm_model: str = "kimi-k2-instruct"
 
     image_vlm_system_prompt: str = Field(
         default=image_vlm_system_prompt,

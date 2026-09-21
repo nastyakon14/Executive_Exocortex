@@ -6,8 +6,10 @@ import queue
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -19,7 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Resp
 from config.settings import settings
 from storage.postgres.db_connect import create_database, create_tables, update_history_messages
 from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
-from app.handlers.folders import (
+from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
     FileTooLargeError,
     extract_file_text,
@@ -35,6 +37,7 @@ from zettelkasten.graph_visualizer_v2 import (
     render_graph_html,
 )
 from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
+from zettelkasten.source_quote import find_source_quote
 
 load_dotenv()
 
@@ -82,7 +85,9 @@ graphrag = GraphRAG(
 DELETE_CACHE: dict[str, list[dict]] = {}
 COMMON_SLUG = "all"
 PROJECTS_FILE = Path(__file__).resolve().parent / "storage" / "web_projects.json"
-RESERVED_SLUGS = {COMMON_SLUG, "login", "home", "overview", "projects", "api"}
+RESERVED_SLUGS = {COMMON_SLUG, "login", "home", "overview", "projects", "api", "contour"}
+CONTOUR_MIN_PROJECTS = 2
+CONTOUR_MAX_PROJECTS = 5
 PROJECT_ACCENTS = ["#6366f1", "#a855f7", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6"]
 MAX_PROJECT_DESC = 240
 EDIT_ICON = (
@@ -104,81 +109,152 @@ def project_accent(slug: str) -> str:
     return PROJECT_ACCENTS[int(digest, 16) % len(PROJECT_ACCENTS)]
 
 
+_state_lock = threading.RLock()
+_ingest_jobs: dict[str, int] = {}
+_ingest_phase: dict[str, str] = {}
+_ingest_error: dict[str, str] = {}
+_ingest_snapshot: dict[str, tuple[str, str]] = {}
+_ingest_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ingest")
+_ingest_run_lock = threading.Lock()
+INGEST_STATUS_LABELS = {
+    "indexed": "Индексирован",
+    "linking": "Встраивание в граф",
+    "ready": "Готов",
+    "error": "Ошибка обработки",
+}
+INGEST_ACCEPTED_MSG = (
+    "Материал принят. Мысли разбираются в фоне. "
+    "На проекте загорится зелёный кружок, когда граф будет готов."
+)
+
+
 def _normalize_project(item: dict) -> dict:
     item.setdefault("description", "")
     item.setdefault("archived", False)
+    item.setdefault("ingest_status", "ready")
+    item.setdefault("ingest_error", "")
+    if item.get("ingest_status") not in INGEST_STATUS_LABELS:
+        item["ingest_status"] = "ready"
     return item
 
 
-def load_projects() -> list[dict]:
+def _stamp_ingest_fields(item: dict) -> dict:
+    slug = item.get("slug")
+    if slug and slug in _ingest_snapshot:
+        status, error = _ingest_snapshot[slug]
+        item["ingest_status"] = status
+        item["ingest_error"] = error
+    return item
+
+
+def _set_ingest_snapshot(slug: str, status: str, error: str = "") -> None:
+    _ingest_snapshot[slug] = (status, error or "")
+    if error:
+        _ingest_error[slug] = error
+    elif status != "error":
+        _ingest_error.pop(slug, None)
+
+
+def _load_projects_unlocked() -> list[dict]:
     if not PROJECTS_FILE.exists():
         return []
     try:
         data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-        return [_normalize_project(p) for p in (data.get("projects") or []) if isinstance(p, dict)]
+        projects = [_normalize_project(p) for p in (data.get("projects") or []) if isinstance(p, dict)]
     except Exception as e:
         print(f"[web_app] projects load warning: {e}")
         return []
+    for item in projects:
+        slug = item.get("slug")
+        if slug and slug not in _ingest_snapshot:
+            _ingest_snapshot[slug] = (
+                item.get("ingest_status") or "ready",
+                item.get("ingest_error") or "",
+            )
+        _stamp_ingest_fields(item)
+    return projects
+
+
+def _save_projects_unlocked(projects: list[dict]) -> None:
+    PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    stamped = []
+    for item in projects:
+        row = dict(item)
+        _stamp_ingest_fields(row)
+        stamped.append(row)
+    tmp = PROJECTS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"projects": stamped}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(PROJECTS_FILE)
+
+
+def load_projects() -> list[dict]:
+    with _state_lock:
+        return _load_projects_unlocked()
 
 
 def save_projects(projects: list[dict]) -> None:
-    PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PROJECTS_FILE.write_text(
-        json.dumps({"projects": projects}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with _state_lock:
+        _save_projects_unlocked(projects)
 
 
 def sync_projects_from_graph() -> list[dict]:
     """Подтягивает графы из Neo4j, чтобы старые данные не потерялись."""
-    projects = load_projects()
-    by_graph = {p.get("graph_id"): p for p in projects if p.get("graph_id")}
-    by_slug = {p.get("slug"): p for p in projects if p.get("slug")}
-    changed = False
     try:
         graph_ids = linker.repository.list_graph_ids()
     except Exception as e:
         print(f"[web_app] graph sync warning: {e}")
         graph_ids = []
 
-    for gid in graph_ids:
-        if gid in by_graph:
-            continue
-        if gid.startswith("proj_"):
-            slug = gid[5:] or uuid.uuid4().hex[:8]
-            name = slug.replace("_", " ")
-        elif gid.startswith("web_"):
-            slug = f"legacy_{gid[4:]}"[:48]
-            name = gid[4:] or gid
-        else:
-            continue
-        base = slug
-        n = 2
-        while slug in by_slug or slug in RESERVED_SLUGS:
-            slug = f"{base}_{n}"
-            n += 1
-        item = {
-            "slug": slug,
-            "name": name,
-            "graph_id": gid,
-            "description": "",
-            "archived": False,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        projects.append(item)
-        by_graph[gid] = item
-        by_slug[slug] = item
-        changed = True
+    with _state_lock:
+        projects = _load_projects_unlocked()
+        by_graph = {p.get("graph_id"): p for p in projects if p.get("graph_id")}
+        by_slug = {p.get("slug"): p for p in projects if p.get("slug")}
+        changed = False
 
-    if changed:
-        save_projects(projects)
-    return projects
+        for gid in graph_ids:
+            if gid in by_graph:
+                continue
+            if gid.startswith("proj_"):
+                slug = gid[5:] or uuid.uuid4().hex[:8]
+                name = slug.replace("_", " ")
+            elif gid.startswith("web_"):
+                slug = f"legacy_{gid[4:]}"[:48]
+                name = gid[4:] or gid
+            else:
+                continue
+            base = slug
+            n = 2
+            while slug in by_slug or slug in RESERVED_SLUGS:
+                slug = f"{base}_{n}"
+                n += 1
+            item = {
+                "slug": slug,
+                "name": name,
+                "graph_id": gid,
+                "description": "",
+                "archived": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _normalize_project(item)
+            _set_ingest_snapshot(slug, "ready")
+            _stamp_ingest_fields(item)
+            projects.append(item)
+            by_graph[gid] = item
+            by_slug[slug] = item
+            changed = True
+
+        if changed:
+            _save_projects_unlocked(projects)
+        return projects
 
 
 def get_project(slug: str) -> dict | None:
     for item in load_projects():
         if item.get("slug") == slug:
-            return item
+            return with_live_ingest(item)
     return None
 
 
@@ -192,22 +268,177 @@ def project_labels_map(projects: list[dict] | None = None) -> dict[str, str]:
 
 
 def update_project(slug: str, **fields) -> dict | None:
-    projects = load_projects()
-    for item in projects:
-        if item.get("slug") == slug:
-            item.update(fields)
-            save_projects(projects)
-            return item
-    return None
+    with _state_lock:
+        projects = _load_projects_unlocked()
+        for item in projects:
+            if item.get("slug") == slug:
+                item.update(fields)
+                _save_projects_unlocked(projects)
+                return with_live_ingest(item)
+        return None
 
 
 def remove_project(slug: str) -> dict | None:
-    projects = load_projects()
-    item = next((p for p in projects if p.get("slug") == slug), None)
-    if not item:
-        return None
-    save_projects([p for p in projects if p.get("slug") != slug])
-    return item
+    with _state_lock:
+        projects = _load_projects_unlocked()
+        item = next((p for p in projects if p.get("slug") == slug), None)
+        if not item:
+            return None
+        _ingest_jobs.pop(slug, None)
+        _ingest_phase.pop(slug, None)
+        _ingest_error.pop(slug, None)
+        _ingest_snapshot.pop(slug, None)
+        _save_projects_unlocked([p for p in projects if p.get("slug") != slug])
+        return item
+
+
+def with_live_ingest(item: dict) -> dict:
+    row = dict(item)
+    slug = row.get("slug")
+    with _state_lock:
+        if slug and _ingest_jobs.get(slug, 0) > 0:
+            status = _ingest_phase.get(slug) or "linking"
+            error = ""
+        elif slug and slug in _ingest_snapshot:
+            status, error = _ingest_snapshot[slug]
+        else:
+            status = row.get("ingest_status") or "ready"
+            error = row.get("ingest_error") or ""
+            if status in {"indexed", "linking"}:
+                status, error = "error", "Обработка прервана. Загрузите материал снова."
+    if status not in INGEST_STATUS_LABELS:
+        status = "ready"
+    row["ingest_status"] = status
+    row["ingest_error"] = error
+    return row
+
+
+def ingest_status_html(status: str, with_label: bool = True, error: str = "") -> str:
+    key = status if status in INGEST_STATUS_LABELS else "ready"
+    label = error.strip() if key == "error" and error.strip() else INGEST_STATUS_LABELS[key]
+    dot = f'<span class="status-dot {key}" title="{escape(label)}"></span>'
+    if not with_label:
+        return dot
+    extra_class = " status-error" if key == "error" else ""
+    return f'<span class="status-row{extra_class}">{dot}<span>{escape(label)}</span></span>'
+
+
+def _patch_ingest_project(slug: str, status: str, error: str = "") -> None:
+    projects = _load_projects_unlocked()
+    found = False
+    for item in projects:
+        if item.get("slug") == slug:
+            item["ingest_status"] = status
+            item["ingest_error"] = error
+            found = True
+            break
+    if found:
+        _save_projects_unlocked(projects)
+        return
+    print(f"[web_app_v2] ingest status: проект {slug!r} не найден в web_projects.json")
+
+
+def begin_ingest(slug: str, phase: str = "indexed") -> None:
+    with _state_lock:
+        _ingest_jobs[slug] = _ingest_jobs.get(slug, 0) + 1
+        _ingest_phase[slug] = phase
+        _set_ingest_snapshot(slug, phase)
+        _patch_ingest_project(slug, phase)
+
+
+def set_ingest_phase(slug: str, phase: str) -> None:
+    with _state_lock:
+        if _ingest_jobs.get(slug, 0) <= 0:
+            return
+        _ingest_phase[slug] = phase
+        _set_ingest_snapshot(slug, phase)
+        _patch_ingest_project(slug, phase)
+
+
+def end_ingest(slug: str, ok: bool = True, message: str = "") -> None:
+    with _state_lock:
+        _ingest_jobs[slug] = max(0, _ingest_jobs.get(slug, 0) - 1)
+        if not ok:
+            _set_ingest_snapshot(slug, "error", message or "Не удалось встроить материал в граф")
+        if _ingest_jobs[slug] > 0:
+            _ingest_phase[slug] = "linking"
+            status, error = _ingest_snapshot.get(slug, ("linking", ""))
+            if status == "error":
+                _patch_ingest_project(slug, "error", error)
+            else:
+                _set_ingest_snapshot(slug, "linking")
+                _patch_ingest_project(slug, "linking")
+            return
+        _ingest_phase.pop(slug, None)
+        error = _ingest_error.get(slug) or (message if not ok else "")
+        if error:
+            _set_ingest_snapshot(slug, "error", error)
+            _patch_ingest_project(slug, "error", error)
+        else:
+            _set_ingest_snapshot(slug, "ready")
+            _patch_ingest_project(slug, "ready")
+
+
+def reset_stale_ingest_status() -> None:
+    with _state_lock:
+        projects = _load_projects_unlocked()
+        changed = False
+        for item in projects:
+            slug = item.get("slug")
+            if not slug:
+                continue
+            if _ingest_jobs.get(slug, 0) > 0:
+                continue
+            if item.get("ingest_status") in {"indexed", "linking"}:
+                item["ingest_status"] = "error"
+                item["ingest_error"] = "Обработка прервана. Загрузите материал снова."
+                _set_ingest_snapshot(slug, "error", item["ingest_error"])
+                changed = True
+            else:
+                _set_ingest_snapshot(
+                    slug,
+                    item.get("ingest_status") or "ready",
+                    item.get("ingest_error") or "",
+                )
+        if changed:
+            _save_projects_unlocked(projects)
+
+
+def run_ingest(
+    slug: str,
+    graph_id: str,
+    text: str,
+    source_input: str,
+    log_type: str,
+    log_text: str,
+    on_stage=None,
+) -> tuple[bool, str]:
+    begin_ingest(slug, "indexed")
+    ok = False
+    ans = ""
+    try:
+        print(f"[web_app_v2] ingest start slug={slug} chars={len(text or '')}")
+        with _ingest_run_lock:
+            set_ingest_phase(slug, "linking")
+            ok, ans = save_user_note(graph_id, text, on_stage=on_stage, source_input=source_input)
+        log_event(slug, log_text, log_type, ans)
+        print(f"[web_app_v2] ingest done slug={slug} ok={ok}")
+        return ok, ans
+    except Exception as e:
+        ok = False
+        ans = str(e)
+        log_event(slug, log_text, log_type, f"Ошибка: {e}")
+        print(f"[web_app_v2] ingest background error: {e}")
+        return False, ans
+    finally:
+        end_ingest(slug, ok=ok, message="" if ok else (ans or "Не удалось встроить материал в граф"))
+
+
+def _queue_ingest(slug: str, graph_id: str, text: str, source_input: str, log_type: str, log_text: str) -> None:
+    _ingest_pool.submit(run_ingest, slug, graph_id, text, source_input, log_type, log_text)
+
+
+reset_stale_ingest_status()
 
 
 def resolve_scope(slug: str) -> dict | None:
@@ -224,20 +455,75 @@ def resolve_scope(slug: str) -> dict | None:
             "readonly": True,
             "description": "",
             "archived": False,
+            "ingest_status": "ready",
+            "ingest_error": "",
         }
     projects = sync_projects_from_graph()
     item = next((p for p in projects if p.get("slug") == slug), None)
     if not item:
         return None
+    live = with_live_ingest(item)
     return {
-        "slug": item["slug"],
-        "name": item.get("name") or item["slug"],
-        "graph_id": item["graph_id"],
-        "graph_ids": [item["graph_id"]],
-        "project_labels": {item["graph_id"]: item.get("name") or item["slug"]},
+        "slug": live["slug"],
+        "name": live.get("name") or live["slug"],
+        "graph_id": live["graph_id"],
+        "graph_ids": [live["graph_id"]],
+        "project_labels": {live["graph_id"]: live.get("name") or live["slug"]},
         "readonly": False,
-        "description": (item.get("description") or "").strip(),
-        "archived": bool(item.get("archived")),
+        "description": (live.get("description") or "").strip(),
+        "archived": bool(live.get("archived")),
+        "ingest_status": live.get("ingest_status") or "ready",
+        "ingest_error": live.get("ingest_error") or "",
+    }
+
+
+def active_search_projects() -> list[dict]:
+    return [p for p in sync_projects_from_graph() if p.get("graph_id") and not p.get("archived")]
+
+
+def resolve_contour_slugs(slugs: list[str]) -> tuple[list[dict], str]:
+    active = {p["slug"]: p for p in active_search_projects()}
+    selected: list[dict] = []
+    seen: set[str] = set()
+    for raw in slugs:
+        key = (raw or "").strip()
+        if not key or key in seen or key not in active:
+            continue
+        seen.add(key)
+        selected.append(active[key])
+        if len(selected) >= CONTOUR_MAX_PROJECTS:
+            break
+    if len(selected) < CONTOUR_MIN_PROJECTS:
+        return [], f"Выберите от {CONTOUR_MIN_PROJECTS} до {CONTOUR_MAX_PROJECTS} проектов"
+    return selected, ""
+
+
+def rag_search_payload(query: str, graph_ids: list[str], labels: dict[str, str], log_key: str) -> dict:
+    resp = graphrag.query(
+        "__all__",
+        query,
+        user_ids=graph_ids,
+        project_labels=labels or None,
+    )
+    log_event(log_key, query, "search_query", resp.answer)
+    sources = []
+    seen = set()
+    for node in resp.context.all_nodes:
+        name = labels.get(node.user_id or "")
+        if name and name not in seen:
+            seen.add(name)
+            sources.append(name)
+    meta = (
+        f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · "
+        f"{len(resp.context.expanded_nodes)} узлов"
+    )
+    if sources:
+        meta += " · из: " + ", ".join(sources)
+    return {
+        "answer_html": format_llm_response(resp.answer),
+        "meta": meta,
+        "sources": sources,
+        "input_sources": collect_input_sources(resp.context.all_nodes, labels),
     }
 
 
@@ -275,6 +561,7 @@ def save_user_note(
     for card in raw_cards:
         unmask_card(card, entity_map)
         card.source_input = (source_input or "").strip() or "text"
+        card.source_quote = find_source_quote(text, card.content)
 
     total = len(raw_cards)
 
@@ -339,15 +626,17 @@ def describe_source_input(raw: str) -> dict:
     }
 
 
-def collect_input_sources(nodes) -> list[dict]:
-    seen = set()
+def collect_input_sources(nodes, project_labels: dict | None = None) -> list[dict]:
     items = []
     for node in nodes:
         raw = (getattr(node, "source_input", None) or "").strip() or "text"
-        if raw in seen:
-            continue
-        seen.add(raw)
-        items.append(describe_source_input(raw))
+        item = describe_source_input(raw)
+        item["topic"] = (getattr(node, "topic", None) or "").strip()
+        item["luhmann_id"] = getattr(node, "luhmann_id", "") or ""
+        item["quote"] = (getattr(node, "source_quote", None) or "").strip()
+        if project_labels:
+            item["project"] = project_labels.get(getattr(node, "user_id", None) or "", "")
+        items.append(item)
     return items
 
 
@@ -476,11 +765,53 @@ body {
 .hub-hero p { color: var(--muted); margin-top: 8px; font-size: 15px; }
 .hub-search { width: 100%; padding: 14px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; margin: 16px 0 20px; }
 .hub-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); }
-.common-card { display: block; text-decoration: none; color: inherit; background: linear-gradient(135deg, rgba(99,102,241,0.18), rgba(168,85,247,0.12)); border: 1px solid rgba(99,102,241,0.45); border-radius: 20px; padding: 22px; margin-bottom: 22px; transition: transform 0.2s, box-shadow 0.2s; }
+.hub-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 22px; }
+@media (max-width: 720px) { .hub-actions { grid-template-columns: 1fr; } }
+.common-card { display: block; text-decoration: none; color: inherit; background: linear-gradient(135deg, rgba(99,102,241,0.18), rgba(168,85,247,0.12)); border: 1px solid rgba(99,102,241,0.45); border-radius: 20px; padding: 22px; margin-bottom: 0; transition: transform 0.2s, box-shadow 0.2s; }
 .common-card:hover { transform: translateY(-3px); box-shadow: 0 16px 40px var(--glow); }
 .common-card h2 { font-size: 20px; margin-bottom: 6px; }
 .common-card p { color: var(--text2); font-size: 14px; line-height: 1.5; }
 .common-meta { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.common-card.contour-card { background: linear-gradient(135deg, rgba(6,182,212,0.16), rgba(99,102,241,0.12)); border-color: rgba(6,182,212,0.45); }
+.container.contour { max-width: 880px; }
+.contour-banner { background: linear-gradient(135deg, rgba(6,182,212,0.12), rgba(99,102,241,0.12)); border: 1px solid rgba(6,182,212,0.28); border-radius: 16px; padding: 16px 18px; margin-bottom: 18px; }
+.contour-banner h2 { font-size: 15px; margin-bottom: 6px; }
+.contour-banner p { color: var(--text2); font-size: 13px; line-height: 1.55; }
+.contour-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 10px; flex-wrap: wrap; }
+.contour-count { font-size: 13px; color: var(--muted); }
+.contour-count strong { color: var(--text); font-weight: 600; }
+.contour-reset { background: transparent; border: none; color: var(--accent); font: inherit; font-size: 13px; cursor: pointer; padding: 0; }
+.contour-reset:hover { text-decoration: underline; }
+.contour-search { width: 100%; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; color: var(--text); font-size: 14px; margin: 0 0 10px; }
+.contour-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); }
+.contour-rail { position: relative; margin: 0 -4px 12px; }
+.contour-rail-btn { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-size: 18px; line-height: 1; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px var(--glow); }
+.contour-rail-btn:hover { border-color: var(--accent); color: var(--accent); }
+.contour-rail-btn.prev { left: 0; }
+.contour-rail-btn.next { right: 0; }
+.contour-pick { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; scroll-padding: 0 40px; padding: 6px 40px 14px; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+.contour-pick::-webkit-scrollbar { height: 6px; }
+.contour-pick::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+.contour-tile { flex: 0 0 210px; scroll-snap-align: start; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 16px; cursor: pointer; color: inherit; font: inherit; position: relative; overflow: hidden; min-height: 112px; transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s; }
+.contour-tile.hidden { display: none; }
+.contour-tile::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--dot, var(--accent)); }
+.contour-tile:hover { border-color: var(--dot, var(--accent)); transform: translateY(-1px); }
+.contour-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); background: rgba(99,102,241,0.08); }
+.contour-tile.disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+.contour-tile h3 { font-size: 14px; margin: 2px 0 6px; padding-right: 22px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.contour-tile .desc { color: var(--muted); font-size: 12px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.contour-tile .meta { color: var(--muted); font-size: 11px; margin-top: 8px; }
+.contour-check { position: absolute; top: 12px; right: 12px; width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--border); background: var(--card); }
+.contour-tile.selected .contour-check { background: var(--accent); border-color: var(--accent); }
+.contour-tile.selected .contour-check::after { content: ''; position: absolute; left: 5px; top: 2px; width: 5px; height: 8px; border: solid #fff; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
+.contour-filter-empty { display: none; text-align: center; color: var(--muted); font-size: 13px; padding: 8px 0 14px; }
+.contour-selected { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; margin-bottom: 14px; }
+.contour-chip { font-size: 12px; padding: 4px 8px 4px 10px; border-radius: 999px; background: rgba(6,182,212,0.14); border: 1px solid rgba(6,182,212,0.35); color: var(--text2); display: inline-flex; align-items: center; gap: 6px; }
+.contour-chip button { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+.contour-chip button:hover { color: var(--error); }
+.contour-wait { background: var(--card); border: 1px dashed var(--border); border-radius: 16px; padding: 28px 20px; text-align: center; color: var(--muted); font-size: 14px; line-height: 1.55; margin-bottom: 8px; }
+.contour-wait strong { color: var(--text); font-weight: 600; }
+.rag-sources .src-project { font-size: 11px; color: var(--accent); font-weight: 600; }
 .section-title { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 8px 0 12px; }
 .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; margin-bottom: 24px; }
 .project-card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; min-height: 130px; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s; position: relative; overflow: hidden; }
@@ -492,6 +823,17 @@ body {
 .project-card .desc { color: var(--text2); font-size: 13px; line-height: 1.45; margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .project-card.archived { opacity: 0.58; }
 .project-card .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--card2); color: var(--muted); font-weight: 500; }
+.status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.status-dot.ready { background: #22c55e; }
+.status-dot.indexed { background: #f97316; }
+.status-dot.linking { background: #eab308; }
+.status-dot.error { background: #ef4444; }
+.status-dot.indexed, .status-dot.linking { animation: status-pulse 1.2s ease-in-out infinite; }
+@keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.status-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.status-row.status-error { color: #ef4444; align-items: flex-start; }
+.status-row.status-error span { line-height: 1.35; }
+.project-card .status-row { margin-top: 8px; }
 .icon-edit { position: absolute; top: 12px; right: 10px; z-index: 2; width: 30px; height: 30px; border: none; background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.35; transition: opacity 0.15s, background 0.15s, color 0.15s; }
 .project-card:hover .icon-edit, .icon-edit:focus { opacity: 1; }
 .icon-edit:hover { background: var(--card2); color: var(--accent); }
@@ -608,6 +950,7 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 
 /* Chat */
 .chat-container { display: flex; flex-direction: column; height: calc(100vh - 200px); min-height: 400px; }
+.container.contour .chat-container { height: calc(100vh - 430px); min-height: 280px; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 16px 0; display: flex; flex-direction: column; gap: 12px; }
 .chat-msg { max-width: 85%; padding: 14px 18px; border-radius: 18px; font-size: 14px; line-height: 1.6; animation: fadeIn 0.3s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -628,6 +971,14 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .rag-sources a { color: var(--accent); word-break: break-all; text-decoration: none; }
 .rag-sources a:hover { text-decoration: underline; }
 .rag-sources .src-label { color: var(--text2); word-break: break-all; }
+.rag-sources .src-quote {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  color: var(--text2);
+  font-size: 13px;
+  line-height: 1.45;
+}
 .chat-msg h2, .chat-msg h3, .chat-msg h4 { margin: 12px 0 8px; font-size: 15px; }
 .chat-msg h2 { font-size: 17px; }
 .chat-msg ul { margin: 8px 0; padding-left: 20px; }
@@ -676,6 +1027,7 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .loading-file-name { margin-top: 8px; font-size: 13px; color: var(--text2); word-break: break-word; }
 .loading-stages { display: none; text-align: left; margin: 18px 0 0; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
 .loading-stages.active { display: block; }
+.loading-hint { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 14px; }
 .loading-stage { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; font-size: 13px; color: var(--muted); line-height: 1.35; }
 .loading-stage + .loading-stage { border-top: 1px solid var(--border); }
 .loading-stage.current { color: var(--text); font-weight: 500; }
@@ -1006,6 +1358,12 @@ document.addEventListener('keydown', function(e) {
     }
     tick();
 })();
+
+(function() {
+    if (document.querySelector('.status-dot.indexed, .status-dot.linking')) {
+        setTimeout(function() { location.reload(); }, 3000);
+    }
+})();
 """
 
 
@@ -1040,6 +1398,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         </div>
         <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
+        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоне. На проекте загорится зелёный кружок, когда граф будет готов.</div>
     </div>
 </div>
 {body}
@@ -1052,7 +1411,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request, msg: str = "", st: str = ""):
-    projects = sync_projects_from_graph()
+    projects = [with_live_ingest(p) for p in sync_projects_from_graph()]
     counts = {}
     total_all = 0
     active_count = 0
@@ -1093,6 +1452,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
                 <h3><span>{escape(name)}</span>{badge}</h3>
                 {desc_html}
                 <p>{n} мыслей в графе</p>
+                {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
         </div>
         """
@@ -1120,11 +1480,18 @@ async def root(request: Request, msg: str = "", st: str = ""):
         {alert}
         <input class="hub-search" id="hubSearch" type="search" placeholder="Найти проект по названию..." />
 
-        <a class="common-card" href="/p/{COMMON_SLUG}">
-            <h2>🌌 Общий граф</h2>
-            <p>Единый слой по активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять заметки. Архивные проекты в общий слой не входят.</p>
-            <div class="common-meta">{active_count} проектов · {total_all} мыслей</div>
-        </a>
+        <div class="hub-actions">
+            <a class="common-card" href="/p/{COMMON_SLUG}">
+                <h2>Общий граф</h2>
+                <p>Единый слой по всем активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять заметки.</p>
+                <div class="common-meta">{active_count} проектов · {total_all} мыслей</div>
+            </a>
+            <a class="common-card contour-card" href="/contour">
+                <h2>Совместный поиск</h2>
+                <p>Соберите изолированный контур из нескольких проектов и задайте вопрос только по ним. Графы остаются раздельными.</p>
+                <div class="common-meta">до {CONTOUR_MAX_PROJECTS} проектов · только поиск</div>
+            </a>
+        </div>
 
         <div class="section-title">Проекты</div>
         {archive_toggle}
@@ -1241,6 +1608,7 @@ async def create_project(name: str = Form(""), description: str = Form("")):
         "graph_id": f"proj_{slug}",
         "description": desc,
         "archived": False,
+        "ingest_status": "ready",
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     save_projects(projects)
@@ -1297,6 +1665,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             <div class="readonly-banner">Этот граф только для навигации и поиска. Новые заметки добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
             <div class="msg-box">Сейчас объединено {n} мыслей из {len(scope["graph_ids"])} проектов.</div>
             <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
+            <a href="/contour" class="menu-btn"><span class="icon">🧩</span><span>Совместный поиск по выбранным проектам</span></a>
             <a href="/p/{COMMON_SLUG}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть общий граф</span></a>
         </div>
         """
@@ -1337,6 +1706,8 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             </div>
             {desc_html}
             <p class="project-count">📚 {n} мыслей в проекте</p>
+            <p class="project-count">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}</p>
+            {('<p class="project-count">Новые мысли появятся в графе и поиске, когда кружок станет зелёным.</p>' if scope.get("ingest_status") in {"indexed", "linking"} else "")}
         </div>
         <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Добавить новую заметку</span></a>
         <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск мыслей по запросу</span></a>
@@ -1649,7 +2020,12 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                     location.href = addPageUrl(form) + '?msg=' + encodeURIComponent(msg) + '&st=' + (ok ? 'ok' : 'err');
                 }
             });
-            if (!finished) hideLoading();
+            if (!finished) {
+                location.href = addPageUrl(form) + '?msg=' + encodeURIComponent(
+                    'Обработка продолжается в фоне. На проекте загорится зелёный кружок, когда граф будет готов.'
+                ) + '&st=ok';
+                return false;
+            }
         } catch (err) {
             hideLoading();
         }
@@ -1736,7 +2112,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                 }
             });
         } catch (err) {
-            appendFolderLog('Ошибка соединения', 'log-err');
+            appendFolderLog('Соединение закрыто. Обработка продолжается в фоне.', 'log-info');
         }
         hideLoading();
         if (btn) btn.disabled = false;
@@ -1787,7 +2163,7 @@ async def _stream_queue_job(run_sync):
         finally:
             q.put(None)
 
-    fut = loop.run_in_executor(None, runner)
+    _ingest_pool.submit(runner)
 
     async def generate():
         while True:
@@ -1795,7 +2171,6 @@ async def _stream_queue_job(run_sync):
             if item is None:
                 break
             yield _sse(item)
-        await fut
 
     return _sse_response(generate())
 
@@ -1819,13 +2194,11 @@ async def add_text(slug: str, request: Request, note_text: str = Form("")):
     def work(on_stage):
         if on_stage:
             on_stage("prepare", "Подготовка заметки", "Проверяем текст")
-        ok, ans = save_user_note(scope["graph_id"], text, on_stage=on_stage, source_input="text")
-        log_event(slug, text, "text_artifact", ans)
-        return ok, ans
+        return run_ingest(slug, scope["graph_id"], text, "text", "text_artifact", text, on_stage=on_stage)
 
     if not _wants_sse(request):
-        ok, ans = work(None)
-        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+        _queue_ingest(slug, scope["graph_id"], text, "text", "text_artifact", text)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
         ok, ans = work(_stage_put(q))
@@ -1863,23 +2236,28 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
             text = extract_file_text(str(tmp))
             if not (text or "").strip():
                 return False, "Текст не извлечен"
-            ok, ans = save_user_note(
+            return run_ingest(
+                slug,
                 scope["graph_id"],
                 text,
+                filename,
+                ext[1:].upper(),
+                f"[{filename}]",
                 on_stage=on_stage,
-                source_input=filename,
             )
-            log_event(slug, f"[{filename}]", ext[1:].upper(), ans)
-            return ok, ans
         except FileTooLargeError as e:
             log_event(slug, f"[{filename}]", ext[1:].upper(), str(e))
             return False, str(e)
+        except Exception as e:
+            err = f"Не удалось прочитать файл: {e}"
+            log_event(slug, f"[{filename}]", ext[1:].upper(), err)
+            return False, err
         finally:
             tmp.unlink(missing_ok=True)
 
     if not _wants_sse(request):
-        ok, ans = work(None)
-        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+        _ingest_pool.submit(work, None)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
         ok, ans = work(_stage_put(q))
@@ -1924,11 +2302,14 @@ async def add_folder(
                 if not (text or "").strip():
                     ok, ans = False, "Текст не извлечен"
                 else:
-                    ok, ans = save_user_note(
+                    ok, ans = run_ingest(
+                        slug,
                         uid,
                         text,
+                        os.path.abspath(path),
+                        "folder",
+                        f"[{name}]",
                         on_stage=on_stage,
-                        source_input=os.path.abspath(path),
                     )
             except FileTooLargeError as e:
                 ok, ans = False, str(e)
@@ -1938,7 +2319,7 @@ async def add_folder(
                 ok_n += 1
             else:
                 fail_n += 1
-            log_event(slug, f"[{name}]", "folder", ans)
+                log_event(slug, f"[{name}]", "folder", ans)
             q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
         q.put({"type": "done", "ok": ok_n, "fail": fail_n})
 
@@ -1981,24 +2362,357 @@ async def add_confluence(slug: str, request: Request, url: str = Form("")):
             return False, err_text
         if on_stage:
             on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
-        ok, ans = save_user_note(
-            scope["graph_id"],
-            text,
-            on_stage=on_stage,
-            source_input=page_url,
-        )
-        log_event(slug, page_url, "confluence", ans)
-        return ok, ans
+        return run_ingest(slug, scope["graph_id"], text, page_url, "confluence", page_url, on_stage=on_stage)
 
     if not _wants_sse(request):
-        ok, ans = work(None)
-        return RedirectResponse(f"/p/{slug}/add?msg={escape(ans)}&st={'ok' if ok else 'err'}", status_code=303)
+        _ingest_pool.submit(work, None)
+        return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
         ok, ans = work(_stage_put(q))
         q.put({"type": "result", "ok": bool(ok), "message": ans})
 
     return await _stream_queue_job(run)
+
+
+# ========== CONTOUR SEARCH ==========
+
+@app.get("/contour", response_class=HTMLResponse)
+async def contour_page(request: Request):
+    active = active_search_projects()
+    counts = {}
+    for p in active:
+        try:
+            counts[p["slug"]] = linker.repository.total_count(p["graph_id"])
+        except Exception:
+            counts[p["slug"]] = 0
+
+    catalog = [
+        {
+            "slug": p["slug"],
+            "name": p.get("name") or p["slug"],
+            "desc": (p.get("description") or "").strip(),
+            "accent": project_accent(p["slug"]),
+            "count": counts.get(p["slug"], 0),
+        }
+        for p in sorted(active, key=lambda x: (x.get("name") or "").lower())
+    ]
+    preselect = [s for s in request.query_params.getlist("p") if s]
+    tiles = ""
+    for item in catalog:
+        desc = escape(item["desc"]) if item["desc"] else "Без описания"
+        tiles += f"""
+        <button type="button" class="contour-tile" data-slug="{escape(item['slug'])}" data-name="{escape((item['name'] + ' ' + item['desc']).lower())}" style="--dot:{item['accent']}">
+            <span class="contour-check"></span>
+            <h3>{escape(item['name'])}</h3>
+            <div class="desc">{desc}</div>
+            <div class="meta">{item['count']} мыслей</div>
+        </button>
+        """
+    if not catalog:
+        tiles = '<div class="contour-wait">Сначала создайте хотя бы два активных проекта.</div>'
+
+    body = f"""
+    <div class="container contour">
+        <a href="/" class="back-link">← Проекты</a>
+        <div class="page-kicker">Изолированный контур · только поиск</div>
+        <div class="page-header"><h2>Совместный поиск</h2></div>
+        <div class="contour-banner">
+            <h2>Графы не сливаются</h2>
+            <p>Выберите от {CONTOUR_MIN_PROJECTS} до {CONTOUR_MAX_PROJECTS} проектов. Вопрос пойдёт в GraphRAG только по ним. Каждый проект по-прежнему открывается отдельно, заметки туда не записываются.</p>
+        </div>
+        <div class="contour-toolbar">
+            <div class="contour-count" id="contourCount">Выбрано <strong>0</strong> из {CONTOUR_MAX_PROJECTS}</div>
+            <button type="button" class="contour-reset" id="contourReset">Сбросить</button>
+        </div>
+        <input class="contour-search" id="contourSearch" type="search" placeholder="Найти проект по названию..." autocomplete="off">
+        <div class="contour-rail" id="contourRail">
+            <button type="button" class="contour-rail-btn prev" id="contourPrev" aria-label="Листать влево">‹</button>
+            <div class="contour-pick" id="contourPick">{tiles}</div>
+            <button type="button" class="contour-rail-btn next" id="contourNext" aria-label="Листать вправо">›</button>
+        </div>
+        <div class="contour-filter-empty" id="contourFilterEmpty">Нет проектов с таким названием</div>
+        <div class="contour-selected" id="contourChips"></div>
+        <div class="contour-wait" id="contourWait">Выберите <strong>ещё два проекта</strong>, чтобы задать вопрос по контуру.</div>
+        <div class="chat-container" id="contourChat" style="display:none">
+            <div class="chat-messages" id="chatMessages">
+                <div class="chat-msg bot" id="contourHint"><p></p></div>
+            </div>
+            <form class="chat-input-wrap" id="searchForm" onsubmit="return sendMessage(event)">
+                <textarea id="queryInput" name="q" placeholder="Вопрос только по выбранным проектам..." rows="1"></textarea>
+                <button type="submit" class="btn" id="sendBtn">→</button>
+            </form>
+        </div>
+    </div>
+    """
+
+    js = f"""
+    const PROJECTS = {json.dumps(catalog, ensure_ascii=False)};
+    const MAX = {CONTOUR_MAX_PROJECTS};
+    const MIN = {CONTOUR_MIN_PROJECTS};
+    const selected = new Set({json.dumps(preselect, ensure_ascii=False)});
+    const pick = document.getElementById('contourPick');
+    const searchEl = document.getElementById('contourSearch');
+    const emptyEl = document.getElementById('contourFilterEmpty');
+    const railEl = document.getElementById('contourRail');
+    const countEl = document.getElementById('contourCount');
+    const chipsEl = document.getElementById('contourChips');
+    const waitEl = document.getElementById('contourWait');
+    const chatEl = document.getElementById('contourChat');
+    const hintEl = document.getElementById('contourHint');
+    const chatMessages = document.getElementById('chatMessages');
+    const queryInput = document.getElementById('queryInput');
+    const sendBtn = document.getElementById('sendBtn');
+
+    function bySlug(slug) {{
+        return PROJECTS.find(function(p) {{ return p.slug === slug; }});
+    }}
+    function esc(s) {{
+        return String(s).replace(/[&<>"']/g, function(c) {{
+            return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+        }});
+    }}
+    function selectedList() {{
+        return PROJECTS.filter(function(p) {{ return selected.has(p.slug); }});
+    }}
+    function remaining() {{
+        const n = selected.size;
+        if (n >= MIN) return 0;
+        return MIN - n;
+    }}
+    function syncUrl() {{
+        const params = new URLSearchParams();
+        selectedList().forEach(function(p) {{ params.append('p', p.slug); }});
+        const q = params.toString();
+        history.replaceState(null, '', q ? ('/contour?' + q) : '/contour');
+    }}
+    function render() {{
+        const q = (searchEl && searchEl.value || '').trim().toLowerCase();
+        const items = selectedList();
+        let visible = 0;
+        pick.querySelectorAll('.contour-tile').forEach(function(btn) {{
+            const slug = btn.getAttribute('data-slug');
+            const name = btn.getAttribute('data-name') || '';
+            const match = !q || name.indexOf(q) !== -1;
+            btn.classList.toggle('hidden', !match);
+            if (match) visible += 1;
+            const on = selected.has(slug);
+            btn.classList.toggle('selected', on);
+            btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+            const locked = !on && selected.size >= MAX;
+            btn.classList.toggle('disabled', locked);
+        }});
+        const order = items.map(function(p) {{ return p.slug; }});
+        const tiles = Array.from(pick.querySelectorAll('.contour-tile'));
+        tiles.sort(function(a, b) {{
+            const as = selected.has(a.getAttribute('data-slug')) ? 0 : 1;
+            const bs = selected.has(b.getAttribute('data-slug')) ? 0 : 1;
+            if (as !== bs) return as - bs;
+            if (as === 0) {{
+                return order.indexOf(a.getAttribute('data-slug')) - order.indexOf(b.getAttribute('data-slug'));
+            }}
+            return tiles.indexOf(a) - tiles.indexOf(b);
+        }});
+        tiles.forEach(function(btn) {{ pick.appendChild(btn); }});
+        if (!q) pick.scrollLeft = 0;
+        if (emptyEl) emptyEl.style.display = (q && !visible) ? '' : 'none';
+        if (railEl) railEl.style.display = (!q || visible) ? '' : 'none';
+        countEl.innerHTML = 'Выбрано <strong>' + selected.size + '</strong> из ' + MAX;
+        chipsEl.innerHTML = items.map(function(p) {{
+            return '<span class="contour-chip">' + esc(p.name) + '<button type="button" data-remove="' + esc(p.slug) + '" aria-label="Убрать">×</button></span>';
+        }}).join('');
+        const ready = selected.size >= MIN;
+        waitEl.style.display = ready ? 'none' : '';
+        chatEl.style.display = ready ? '' : 'none';
+        const need = remaining();
+        if (!ready) {{
+            waitEl.innerHTML = need === 2
+                ? 'Выберите <strong>ещё два проекта</strong>, чтобы задать вопрос по контуру.'
+                : 'Выберите <strong>ещё один проект</strong>, чтобы открыть поиск.';
+        }} else if (hintEl) {{
+            const names = items.map(function(p) {{ return '«' + p.name + '»'; }}).join(', ');
+            hintEl.innerHTML = '<p>Контур: ' + names + '. Спрашивайте только по этим проектам. Источники в ответе будут подписаны.</p>';
+        }}
+        syncUrl();
+    }}
+    pick.addEventListener('click', function(e) {{
+        const btn = e.target.closest('.contour-tile');
+        if (!btn || btn.classList.contains('disabled') || btn.classList.contains('hidden')) return;
+        const slug = btn.getAttribute('data-slug');
+        if (selected.has(slug)) selected.delete(slug);
+        else if (selected.size < MAX) selected.add(slug);
+        render();
+    }});
+    chipsEl.addEventListener('click', function(e) {{
+        const btn = e.target.closest('[data-remove]');
+        if (!btn) return;
+        selected.delete(btn.getAttribute('data-remove'));
+        render();
+    }});
+    if (searchEl) searchEl.addEventListener('input', render);
+    document.getElementById('contourPrev').addEventListener('click', function() {{
+        pick.scrollBy({{ left: -230, behavior: 'smooth' }});
+    }});
+    document.getElementById('contourNext').addEventListener('click', function() {{
+        pick.scrollBy({{ left: 230, behavior: 'smooth' }});
+    }});
+    document.getElementById('contourReset').addEventListener('click', function() {{
+        selected.clear();
+        render();
+    }});
+    [...selected].forEach(function(slug) {{ if (!bySlug(slug)) selected.delete(slug); }});
+    render();
+
+    if (queryInput) {{
+        queryInput.addEventListener('input', function() {{
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+        }});
+        queryInput.addEventListener('keydown', function(e) {{
+            if (e.key === 'Enter' && !e.shiftKey) {{
+                e.preventDefault();
+                sendMessage(e);
+            }}
+        }});
+    }}
+
+    async function sendMessage(e) {{
+        e.preventDefault();
+        if (selected.size < MIN) return false;
+        const query = queryInput.value.trim();
+        if (!query) {{ queryInput.focus(); return false; }}
+        addMessage(query, 'user');
+        queryInput.value = '';
+        queryInput.style.height = 'auto';
+        const loadingId = 'loading-' + Date.now();
+        chatMessages.innerHTML += `<div class="chat-msg bot" id="${{loadingId}}">
+            <div style="display:flex;align-items:center;gap:12px">
+                <div class="spinner" style="width:20px;height:20px;margin:0;border-width:2px"></div>
+                <span style="color:var(--muted)">Поиск по выбранному контуру...</span>
+            </div>
+        </div>`;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        sendBtn.disabled = true;
+        try {{
+            const resp = await fetch('/contour/api/search', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{ q: query, projects: selectedList().map(function(p) {{ return p.slug; }}) }})
+            }});
+            const data = await resp.json();
+            document.getElementById(loadingId).remove();
+            if (data.error) addMessage('Ошибка: ' + data.error, 'bot');
+            else addMessageHtml(data.answer_html, data.meta, data.sources, data.input_sources);
+        }} catch (err) {{
+            document.getElementById(loadingId).remove();
+            addMessage('Ошибка соединения', 'bot');
+        }}
+        sendBtn.disabled = false;
+        queryInput.focus();
+        return false;
+    }}
+    function addMessage(text, type) {{
+        const div = document.createElement('div');
+        div.className = 'chat-msg ' + type;
+        div.textContent = text;
+        chatMessages.appendChild(div);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }}
+    function addMessageHtml(html, meta, sources, inputSources) {{
+        const div = document.createElement('div');
+        div.className = 'chat-msg bot';
+        div.innerHTML = html;
+        if (sources && sources.length) {{
+            const wrap = document.createElement('div');
+            wrap.className = 'source-chips';
+            sources.forEach(function(name) {{
+                const chip = document.createElement('span');
+                chip.className = 'source-chip';
+                chip.textContent = name;
+                wrap.appendChild(chip);
+            }});
+            div.appendChild(wrap);
+        }}
+        if (inputSources && inputSources.length) {{
+            const details = document.createElement('details');
+            details.className = 'rag-sources';
+            const summary = document.createElement('summary');
+            summary.textContent = 'Посмотреть источники';
+            details.appendChild(summary);
+            const list = document.createElement('ul');
+            inputSources.forEach(function(src) {{
+                const li = document.createElement('li');
+                const kind = document.createElement('span');
+                kind.className = 'src-kind';
+                kind.textContent = src.title || 'Источник';
+                li.appendChild(kind);
+                if (src.project) {{
+                    const proj = document.createElement('span');
+                    proj.className = 'src-project';
+                    proj.textContent = src.project;
+                    li.appendChild(proj);
+                }}
+                if (src.topic) {{
+                    const topic = document.createElement('span');
+                    topic.className = 'src-label';
+                    topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
+                    li.appendChild(topic);
+                }}
+                if (src.quote) {{
+                    const quote = document.createElement('blockquote');
+                    quote.className = 'src-quote';
+                    quote.textContent = src.quote;
+                    li.appendChild(quote);
+                }}
+                if (src.href) {{
+                    const a = document.createElement('a');
+                    a.href = src.href;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.textContent = src.label || src.href;
+                    li.appendChild(a);
+                }} else {{
+                    const span = document.createElement('span');
+                    span.className = 'src-label';
+                    span.textContent = src.label || '';
+                    li.appendChild(span);
+                }}
+                list.appendChild(li);
+            }});
+            details.appendChild(list);
+            div.appendChild(details);
+        }}
+        if (meta) {{
+            const metaDiv = document.createElement('div');
+            metaDiv.className = 'meta';
+            metaDiv.textContent = meta;
+            div.appendChild(metaDiv);
+        }}
+        chatMessages.appendChild(div);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }}
+    """
+    return HTMLResponse(html_page("Совместный поиск", body, js))
+
+
+@app.post("/contour/api/search")
+async def contour_api_search(request: Request):
+    try:
+        data = await request.json()
+        query = (data.get("q") or "").strip()
+        slugs = data.get("projects") or []
+    except Exception:
+        return JSONResponse({"error": "Неверный формат"}, status_code=400)
+    if not query:
+        return JSONResponse({"error": "Введите запрос"}, status_code=400)
+    if not isinstance(slugs, list):
+        return JSONResponse({"error": "Выберите проекты"}, status_code=400)
+    selected, err = resolve_contour_slugs([str(s) for s in slugs])
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    graph_ids = [p["graph_id"] for p in selected]
+    labels = {p["graph_id"]: (p.get("name") or p["slug"]) for p in selected}
+    return JSONResponse(rag_search_payload(query, graph_ids, labels, "contour"))
 
 
 # ========== SEARCH (Chat style with formatting) ==========
@@ -2137,6 +2851,24 @@ async def search_page(slug: str):
                 kind.className = 'src-kind';
                 kind.textContent = src.title || 'Источник';
                 li.appendChild(kind);
+                if (src.project) {{
+                    const proj = document.createElement('span');
+                    proj.className = 'src-project';
+                    proj.textContent = src.project;
+                    li.appendChild(proj);
+                }}
+                if (src.topic) {{
+                    const topic = document.createElement('span');
+                    topic.className = 'src-label';
+                    topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
+                    li.appendChild(topic);
+                }}
+                if (src.quote) {{
+                    const quote = document.createElement('blockquote');
+                    quote.className = 'src-quote';
+                    quote.textContent = src.quote;
+                    li.appendChild(quote);
+                }}
                 if (src.href) {{
                     const a = document.createElement('a');
                     a.href = src.href;
@@ -2183,35 +2915,24 @@ async def api_search(slug: str, request: Request):
     if not query:
         return JSONResponse({"error": "Введите запрос"}, status_code=400)
 
-    graph_key = "__all__" if scope["readonly"] else scope["graph_id"]
     labels = scope.get("project_labels") or {}
-    resp = graphrag.query(
-        graph_key,
-        query,
-        user_ids=scope["graph_ids"] if scope["readonly"] else None,
-        project_labels=labels if scope["readonly"] else None,
-    )
+    if scope["readonly"]:
+        payload = rag_search_payload(query, scope["graph_ids"], labels, slug)
+        return JSONResponse(payload)
+
+    graph_key = scope["graph_id"]
+    resp = graphrag.query(graph_key, query)
     log_event(slug, query, "search_query", resp.answer)
     formatted = format_llm_response(resp.answer)
-    sources = []
-    if scope["readonly"] and labels:
-        seen = set()
-        for node in resp.context.all_nodes:
-            name = labels.get(node.user_id or "")
-            if name and name not in seen:
-                seen.add(name)
-                sources.append(name)
     meta = (
         f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · "
         f"{len(resp.context.expanded_nodes)} узлов"
     )
-    if sources:
-        meta += " · из: " + ", ".join(sources)
-    input_sources = collect_input_sources(resp.context.all_nodes)
+    input_sources = collect_input_sources(resp.context.all_nodes, labels)
     return JSONResponse({
         "answer_html": formatted,
         "meta": meta,
-        "sources": sources,
+        "sources": [],
         "input_sources": input_sources,
     })
 
@@ -2461,4 +3182,4 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("WEB_APP_PORT", "8009"))
-    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8008, reload=False)

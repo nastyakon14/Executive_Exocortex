@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from typing import Any, Sequence
 
@@ -7,6 +8,80 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 
 from observability.metrics import record_llm_call
+
+_HTML_RE = re.compile(r"<[^>]+>")
+_RETRYABLE_MARKERS = (
+    "403",
+    "429",
+    "502",
+    "503",
+    "504",
+    "timeout",
+    "temporarily",
+    "forbidden",
+    "cloudflare",
+    "overloaded",
+    "connection",
+    "nginx",
+)
+
+
+def sanitize_llm_error(exc: BaseException | str) -> str:
+    text = str(exc) or ""
+    if re.search(r"<\s*html|403 forbidden|nginx", text, re.I):
+        return (
+            "Шлюз языковой модели отклонил запрос (403). "
+            "Это ограничение прокси, а не ошибка файла. Подождите минуту и загрузите материал снова."
+        )
+    if "429" in text or "rate limit" in text.lower():
+        return "Модель временно перегружена. Подождите и загрузите материал снова."
+    clean = _HTML_RE.sub(" ", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:400] or "Ошибка языковой модели"
+
+
+def is_retryable_llm_error(exc: BaseException) -> bool:
+    return any(m in str(exc).lower() for m in _RETRYABLE_MARKERS)
+
+
+def invoke_structured(
+    structured_llm,
+    messages: Sequence[BaseMessage],
+    *,
+    component: str,
+    model_name: str,
+    llm=None,
+    schema=None,
+    attempts: int = 3,
+):
+    """invoke со structured output: повтор при 403/5xx и запасной function_calling."""
+    print_llm_request(component, messages, model_name=model_name)
+    last: BaseException | None = None
+    current = structured_llm
+    switched = False
+    for i in range(attempts):
+        try:
+            return current.invoke(messages)
+        except Exception as e:
+            last = e
+            retry = i + 1 < attempts and is_retryable_llm_error(e)
+            print(f"[{component}] LLM error attempt {i + 1}/{attempts}: {sanitize_llm_error(e)}", flush=True)
+            if not retry:
+                break
+            if (
+                not switched
+                and llm is not None
+                and schema is not None
+                and ("403" in str(e) or "forbidden" in str(e).lower())
+            ):
+                try:
+                    current = llm.with_structured_output(schema, method="function_calling")
+                    switched = True
+                    print(f"[{component}] fallback structured output: function_calling", flush=True)
+                except Exception:
+                    pass
+            time.sleep(1.5 * (i + 1))
+    raise RuntimeError(sanitize_llm_error(last or RuntimeError("LLM error"))) from last
 
 
 def print_llm_request(component: str, messages: Sequence[BaseMessage], *, model_name: str = "") -> None:
@@ -127,6 +202,12 @@ def make_chat_openai(
         "api_key": os.getenv("LLM_API_KEY"),
         "base_url": os.getenv("LLM_BASE_URL"),
         "temperature": temperature,
+        "timeout": float(os.getenv("LLM_TIMEOUT", "180")),
+        "max_retries": int(os.getenv("LLM_MAX_RETRIES", "2")),
+        "default_headers": {
+            "HTTP-Referer": os.getenv("LLM_HTTP_REFERER", "http://localhost"),
+            "X-Title": os.getenv("LLM_APP_TITLE", "Executive Exocortex"),
+        },
     }
     if instrument:
         kwargs["callbacks"] = [LLMMetricsCallback(component, model_name)]

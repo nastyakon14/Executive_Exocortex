@@ -30,6 +30,8 @@ prometheus_client
 fastapi 
 uvicorn 
 python-multipart
+python-docx
+python-pptx
 
 natasha
 faker

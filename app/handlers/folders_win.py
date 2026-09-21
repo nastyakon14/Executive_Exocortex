@@ -1,13 +1,14 @@
+"""Обход папки и извлечение текста на Windows."""
 import os
 from pathlib import Path
 
 try:
     from app.handlers.txt_reader import read_txt
-    from app.handlers.pdf_reader import read_pdf
+    from app.handlers.pdf_reader_win import read_pdf
     from app.handlers.size_checker import check_size
 except ImportError:
     from txt_reader import read_txt
-    from pdf_reader import read_pdf
+    from pdf_reader_win import read_pdf
     from size_checker import check_size
 
 try:
@@ -91,32 +92,44 @@ def _pdf_text(data) -> str:
 
 def extract_file_text(file_path: str) -> str:
     """Достаёт текст из одного файла для пайплайна заметок."""
+    if not os.path.isfile(file_path):
+        raise ValueError(f"Файл не найден: {file_path}")
     ext = os.path.splitext(file_path)[1].lower()
-    if not check_size(file_path, ext.lstrip(".")):
-        raise FileTooLargeError()
+    try:
+        if not check_size(file_path, ext.lstrip(".")):
+            raise FileTooLargeError()
+    except FileTooLargeError:
+        raise
+    except OSError as e:
+        raise ValueError(f"Не удалось прочитать файл: {e}") from e
 
-    if ext == ".pdf":
-        return _pdf_text(read_pdf(file_path))
-    if ext == ".txt":
-        return read_txt(file_path) or ""
-    if ext in {".pptx", ".ppt"}:
-        try:
-            from app.handlers.pptx_reader import pptx_to_pdf
-        except ImportError:
-            from pptx_reader import pptx_to_pdf
-        return _pdf_text(pptx_to_pdf(file_path))
-    if ext in {".doc", ".docx"}:
-        try:
-            from app.handlers.word_reader import read_word
-        except ImportError:
-            from word_reader import read_word
-        return _pdf_text(read_word(file_path))
-    if ext in {".png", ".jpg", ".jpeg"}:
-        try:
-            from app.handlers.image_reader import process_image
-        except ImportError:
-            from image_reader import process_image
-        return process_image(file_path) or ""
+    try:
+        if ext == ".pdf":
+            return _pdf_text(read_pdf(file_path))
+        if ext == ".txt":
+            return read_txt(file_path) or ""
+        if ext in {".pptx", ".ppt"}:
+            try:
+                from app.handlers.pptx_reader_win import pptx_to_pdf
+            except ImportError:
+                from pptx_reader_win import pptx_to_pdf
+            return _pdf_text(pptx_to_pdf(file_path))
+        if ext in {".doc", ".docx"}:
+            try:
+                from app.handlers.word_reader_win import read_word
+            except ImportError:
+                from word_reader_win import read_word
+            return _pdf_text(read_word(file_path))
+        if ext in {".png", ".jpg", ".jpeg"}:
+            try:
+                from app.handlers.image_reader_win import process_image
+            except ImportError:
+                from image_reader_win import process_image
+            return process_image(file_path) or ""
+    except FileTooLargeError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Не удалось извлечь текст из «{os.path.basename(file_path)}»: {e}") from e
     raise ValueError(f"Неподдерживаемый формат: {ext}")
 
 

@@ -10,6 +10,22 @@ from dataclasses import dataclass, field
 from storage.neo4j.client import Neo4jClient
 
 
+def _to_lucene_query(text: str) -> str:
+    """Собирает безопасный запрос для Neo4j full-text (Lucene)."""
+    tokens = re.findall(r"[0-9A-Za-zА-Яа-яЁё]{2,}", text or "")
+    unique: list[str] = []
+    seen = set()
+    for token in tokens:
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(token)
+        if len(unique) >= 12:
+            break
+    return " OR ".join(unique)
+
+
 @dataclass
 class ZettelNode:
     """Представление узла Zettel из графа."""
@@ -26,6 +42,7 @@ class ZettelNode:
     updated_at: Optional[datetime] = None
     similarity: Optional[float] = None
     source_input: str = ""
+    source_quote: str = ""
 
 
 @dataclass
@@ -77,6 +94,7 @@ class ZettelRepository:
         is_root_topic: bool = True,
         zettel_id: str = None,
         source_input: str = "text",
+        source_quote: str = "",
     ) -> ZettelNode:
         """
         Создаёт новый узел Zettel (корневой или без связей).
@@ -96,6 +114,7 @@ class ZettelRepository:
             embedding: $embedding,
             is_root_topic: $is_root_topic,
             source_input: $source_input,
+            source_quote: $source_quote,
             created_at: datetime($created_at),
             updated_at: datetime($created_at)
         })
@@ -113,6 +132,7 @@ class ZettelRepository:
             "embedding": embedding,
             "is_root_topic": is_root_topic,
             "source_input": source_input or "text",
+            "source_quote": source_quote or "",
             "created_at": now,
         })
         
@@ -136,6 +156,7 @@ class ZettelRepository:
             is_root_topic=is_root_topic,
             embedding=embedding,
             source_input=source_input or "text",
+            source_quote=source_quote or "",
         )
     
     def create_child_of(
@@ -150,6 +171,7 @@ class ZettelRepository:
         parent_zettel_id: str,
         zettel_id: str = None,
         source_input: str = "text",
+        source_quote: str = "",
     ) -> ZettelNode:
         """
         Создаёт дочерний узел Zettel и связывает его с родителем через CHILD_OF.
@@ -170,6 +192,7 @@ class ZettelRepository:
             embedding: $embedding,
             is_root_topic: false,
             source_input: $source_input,
+            source_quote: $source_quote,
             created_at: datetime($created_at),
             updated_at: datetime($created_at)
         })
@@ -188,6 +211,7 @@ class ZettelRepository:
             "embedding": embedding,
             "parent_id": parent_zettel_id,
             "source_input": source_input or "text",
+            "source_quote": source_quote or "",
             "created_at": now,
         })
         
@@ -207,6 +231,7 @@ class ZettelRepository:
             is_root_topic=False,
             embedding=embedding,
             source_input=source_input or "text",
+            source_quote=source_quote or "",
         )
     
     def update_zettel_content(
@@ -216,6 +241,7 @@ class ZettelRepository:
         new_content: str,
         new_embedding: List[float],
         reason: str = "",
+        source_quote: str = "",
     ) -> Optional[ZettelNode]:
         """
         Обновляет контент и эмбеддинг существующего узла (сценарий UPDATE_OF).
@@ -228,6 +254,7 @@ class ZettelRepository:
         MATCH (z:Zettel {zettel_id: $zettel_id, user_id: $user_id})
         SET z.content = $content,
             z.embedding = $embedding,
+            z.source_quote = CASE WHEN $source_quote = '' THEN z.source_quote ELSE $source_quote END,
             z.updated_at = datetime($updated_at)
         RETURN z
         """
@@ -237,6 +264,7 @@ class ZettelRepository:
             "user_id": user_id,
             "content": updated_content,
             "embedding": new_embedding,
+            "source_quote": source_quote or "",
             "updated_at": now.isoformat(),
         })
         
@@ -257,6 +285,8 @@ class ZettelRepository:
             tags=z["tags"],
             is_root_topic=z["is_root_topic"],
             embedding=z["embedding"],
+            source_input=z.get("source_input") or "text",
+            source_quote=z.get("source_quote") or "",
         )
     
     def _create_entity_links(self, user_id: str, zettel_id: str, tags: List[str]) -> None:
@@ -547,6 +577,80 @@ class ZettelRepository:
                 candidates.append((node, score))
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[:limit]
+
+    def fulltext_search(
+        self,
+        user_id: str,
+        query_text: str,
+        limit: int = 20,
+        user_ids: Optional[List[str]] = None,
+    ) -> List[Tuple[ZettelNode, float]]:
+        """Поиск по словам в теме и тексте. Пустой список, если индекса ещё нет."""
+        lucene = _to_lucene_query(query_text)
+        if not lucene:
+            return []
+        if user_id == "__all__" and user_ids is not None and not user_ids:
+            return []
+        if user_id == "__all__" and user_ids:
+            mode = "many"
+        elif user_id == "__all__":
+            mode = "web"
+        else:
+            mode = "one"
+        try:
+            result = self.client.execute_read(
+                """
+                CALL db.index.fulltext.queryNodes('zettel_fulltext', $q)
+                YIELD node, score
+                WHERE node:Zettel
+                  AND (
+                    ($mode = 'one' AND node.user_id = $user_id)
+                    OR ($mode = 'many' AND node.user_id IN $user_ids)
+                    OR ($mode = 'web' AND (node.user_id STARTS WITH 'proj_' OR node.user_id STARTS WITH 'web_'))
+                  )
+                RETURN node AS z, score
+                LIMIT $limit
+                """,
+                {
+                    "q": lucene,
+                    "user_id": user_id,
+                    "user_ids": user_ids or [],
+                    "mode": mode,
+                    "limit": limit,
+                },
+            )
+        except Exception as e:
+            print(f"[Neo4j] fulltext search skipped: {e}")
+            return []
+        hits = []
+        for row in result or []:
+            node = self._node_to_zettel(row["z"])
+            score = float(row.get("score") or 0.0)
+            node.similarity = score
+            hits.append((node, score))
+        return hits
+
+    @staticmethod
+    def rrf_fuse(
+        ranked_lists: List[List[Tuple[ZettelNode, float]]],
+        limit: int = 5,
+        k: int = 60,
+    ) -> List[Tuple[ZettelNode, float]]:
+        """Сливает несколько ранжированных списков (Reciprocal Rank Fusion)."""
+        scores: Dict[str, float] = {}
+        nodes: Dict[str, ZettelNode] = {}
+        for lst in ranked_lists:
+            for rank, (node, _) in enumerate(lst, start=1):
+                zid = node.zettel_id
+                scores[zid] = scores.get(zid, 0.0) + 1.0 / (k + rank)
+                nodes[zid] = node
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
+        fused = []
+        for zid, score in ordered:
+            node = nodes[zid]
+            node.similarity = score
+            fused.append((node, score))
+        return fused
     
     # контекст вокруг узла для линкера и graphrag
 
@@ -632,6 +736,7 @@ class ZettelRepository:
             is_root_topic=node_dict.get("is_root_topic", False),
             embedding=list(node_dict.get("embedding", [])) if node_dict.get("embedding") else None,
             source_input=node_dict.get("source_input") or "text",
+            source_quote=node_dict.get("source_quote") or "",
         )
     
     def get_graph_text(self, user_id: str, max_line_len: int = 120) -> str:
@@ -767,6 +872,7 @@ class ZettelRepository:
                z.tags AS tags,
                z.is_root_topic AS is_root_topic,
                z.source_input AS source_input,
+               z.source_quote AS source_quote,
                parent.luhmann_id AS parent_luhmann
         """
         edges_query = """
@@ -821,6 +927,7 @@ class ZettelRepository:
                 "is_root_topic": bool(row.get("is_root_topic")),
                 "parent_luhmann": parent_luhmann,
                 "source_input": row.get("source_input") or "text",
+                "source_quote": row.get("source_quote") or "",
             })
 
         entities = []

@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from dotenv import load_dotenv
 from config.settings import settings
-from observability.llm import make_chat_openai, print_llm_request
+from observability.llm import invoke_structured, make_chat_openai, sanitize_llm_error
 
 load_dotenv()
 
@@ -113,6 +113,7 @@ class ZettelCard(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Дата время создания карточки") # дата время создания карточки
     embedding: Optional[list[float]] = Field(default=None, description="Векторное представление карточки") # векторное представление карточки
     source_input: str = Field(default="text", description="Источник входных данных: путь к файлу, URL Confluence или text")
+    source_quote: str = Field(default="", description="Абзац исходника, из которого взята мысль")
 
     class Config:
         use_enum_values = True
@@ -169,12 +170,12 @@ class NoteAtomizer:
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
 
-        base_llm = make_chat_openai(
+        self.llm = make_chat_openai(
             component="atomizer",
             model_name=self.model_name,
             temperature=self.temperature,
         )
-        self.structured_llm = base_llm.with_structured_output(AtomicThoughtList)
+        self.structured_llm = self.llm.with_structured_output(AtomicThoughtList)
 
     def atomize(
         self,
@@ -210,7 +211,7 @@ class NoteAtomizer:
             cards = self._build_cards(all_thoughts, current_db_max_root_id)
             return self._validate_and_fix(cards)
         except Exception as e:
-            return (f"Ошибка при извлечении атомарных мыслей (atomizer.atomize) --> {e}")
+            return (f"Ошибка при извлечении атомарных мыслей: {sanitize_llm_error(e)}")
 
     @staticmethod
     def _is_length_limit_error(exc: Exception) -> bool:
@@ -437,8 +438,14 @@ class NoteAtomizer:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=preamble + body),
         ]
-        print_llm_request("atomizer", messages, model_name=self.model_name)
-        return self.structured_llm.invoke(messages)
+        return invoke_structured(
+            self.structured_llm,
+            messages,
+            component="atomizer",
+            model_name=self.model_name,
+            llm=self.llm,
+            schema=AtomicThoughtList,
+        )
 
     def _build_cards(
         self,

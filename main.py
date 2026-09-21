@@ -15,7 +15,7 @@ import app.texts as texts
 import app.handlers.asr as asr
 from app.html_format import prepare_telegram_html, plain_fallback
 from app.handlers.txt_reader import read_txt
-from app.handlers.pdf_reader import read_pdf
+from app.handlers.pdf_reader_mac import read_pdf
 from config.settings import settings
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.linker import GraphLinker, LocalEmbeddingModel, LinkAction

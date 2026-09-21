@@ -257,8 +257,9 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             ", ".join(tags),
             _short_text(content, 2500),
             preview,
-            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or ""]).lower(),
+            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or "", z.get("source_quote") or ""]).lower(),
             z.get("source_input") or "text",
+            z.get("source_quote") or "",
         ])
 
     for e in graph_data["entities"]:
@@ -636,6 +637,10 @@ function showDetail(idx) {
         html += esc(src);
       }
       html += '</div></div>';
+    }
+    const quote = (m[9] || '').trim();
+    if (quote) {
+      html += '<div class="field"><div class="field-label">Абзац в источнике</div><div class="field-value">' + esc(quote) + '</div></div>';
     }
     html += '<hr/><div class="field-value">' + esc(m[5]) + '</div>';
   } else {

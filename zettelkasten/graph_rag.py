@@ -59,6 +59,9 @@ class RetrievedContext:
                 project = self.project_labels.get(node.user_id or "", "")
                 source = f" | проект: {project}" if project else ""
                 lines.append(f"• [{node.luhmann_id}]{source} {node.content}")
+                quote = (getattr(node, "source_quote", None) or "").strip()
+                if quote and quote != node.content:
+                    lines.append(f"  цитата: «{quote}»")
         
         if self.entities:
             lines.append("\n## СВЯЗАННЫЕ СУЩНОСТИ")
@@ -126,23 +129,33 @@ class GraphRetriever:
         """Выполняет graphrag retrieval для конкретного пользователя или по всем проектам."""
         context = RetrievedContext()
         
-        # шаг 1: векторный поиск точек входа в граф
+        pool = max(self.search_limit * 4, 20)
         query_embedding = self.embedding_model.embed_query(query)
         if user_id == "__all__":
-            candidates = self.repository.vector_search_all(
+            vector_hits = self.repository.vector_search_all(
                 query_embedding=query_embedding,
-                limit=self.search_limit,
+                limit=pool,
                 similarity_threshold=similarity_threshold,
                 user_ids=user_ids,
             )
         else:
-            candidates = self.repository.vector_search(
+            vector_hits = self.repository.vector_search(
                 user_id=user_id,
                 query_embedding=query_embedding,
-                limit=self.search_limit,
+                limit=pool,
                 similarity_threshold=similarity_threshold,
             )
-        
+        lexical_hits = self.repository.fulltext_search(
+            user_id=user_id,
+            query_text=query,
+            limit=pool,
+            user_ids=user_ids if user_id == "__all__" else None,
+        )
+        if vector_hits and lexical_hits:
+            candidates = self.repository.rrf_fuse([vector_hits, lexical_hits], limit=self.search_limit)
+        else:
+            candidates = (vector_hits or lexical_hits)[: self.search_limit]
+
         context.entry_points = [node for node, _ in candidates]
         
         if not context.entry_points:

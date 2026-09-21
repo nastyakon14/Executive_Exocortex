@@ -20,6 +20,7 @@ def init_schema(client: Neo4jClient) -> None:
     _create_constraints(client)
     _create_indexes(client)
     _create_vector_index(client)
+    _create_fulltext_index(client)
     
     print("[Neo4j Schema] Схема готова")
 
@@ -133,6 +134,23 @@ def _create_vector_index(client: Neo4jClient) -> None:
             )
         else:
             print(f"[Neo4j Schema] Ошибка создания vector index: {e}")
+
+
+def _create_fulltext_index(client: Neo4jClient) -> None:
+    """Полнотекстовый индекс по теме и тексту мысли — для гибридного поиска."""
+    query = """
+    CREATE FULLTEXT INDEX zettel_fulltext IF NOT EXISTS
+    FOR (z:Zettel) ON EACH [z.topic, z.content]
+    """
+    try:
+        client.execute_write(query.strip())
+        print("[Neo4j Schema] Full-text index создан (topic + content)")
+    except Exception as e:
+        error_str = str(e).lower()
+        if "already exists" in error_str:
+            print("[Neo4j Schema] Full-text index уже существует")
+        else:
+            print(f"[Neo4j Schema] Ошибка создания full-text index: {e}")
 
 
 def drop_all_data(client: Neo4jClient) -> None:

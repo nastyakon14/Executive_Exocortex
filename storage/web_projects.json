@@ -6,7 +6,9 @@
       "graph_id": "web_admin",
       "description": "все подряд",
       "archived": false,
-      "created_at": "2026-09-07T14:03:24.733547+00:00"
+      "created_at": "2026-09-07T14:03:24.733547+00:00",
+      "ingest_status": "ready",
+      "ingest_error": ""
     },
     {
       "slug": "legacy_demo",
@@ -14,7 +16,9 @@
       "graph_id": "web_demo",
       "description": "",
       "archived": false,
-      "created_at": "2026-09-07T14:03:24.733560+00:00"
+      "created_at": "2026-09-07T14:03:24.733560+00:00",
+      "ingest_status": "error",
+      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей (atomizer.atomize) --> <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>"
     },
     {
       "slug": "test_project",
@@ -22,7 +26,9 @@
       "graph_id": "proj_test_project",
       "description": "exocortex",
       "archived": true,
-      "created_at": "2026-09-07T14:41:26.895253+00:00"
+      "created_at": "2026-09-07T14:41:26.895253+00:00",
+      "ingest_status": "ready",
+      "ingest_error": ""
     },
     {
       "slug": "b2b_аудит",
@@ -30,7 +36,9 @@
       "graph_id": "proj_b2b_аудит",
       "description": "великий",
       "archived": false,
-      "created_at": "2026-09-07T14:42:05.424621+00:00"
+      "created_at": "2026-09-07T14:42:05.424621+00:00",
+      "ingest_status": "ready",
+      "ingest_error": ""
     },
     {
       "slug": "news",
@@ -38,7 +46,9 @@
       "graph_id": "proj_news",
       "description": "",
       "archived": false,
-      "created_at": "2026-09-08T07:44:57.091415+00:00"
+      "created_at": "2026-09-08T07:44:57.091415+00:00",
+      "ingest_status": "ready",
+      "ingest_error": ""
     }
   ]
 }

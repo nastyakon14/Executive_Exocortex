@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings
-from observability.llm import make_chat_openai, print_llm_request
+from observability.llm import invoke_structured, make_chat_openai
 from storage.neo4j.client import get_neo4j_client
 from storage.neo4j.schema import init_schema
 from storage.neo4j.repository import ZettelRepository, ZettelNode, GraphContext
@@ -303,6 +303,7 @@ class GraphLinker:
             embedding=embedding,
             parent_zettel_id=parent_node.zettel_id,
             source_input=card.source_input or "text",
+            source_quote=getattr(card, "source_quote", "") or "",
         )
         
         # print(f"   ✅ Дочерняя → [{new_luhmann}] ← [{real_parent_luhmann}]")
@@ -386,8 +387,14 @@ class GraphLinker:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
         ]
-        print_llm_request("linker", messages, model_name=self.model_name)
-        return self.structured_llm.invoke(messages)
+        return invoke_structured(
+            self.structured_llm,
+            messages,
+            component="linker",
+            model_name=self.model_name,
+            llm=self.llm,
+            schema=LinkDecision,
+        )
     
     def _apply_new_root(
         self,
@@ -417,6 +424,7 @@ class GraphLinker:
             embedding=embedding,
             is_root_topic=True,
             source_input=card.source_input or "text",
+            source_quote=getattr(card, "source_quote", "") or "",
         )
         
         # print(f"   ✅ NEW_ROOT → [{new_luhmann}]")
@@ -462,6 +470,7 @@ class GraphLinker:
             embedding=embedding,
             parent_zettel_id=parent_node.zettel_id,
             source_input=card.source_input or "text",
+            source_quote=getattr(card, "source_quote", "") or "",
         )
         
         # print(f"   ✅ CHILD_OF [{parent_node.luhmann_id}] → [{new_luhmann}]")
@@ -489,6 +498,7 @@ class GraphLinker:
             new_content=card.content,
             new_embedding=embedding,
             reason=decision.reasoning,
+            source_quote=getattr(card, "source_quote", "") or "",
         )
         
         if not updated_node:
@@ -502,6 +512,7 @@ class GraphLinker:
                     tags=card.tags,
                     is_root_topic=False,
                     source_input=card.source_input or "text",
+                    source_quote=getattr(card, "source_quote", "") or "",
                 ),
                 action=LinkAction.UPDATE_OF,
                 reasoning=f"Ошибка: карточка {decision.target_zettel_id} не найдена",
