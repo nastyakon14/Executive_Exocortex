@@ -1320,7 +1320,11 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         if desc
         else '<p class="project-desc empty">Нет описания — нажмите карандаш, чтобы добавить.</p>'
     )
-    name_js = json.dumps(scope["name"], ensure_ascii=False)
+    destroy_copy = (
+        f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» и все связанные мысли будут удалены.'
+        if n > 0
+        else f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» будет удалён.'
+    )
     body = f"""
     <div class="container">
         {project_nav(scope)}
@@ -1343,8 +1347,8 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
                 <input type="hidden" name="archived" value="{archive_action}">
                 <button type="submit" class="btn-ghost">{archive_label}</button>
             </form>
-            <form action="/p/{escape(slug)}/destroy" method="post" onsubmit="return confirmDestroy(this)">
-                <button type="submit" class="btn-ghost danger">{"Удалить проект" if n > 0 else "Удалить пустой проект"}</button>
+            <form id="destroyForm" action="/p/{escape(slug)}/destroy" method="post">
+                <button type="button" class="btn-ghost danger" onclick="openModal('destroyModal')">{"Удалить проект" if n > 0 else "Удалить пустой проект"}</button>
             </form>
         </div>
     </div>
@@ -1367,31 +1371,24 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             </form>
         </div>
     </div>
+    <div class="modal-overlay" id="destroyModal">
+        <div class="modal-box">
+            <h3>🗑 Удалить проект?</h3>
+            <p>{destroy_copy}</p>
+            <div class="modal-btns">
+                <button type="button" class="cancel" onclick="closeModal('destroyModal')">Отмена</button>
+                <button type="button" class="confirm" onclick="confirmDestroy()">Удалить</button>
+            </div>
+        </div>
+    </div>
     """
-    js = f"""
-    const projectName = {name_js};
-    const thoughtCount = {n};
+    js = """
     const openEdit = document.getElementById('openEditModal');
-    if (openEdit) openEdit.addEventListener('click', function() {{ openModal('editModal'); }});
-    function confirmDestroy(form) {{
-        if (thoughtCount > 0) {{
-            const typed = window.prompt('Чтобы удалить проект вместе с ' + thoughtCount + ' мыслями, введите его название:');
-            if (typed === null) return false;
-            if (typed.trim() !== projectName) {{
-                alert('Название не совпало. Проект не удалён.');
-                return false;
-            }}
-            const hidden = document.createElement('input');
-            hidden.type = 'hidden';
-            hidden.name = 'confirm_name';
-            hidden.value = typed.trim();
-            form.appendChild(hidden);
-        }} else if (!confirm('Удалить пустой проект «' + projectName + '»?')) {{
-            return false;
-        }}
+    if (openEdit) openEdit.addEventListener('click', function() { openModal('editModal'); });
+    function confirmDestroy() {
         showLoading('Удаление проекта');
-        return true;
-    }}
+        document.getElementById('destroyForm').submit();
+    }
     """
     return HTMLResponse(html_page(scope["name"], body, js))
 
@@ -1471,7 +1468,7 @@ async def project_archive(slug: str, archived: str = Form("1")):
 
 
 @app.post("/p/{slug}/destroy")
-async def project_destroy(slug: str, confirm_name: str = Form("")):
+async def project_destroy(slug: str):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -1480,11 +1477,6 @@ async def project_destroy(slug: str, confirm_name: str = Form("")):
         n = linker.repository.total_count(scope["graph_id"])
     except Exception:
         pass
-    if n > 0 and confirm_name.strip() != scope["name"]:
-        return RedirectResponse(
-            f"/p/{slug}?msg=Чтобы удалить проект с мыслями, введите его точное название&st=err",
-            status_code=303,
-        )
     try:
         linker.repository.delete_graph(scope["graph_id"])
     except Exception as e:
