@@ -1,46 +1,34 @@
 """PDF на Windows: встроенный текст, иначе tesseract.exe с корпоративного пути."""
 import os
 import re
-import shutil
+import subprocess
 
 import pandas as pd
 import pdfplumber
 import pytesseract
 
 
-def _windows_tesseract_home() -> str:
-    if os.name == "nt":
-        return r"\\0001fsrvau01\fs_analytics_unit"
-    return "/mnt/analytics_unit"
+def get_home_dir():
+    return r"\\0001fsrvau01\fs_analytics_unit"
 
 
-def _configure_tesseract() -> None:
-    cmd = os.environ.get("TESSERACT_CMD")
-    tessdata = os.environ.get("TESSDATA_PREFIX") or ""
-    if not cmd:
-        tesseract_dir = os.path.join(
-            _windows_tesseract_home(),
-            "Projects",
-            "2026",
-            "34. IDP opensource",
-            "3. Data processing",
-            "Tesseract-OCR",
-        )
-        exe = os.path.join(tesseract_dir, "tesseract.exe")
-        if os.path.isfile(exe):
-            cmd = exe
-            tessdata = os.path.join(tesseract_dir, "tessdata")
-        else:
-            cmd = shutil.which("tesseract")
-    if not cmd:
-        return
-    pytesseract.pytesseract.tesseract_cmd = cmd
-    if tessdata and os.path.isdir(tessdata):
-        os.environ["TESSDATA_PREFIX"] = tessdata
-    os.environ["PATH"] = str(os.path.dirname(cmd)) + os.pathsep + os.environ.get("PATH", "")
+home_dir = get_home_dir()
+TESSERACT_DIR = os.path.join(
+    home_dir, "Projects", "2026", "34. IDP opensource", "3. Data processing", "Tesseract-OCR"
+)
+TESSERACT_EXE = os.path.join(TESSERACT_DIR, "tesseract.exe")
+TESSDATA_DIR = os.path.join(TESSERACT_DIR, "tessdata")
 
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
+os.environ["PATH"] = TESSERACT_DIR + os.pathsep + os.environ.get("PATH", "")
 
-_configure_tesseract()
+result = subprocess.run(
+    [TESSERACT_EXE, "--list-langs"],
+    capture_output=True,
+    text=True,
+)
+print("Доступные языки:", result.stdout)
 
 
 def cleaning_text(text):

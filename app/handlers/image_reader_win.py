@@ -1,8 +1,6 @@
 """Картинки на Windows: tesseract.exe с корпоративного пути, затем тот же VLM."""
-import logging
 import os
 import re
-import shutil
 import subprocess
 import warnings
 
@@ -19,8 +17,6 @@ try:
 except ImportError:
     from image_vlm import VL_extract_table
 
-logger = logging.getLogger(__name__)
-
 
 def get_home_dir():
     return r"\\0001fsrvau01\fs_analytics_unit"
@@ -33,48 +29,22 @@ TESSERACT_DIR = os.path.join(
 TESSERACT_EXE = os.path.join(TESSERACT_DIR, "tesseract.exe")
 TESSDATA_DIR = os.path.join(TESSERACT_DIR, "tessdata")
 
-_ocr = None
-_tesseract_ready = False
-_tesseract_available = False
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
+os.environ["PATH"] = TESSERACT_DIR + os.pathsep + os.environ.get("PATH", "")
 
+result = subprocess.run(
+    [TESSERACT_EXE, "--list-langs"],
+    capture_output=True,
+    text=True,
+)
+print("Доступные языки:", result.stdout)
 
-def _configure_tesseract() -> bool:
-    global _tesseract_ready, _tesseract_available, _ocr
-    if _tesseract_ready:
-        return _tesseract_available
-
-    cmd = os.environ.get("TESSERACT_CMD")
-    tessdata = os.environ.get("TESSDATA_PREFIX") or ""
-    if not cmd and os.path.isfile(TESSERACT_EXE):
-        cmd = TESSERACT_EXE
-        tessdata = TESSDATA_DIR
-    if not cmd:
-        cmd = shutil.which("tesseract")
-    if not cmd:
-        _tesseract_ready = True
-        _tesseract_available = False
-        _ocr = None
-        return False
-
-    pytesseract.pytesseract.tesseract_cmd = cmd
-    if tessdata and os.path.isdir(tessdata):
-        os.environ["TESSDATA_PREFIX"] = tessdata
-    os.environ["PATH"] = os.path.dirname(cmd) + os.pathsep + os.environ.get("PATH", "")
-    try:
-        subprocess.run([cmd, "--list-langs"], capture_output=True, text=True, timeout=8)
-    except Exception:
-        pass
-    try:
-        kwargs = {"n_threads": 4, "lang": "rus+eng"}
-        if tessdata and os.path.isdir(tessdata):
-            kwargs["tessdata_dir"] = tessdata
-        _ocr = TesseractOCR(**kwargs)
-    except Exception as e:
-        logger.warning("img2table OCR недоступен: %s", e)
-        _ocr = None
-    _tesseract_ready = True
-    _tesseract_available = True
-    return True
+ocr = TesseractOCR(
+    n_threads=4,
+    lang="rus+eng",
+    tessdata_dir=TESSDATA_DIR,
+)
 
 
 def cleaning_text(text):
@@ -82,8 +52,6 @@ def cleaning_text(text):
 
 
 def extract_png(input_path) -> str:
-    if not _configure_tesseract():
-        return ""
     img = PIL.Image.open(input_path)
     try:
         text = cleaning_text(pytesseract.image_to_string(img, lang="rus+eng").strip())
@@ -103,11 +71,9 @@ def df_to_markdown(df: pd.DataFrame) -> str:
 
 
 def table_processing(input_path) -> str:
-    if not _configure_tesseract() or _ocr is None:
-        return ""
     doc = Image(input_path)
     extracted = doc.extract_tables(
-        ocr=_ocr,
+        ocr=ocr,
         implicit_rows=True,
         implicit_columns=False,
         borderless_tables=False,
