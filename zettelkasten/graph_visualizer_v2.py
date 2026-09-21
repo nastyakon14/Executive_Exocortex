@@ -1,19 +1,320 @@
 """
 Интерактивный граф знаний v2: Canvas 2D на CPU.
-Раскладка как в graph_visualizer.py, данные компактные и грузятся отдельно.
+Самодостаточный пайплайн: раскладка, упаковка данных, HTML и gzip.
 """
 
 import base64
 import gzip
 import json
+import math
 import os
+import re
 import tempfile
+from collections import defaultdict
 from html import escape as html_escape
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from storage.neo4j.client import Neo4jClient
 from storage.neo4j.repository import ZettelRepository
-from zettelkasten.graph_visualizer import _pack_graph, encode_graph_html
+
+
+_BRANCH_PALETTE = [
+    {"bg": "#D4A055", "border": "#B8862E"},
+    {"bg": "#72B862", "border": "#529842"},
+    {"bg": "#C46888", "border": "#A44868"},
+    {"bg": "#9078C8", "border": "#7058A8"},
+    {"bg": "#C89848", "border": "#A87828"},
+    {"bg": "#68A898", "border": "#488878"},
+    {"bg": "#C87858", "border": "#A85838"},
+    {"bg": "#78A878", "border": "#588858"},
+    {"bg": "#D48068", "border": "#B46048"},
+    {"bg": "#88B848", "border": "#689828"},
+]
+
+
+def _luhmann_sort_key(luhmann_id: str) -> tuple:
+    m = re.match(r"^(\d+)", luhmann_id)
+    return (int(m.group(1)), luhmann_id) if m else (9999, luhmann_id)
+
+
+def _find_root_luhmann(luhmann_id: str, parent_by_luhmann: dict) -> str:
+    current = luhmann_id
+    seen = set()
+    while parent_by_luhmann.get(current) and current not in seen:
+        seen.add(current)
+        current = parent_by_luhmann[current]
+    return current
+
+
+def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
+    roots = sorted(
+        {_find_root_luhmann(z["luhmann_id"], parent_by_luhmann) for z in zettels},
+        key=_luhmann_sort_key,
+    )
+    return {root: _BRANCH_PALETTE[i % len(_BRANCH_PALETTE)] for i, root in enumerate(roots)}
+
+
+def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
+    zettels = graph_data.get("zettels") or []
+    entities = graph_data.get("entities") or []
+    edges = graph_data.get("edges") or []
+
+    children: dict[str, list[str]] = defaultdict(list)
+    luhmann_to_id: dict[str, str] = {}
+    parent_of: dict[str, str | None] = {}
+    order: list[str] = []
+    for z in zettels:
+        lid = z["luhmann_id"]
+        luhmann_to_id[lid] = z["zettel_id"]
+        order.append(lid)
+        parent = z.get("parent_luhmann")
+        parent_of[lid] = parent
+        if parent:
+            children[parent].append(lid)
+
+    known = set(luhmann_to_id)
+    roots: list[str] = []
+    seen_roots = set()
+    for lid in order:
+        parent = parent_of.get(lid)
+        if (not parent or parent not in known) and lid not in seen_roots:
+            seen_roots.add(lid)
+            roots.append(lid)
+    roots.sort(key=_luhmann_sort_key)
+
+    x_unit = 150
+    y_gap = 165
+    leaf_memo: dict[str, int] = {}
+
+    def leaf_count(lid: str, stack: set[str]) -> int:
+        cached = leaf_memo.get(lid)
+        if cached is not None:
+            return cached
+        if lid in stack:
+            return 1
+        stack.add(lid)
+        kids = [c for c in children[lid] if c in known]
+        total = sum(leaf_count(c, stack) for c in kids) if kids else 1
+        stack.remove(lid)
+        leaf_memo[lid] = max(total, 1)
+        return leaf_memo[lid]
+
+    pos: Dict[str, Tuple[float, float]] = {}
+
+    def place(lid: str, x_left: float, y: float, stack: set[str]) -> None:
+        if lid in stack:
+            return
+        stack.add(lid)
+        width = leaf_count(lid, set()) * x_unit
+        zid = luhmann_to_id.get(lid)
+        if zid:
+            pos[zid] = (x_left + width / 2, y)
+        cursor = x_left
+        for child in children[lid]:
+            if child not in known:
+                continue
+            child_w = leaf_count(child, set()) * x_unit
+            place(child, cursor, y + y_gap, stack)
+            cursor += child_w
+        stack.remove(lid)
+
+    depth_memo: dict[str, int] = {}
+
+    def tree_depth(lid: str, stack: set[str]) -> int:
+        cached = depth_memo.get(lid)
+        if cached is not None:
+            return cached
+        if lid in stack:
+            return 0
+        stack.add(lid)
+        kids = [c for c in children[lid] if c in known]
+        depth = 1 + max((tree_depth(c, stack) for c in kids), default=0)
+        stack.remove(lid)
+        depth_memo[lid] = depth
+        return depth
+
+    row_limit = 3200
+    x_cursor = 0.0
+    y_cursor = 0.0
+    row_h = 0.0
+    for root in roots:
+        width = leaf_count(root, set()) * x_unit
+        height = tree_depth(root, set()) * y_gap
+        if x_cursor > 0 and x_cursor + width > row_limit:
+            x_cursor = 0.0
+            y_cursor += row_h + 260
+            row_h = 0.0
+        place(root, x_cursor, y_cursor, set())
+        x_cursor += width + 110
+        row_h = max(row_h, height)
+
+    neighbors: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        to_id = str(edge.get("to_id") or "")
+        from_id = edge.get("from_id")
+        if to_id.startswith("entity:") and from_id:
+            neighbors[to_id].append(from_id)
+
+    for i, entity in enumerate(entities):
+        eid = f"entity:{entity['name']}"
+        pts = [pos[zid] for zid in neighbors.get(eid, []) if zid in pos]
+        if pts:
+            ax = sum(p[0] for p in pts) / len(pts)
+            ay = sum(p[1] for p in pts) / len(pts)
+            pos[eid] = (ax + 34 * math.cos(i * 1.7), ay + 72 + 34 * math.sin(i * 1.7))
+        else:
+            pos[eid] = (i * 88.0, y_cursor + row_h + 220)
+    return pos
+
+
+def _short_text(content: str, max_len: int) -> str:
+    text = " ".join((content or "").split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _node_label(text: str) -> str:
+    """Подпись узла: 2 слова, или 3 если среди них есть короткое (≤3 символа)."""
+    words = (text or "").split()
+    if not words:
+        return ""
+    take = 3 if any(len(w) <= 3 for w in words[:2]) else 2
+    take = min(take, 3)
+    if len(words) <= take:
+        return " ".join(words)
+    return " ".join(words[:take]) + "…"
+
+
+def _thought_size(depth: int) -> int:
+    if depth <= 0:
+        return 62
+    if depth == 1:
+        return 48
+    if depth == 2:
+        return 34
+    if depth == 3:
+        return 28
+    return 24
+
+
+def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int, int]:
+    parent_by_luhmann = {z["luhmann_id"]: z.get("parent_luhmann") for z in graph_data["zettels"]}
+    depth_by_luhmann: dict[str, int] = {}
+
+    def calc_depth(luhmann_id: str, stack=None) -> int:
+        if luhmann_id in depth_by_luhmann:
+            return depth_by_luhmann[luhmann_id]
+        if stack is None:
+            stack = set()
+        if luhmann_id in stack:
+            depth_by_luhmann[luhmann_id] = 0
+            return 0
+        parent_l = parent_by_luhmann.get(luhmann_id)
+        if not parent_l:
+            depth_by_luhmann[luhmann_id] = 0
+            return 0
+        stack.add(luhmann_id)
+        depth = calc_depth(parent_l, stack) + 1
+        stack.remove(luhmann_id)
+        depth_by_luhmann[luhmann_id] = depth
+        return depth
+
+    branch_colors = _assign_branch_colors(graph_data["zettels"], parent_by_luhmann)
+    color_index = {root: i % len(_BRANCH_PALETTE) for i, root in enumerate(branch_colors)}
+    positions = _compute_node_positions(graph_data)
+
+    nodes = []
+    meta = []
+    id_index: dict[str, int] = {}
+    for z in graph_data["zettels"]:
+        nid = z["zettel_id"]
+        if nid in id_index:
+            continue
+        depth = calc_depth(z["luhmann_id"])
+        topic = z.get("topic") or ""
+        content = z.get("content") or ""
+        tags = list(z.get("tags") or [])
+        tt = z.get("thought_type") or ""
+        display = topic.strip() or content
+        xy = positions.get(nid, (0.0, 0.0))
+        root = _find_root_luhmann(z["luhmann_id"], parent_by_luhmann)
+        id_index[nid] = len(nodes)
+        nodes.append({
+            "x": round(xy[0], 1),
+            "y": round(xy[1], 1),
+            "r": _thought_size(depth),
+            "g": 0,
+            "c": color_index[root],
+            "l": _node_label(display),
+        })
+        preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
+        meta.append([
+            z["luhmann_id"],
+            z.get("parent_luhmann") or "",
+            topic,
+            tt,
+            ", ".join(tags),
+            _short_text(content, 2500),
+            preview,
+            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or ""]).lower(),
+            z.get("source_input") or "text",
+        ])
+
+    for e in graph_data["entities"]:
+        eid = f"entity:{e['name']}"
+        if eid in id_index:
+            continue
+        xy = positions.get(eid, (0.0, 0.0))
+        name = e.get("display_name") or e.get("name") or ""
+        id_index[eid] = len(nodes)
+        nodes.append({
+            "x": round(xy[0], 1),
+            "y": round(xy[1], 1),
+            "r": 18,
+            "g": 1,
+            "c": 0,
+            "l": _node_label(name),
+        })
+        meta.append([
+            "",
+            "",
+            name,
+            e.get("entity_type") or "tag",
+            "",
+            f"Упоминаний: {e.get('mention_count') or 0}",
+            name,
+            f"{name} {e.get('entity_type', '')} {e.get('name', '')}".lower(),
+            "",
+        ])
+
+    kind = {"CHILD_OF": 0, "MENTIONS": 1, "RELATED_TO": 2}
+    edges = []
+    edge_set = set()
+    for edge in graph_data["edges"]:
+        key = (edge["from_id"], edge["to_id"], edge["rel_type"])
+        if key in edge_set:
+            continue
+        a = id_index.get(edge["from_id"])
+        b = id_index.get(edge["to_id"])
+        if a is None or b is None:
+            continue
+        edge_set.add(key)
+        edges.append([a, b, kind.get(edge["rel_type"], 0)])
+    return nodes, edges, meta, len(graph_data["zettels"]), len(graph_data["entities"]), len(edges)
+
+
+def encode_graph_html(html: str, accept_encoding: str = "") -> tuple[bytes, dict]:
+    """Сжимает большой HTML, если браузер принимает gzip."""
+    raw = html.encode("utf-8")
+    headers = {"content-type": "text/html; charset=utf-8"}
+    if "gzip" in (accept_encoding or "").lower() and len(raw) > 20_000:
+        return gzip.compress(raw, compresslevel=4), {
+            **headers,
+            "content-encoding": "gzip",
+            "vary": "Accept-Encoding",
+        }
+    return raw, headers
 
 
 def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
