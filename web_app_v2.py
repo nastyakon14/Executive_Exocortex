@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Resp
 import uvicorn
 
 from config.settings import settings
-from storage.postgres.db_connect import  create_database, create_tables, update_history_messages
+from storage.postgres.db_connect import create_database, create_tables, update_history_messages, upsert_watch_source
 from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
 from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
@@ -52,7 +52,7 @@ create_tables()
 pii_anonymizer = Anonymizer(
     use_ner=True,
     use_fake_values=False,
-    mask_dates=False,
+    mask_dates=True,
     mask_urls=True,
     mask_ip=True,
 )
@@ -663,6 +663,58 @@ def _file_format_label(path: str) -> str:
     return FILE_FORMAT_LABELS.get(ext, ext.lstrip(".").upper() or "файл")
 
 
+def _form_flag(value: str) -> bool:
+    return (value or "").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def _format_created_at(value) -> str:
+    if value is None:
+        return ""
+    native = value
+    if hasattr(value, "to_native"):
+        try:
+            native = value.to_native()
+        except Exception:
+            native = value
+    if isinstance(native, datetime):
+        if native.tzinfo is None:
+            native = native.replace(tzinfo=timezone.utc)
+        return native.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    return str(native)
+
+
+def _save_watch_source(scope: dict, kind: str, path: str, watch: bool, extract_child: bool = False) -> None:
+    try:
+        upsert_watch_source(
+            graph_id=scope["graph_id"],
+            project_slug=scope["slug"],
+            source_kind=kind,
+            source_path=path,
+            watch=watch,
+            extract_child=extract_child,
+        )
+    except Exception as e:
+        print(f"[web_app_v2] watch source save warning: {e}")
+
+
+def _tick_row(name: str, label: str, hint: str) -> str:
+    return f"""
+    <div class="tick-row">
+        <label class="tick-check">
+            <input type="checkbox" name="{name}" value="1">
+            <span class="tick-box">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>
+            </span>
+            {escape(label)}
+        </label>
+        <span class="info-tip" tabindex="0">
+            <span class="info-tip-mark" aria-hidden="true">!</span>
+            <span class="info-tip-text">{escape(hint)}</span>
+        </span>
+    </div>
+    """
+
+
 def describe_source_input(raw: str) -> dict:
     value = (raw or "").strip() or "text"
     if value.lower().startswith(("http://", "https://")):
@@ -702,6 +754,10 @@ def collect_input_sources(nodes, project_labels: dict | None = None) -> list[dic
         item["topic"] = (getattr(node, "topic", None) or "").strip()
         item["luhmann_id"] = getattr(node, "luhmann_id", "") or ""
         item["quote"] = (getattr(node, "source_quote", None) or "").strip()
+        item["content"] = (getattr(node, "content", None) or "").strip()
+        item["thought_type"] = getattr(node, "thought_type", "") or ""
+        item["tags"] = list(getattr(node, "tags", None) or [])
+        item["created_at"] = _format_created_at(getattr(node, "created_at", None))
         if project_labels:
             item["project"] = project_labels.get(getattr(node, "user_id", None) or "", "")
         items.append(item)
@@ -1007,6 +1063,22 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .tick-box { width: 18px; height: 18px; border: 1.5px solid var(--border); border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; color: transparent; background: var(--card); flex-shrink: 0; }
 .tick-box svg { width: 12px; height: 12px; }
 .tick-check input:checked + .tick-box { border-color: var(--accent); background: rgba(99,102,241,0.12); color: var(--accent); }
+.tick-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; }
+.tick-row .tick-check { margin: 0; }
+.info-tip { position: relative; display: inline-flex; flex-shrink: 0; }
+.info-tip-mark {
+  width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--border);
+  color: var(--muted); font-size: 12px; font-weight: 700; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center; cursor: help;
+}
+.info-tip:hover .info-tip-mark, .info-tip:focus-within .info-tip-mark { border-color: var(--accent); color: var(--accent); }
+.info-tip-text {
+  display: none; position: absolute; bottom: calc(100% + 8px); right: 0; width: 260px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; font-size: 12px; line-height: 1.45; color: var(--text2);
+  z-index: 30; box-shadow: 0 10px 28px var(--glow);
+}
+.info-tip:hover .info-tip-text, .info-tip:focus-within .info-tip-text { display: block; }
 .folder-log { display: none; margin-top: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; max-height: 240px; overflow-y: auto; font-size: 13px; line-height: 1.55; }
 .folder-log.active { display: block; }
 .folder-log .log-ok { color: var(--success); }
@@ -1037,6 +1109,9 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .rag-sources[open] summary::before { content: "▾"; }
 .rag-sources ul { margin: 10px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
 .rag-sources li { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 10px; background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.22); }
+.rag-sources li.src-item { cursor: pointer; }
+.rag-sources li.src-item:hover { border-color: var(--accent); background: rgba(99,102,241,0.16); }
+.rag-sources .src-open-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
 .rag-sources .src-kind { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 .rag-sources a { color: var(--accent); word-break: break-all; text-decoration: none; }
 .rag-sources a:hover { text-decoration: underline; }
@@ -1175,6 +1250,14 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .modal-btns .cancel:hover { background: var(--border); }
 .modal-btns .confirm { background: var(--error); color: #fff; }
 .modal-btns .confirm:hover { opacity: 0.9; }
+#sourceModal .modal-box { max-width: 560px; max-height: 82vh; overflow-y: auto; }
+.source-field { margin: 10px 0; }
+.source-field .field-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+.source-field .field-value { font-size: 14px; color: var(--text); line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.source-field a { color: var(--accent); word-break: break-all; text-decoration: none; }
+.source-field a:hover { text-decoration: underline; }
+.source-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.source-tags span { font-size: 11px; padding: 3px 8px; border-radius: 999px; background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.28); color: var(--text2); }
 """
 
 JS_COMMON = """
@@ -1221,6 +1304,116 @@ document.addEventListener('keydown', function(e) {
         });
     }
 });
+
+function setSourceField(id, value) {
+    const wrap = document.getElementById(id + 'Wrap');
+    const el = document.getElementById(id);
+    if (!wrap || !el) return;
+    const text = (value || '').toString().trim();
+    wrap.style.display = text ? '' : 'none';
+    el.textContent = text;
+}
+function appendRagSources(container, inputSources) {
+    if (!inputSources || !inputSources.length) return;
+    const details = document.createElement('details');
+    details.className = 'rag-sources';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Посмотреть источники';
+    details.appendChild(summary);
+    const list = document.createElement('ul');
+    inputSources.forEach(function(src) {
+        const li = document.createElement('li');
+        li.className = 'src-item';
+        li.title = 'Открыть карточку источника';
+        const kind = document.createElement('span');
+        kind.className = 'src-kind';
+        kind.textContent = src.title || 'Источник';
+        li.appendChild(kind);
+        if (src.project) {
+            const proj = document.createElement('span');
+            proj.className = 'src-project';
+            proj.textContent = src.project;
+            li.appendChild(proj);
+        }
+        if (src.topic) {
+            const topic = document.createElement('span');
+            topic.className = 'src-label';
+            topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
+            li.appendChild(topic);
+        }
+        if (src.quote) {
+            const quote = document.createElement('blockquote');
+            quote.className = 'src-quote';
+            quote.textContent = src.quote;
+            li.appendChild(quote);
+        }
+        if (src.href) {
+            const a = document.createElement('a');
+            a.href = src.href;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = src.label || src.href;
+            a.addEventListener('click', function(e) { e.stopPropagation(); });
+            li.appendChild(a);
+        } else if (src.label) {
+            const span = document.createElement('span');
+            span.className = 'src-label';
+            span.textContent = src.label;
+            li.appendChild(span);
+        }
+        const hint = document.createElement('span');
+        hint.className = 'src-open-hint';
+        hint.textContent = 'Нажмите, чтобы открыть карточку';
+        li.appendChild(hint);
+        li.addEventListener('click', function() { showSourceCard(src); });
+        list.appendChild(li);
+    });
+    details.appendChild(list);
+    container.appendChild(details);
+}
+function showSourceCard(raw) {
+    const src = raw || {};
+    document.getElementById('sourceModalKind').textContent = src.title || 'Источник';
+    setSourceField('sourceModalId', src.luhmann_id ? '[' + src.luhmann_id + ']' : '');
+    setSourceField('sourceModalTopic', src.topic || '');
+    setSourceField('sourceModalType', src.thought_type || '');
+    setSourceField('sourceModalProject', src.project || '');
+    setSourceField('sourceModalDate', src.created_at || '');
+    const pathWrap = document.getElementById('sourceModalPathWrap');
+    const pathEl = document.getElementById('sourceModalPath');
+    pathEl.innerHTML = '';
+    if (src.href) {
+        const a = document.createElement('a');
+        a.href = src.href;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = src.label || src.href;
+        pathEl.appendChild(a);
+        pathWrap.style.display = '';
+    } else if (src.label) {
+        pathEl.textContent = src.label;
+        pathWrap.style.display = '';
+    } else {
+        pathWrap.style.display = 'none';
+    }
+    setSourceField('sourceModalQuote', src.quote || '');
+    setSourceField('sourceModalContent', src.content || '');
+    const tagsWrap = document.getElementById('sourceModalTagsWrap');
+    const tagsEl = document.getElementById('sourceModalTags');
+    tagsEl.innerHTML = '';
+    const tags = src.tags || [];
+    if (tags.length) {
+        tags.forEach(function(tag) {
+            const chip = document.createElement('span');
+            chip.textContent = tag;
+            tagsEl.appendChild(chip);
+        });
+        tagsWrap.style.display = '';
+    } else {
+        tagsWrap.style.display = 'none';
+    }
+    openModal('sourceModal');
+}
 
 // Loading
 function showLoading(text, subtext, stages) {
@@ -1470,6 +1663,23 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
         <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоне. На проекте загорится зелёный кружок, когда граф будет готов.</div>
+    </div>
+</div>
+<div id="sourceModal" class="modal-overlay">
+    <div class="modal-box">
+        <h3 id="sourceModalKind">Источник</h3>
+        <div class="source-field" id="sourceModalIdWrap"><div class="field-label">Идентификатор</div><div class="field-value" id="sourceModalId"></div></div>
+        <div class="source-field" id="sourceModalTopicWrap"><div class="field-label">Тема</div><div class="field-value" id="sourceModalTopic"></div></div>
+        <div class="source-field" id="sourceModalTypeWrap"><div class="field-label">Тип мысли</div><div class="field-value" id="sourceModalType"></div></div>
+        <div class="source-field" id="sourceModalProjectWrap"><div class="field-label">Проект</div><div class="field-value" id="sourceModalProject"></div></div>
+        <div class="source-field" id="sourceModalDateWrap"><div class="field-label">Дата добавления</div><div class="field-value" id="sourceModalDate"></div></div>
+        <div class="source-field" id="sourceModalPathWrap"><div class="field-label">Источник</div><div class="field-value" id="sourceModalPath"></div></div>
+        <div class="source-field" id="sourceModalQuoteWrap"><div class="field-label">Фрагмент исходника</div><div class="quote field-value" id="sourceModalQuote"></div></div>
+        <div class="source-field" id="sourceModalContentWrap"><div class="field-label">Атомарная мысль</div><div class="quote field-value" id="sourceModalContent"></div></div>
+        <div class="source-field" id="sourceModalTagsWrap"><div class="field-label">Теги</div><div class="source-tags" id="sourceModalTags"></div></div>
+        <div class="modal-btns">
+            <button type="button" class="cancel" onclick="closeModal('sourceModal')">Закрыть</button>
+        </div>
     </div>
 </div>
 {body}
@@ -1990,13 +2200,16 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                         <label>Извлечь из директории</label>
                         <input type="text" name="folder_path" placeholder="Вставьте путь до директории..." required>
                     </div>
-                    <label class="tick-check">
-                        <input type="checkbox" name="extract_child_content" value="1">
-                        <span class="tick-box">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>
-                        </span>
-                        извлечь все дочерние файлы
-                    </label>
+                    {_tick_row(
+                        "extract_child_content",
+                        "извлечь все дочерние файлы",
+                        "Если включить, обрабатываются файлы не только в самой папке, но и во всех вложенных подпапках. Без галочки берутся только файлы верхнего уровня.",
+                    )}
+                    {_tick_row(
+                        "watch_changes",
+                        "Отслеживать изменения",
+                        "Если включить, изменения в этой директории будут отслеживаться. Когда заработает автообновление, новые или изменённые файлы сами попадут в граф проекта.",
+                    )}
                     <button type="submit" class="btn">Обработать</button>
                 </form>
                 <div class="folder-log" id="folderLog"></div>
@@ -2009,6 +2222,11 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                     <label>Извлечь из страницы Confluence</label>
                     <input type="text" name="url" placeholder="Вставьте ссылку на страницу Confluence..." required>
                 </div>
+                {_tick_row(
+                    "watch_changes",
+                    "Отслеживать изменения",
+                    "Если включить, изменения на этой странице Confluence будут отслеживаться. Когда заработает автообновление, обновлённый текст страницы сам попадёт в граф проекта.",
+                )}
                 <button type="submit" class="btn">Извлечь</button>
             </form>
         </div>
@@ -2348,12 +2566,14 @@ async def add_folder(
     slug: str,
     folder_path: str = Form(""),
     extract_child_content: str = Form(""),
+    watch_changes: str = Form(""),
 ):
     scope, err = _writable_scope(slug)
     if err:
         return err
 
-    child = extract_child_content.strip().lower() in {"1", "on", "true", "yes"}
+    child = _form_flag(extract_child_content)
+    watch = _form_flag(watch_changes)
     uid = scope["graph_id"]
 
     def run(q):
@@ -2364,6 +2584,9 @@ async def add_folder(
             q.put({"type": "error", "message": error})
             q.put({"type": "done", "ok": 0, "fail": 0})
             return
+
+        abs_folder = os.path.abspath(os.path.expanduser((folder_path or "").strip()))
+        _save_watch_source(scope, "folder", abs_folder, watch, extract_child=child)
 
         q.put({"type": "start", "total": len(files)})
         ok_n = 0
@@ -2414,11 +2637,17 @@ def _is_confluence_fetch_error(text: str) -> bool:
 
 
 @app.post("/p/{slug}/add/confluence")
-async def add_confluence(slug: str, request: Request, url: str = Form("")):
+async def add_confluence(
+    slug: str,
+    request: Request,
+    url: str = Form(""),
+    watch_changes: str = Form(""),
+):
     scope, err = _writable_scope(slug)
     if err:
         return err
     page_url = url.strip()
+    watch = _form_flag(watch_changes)
 
     if not page_url:
         return RedirectResponse(f"/p/{slug}/add?msg=Вставьте ссылку на страницу Confluence&st=err", status_code=303)
@@ -2437,6 +2666,7 @@ async def add_confluence(slug: str, request: Request, url: str = Form("")):
             err_text = text.strip() or "Не удалось извлечь текст со страницы Confluence"
             log_event(slug, page_url, "confluence", err_text)
             return False, err_text
+        _save_watch_source(scope, "confluence", page_url, watch)
         if on_stage:
             on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
         return run_ingest(slug, scope["graph_id"], text, page_url, "confluence", page_url, on_stage=on_stage)
@@ -2710,55 +2940,7 @@ async def contour_page(request: Request):
             }});
             div.appendChild(wrap);
         }}
-        if (inputSources && inputSources.length) {{
-            const details = document.createElement('details');
-            details.className = 'rag-sources';
-            const summary = document.createElement('summary');
-            summary.textContent = 'Посмотреть источники';
-            details.appendChild(summary);
-            const list = document.createElement('ul');
-            inputSources.forEach(function(src) {{
-                const li = document.createElement('li');
-                const kind = document.createElement('span');
-                kind.className = 'src-kind';
-                kind.textContent = src.title || 'Источник';
-                li.appendChild(kind);
-                if (src.project) {{
-                    const proj = document.createElement('span');
-                    proj.className = 'src-project';
-                    proj.textContent = src.project;
-                    li.appendChild(proj);
-                }}
-                if (src.topic) {{
-                    const topic = document.createElement('span');
-                    topic.className = 'src-label';
-                    topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
-                    li.appendChild(topic);
-                }}
-                if (src.quote) {{
-                    const quote = document.createElement('blockquote');
-                    quote.className = 'src-quote';
-                    quote.textContent = src.quote;
-                    li.appendChild(quote);
-                }}
-                if (src.href) {{
-                    const a = document.createElement('a');
-                    a.href = src.href;
-                    a.target = '_blank';
-                    a.rel = 'noopener noreferrer';
-                    a.textContent = src.label || src.href;
-                    li.appendChild(a);
-                }} else {{
-                    const span = document.createElement('span');
-                    span.className = 'src-label';
-                    span.textContent = src.label || '';
-                    li.appendChild(span);
-                }}
-                list.appendChild(li);
-            }});
-            details.appendChild(list);
-            div.appendChild(details);
-        }}
+        appendRagSources(div, inputSources);
         if (meta) {{
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';
@@ -2915,55 +3097,7 @@ async def search_page(slug: str):
             }});
             div.appendChild(wrap);
         }}
-        if (inputSources && inputSources.length) {{
-            const details = document.createElement('details');
-            details.className = 'rag-sources';
-            const summary = document.createElement('summary');
-            summary.textContent = 'Посмотреть источники';
-            details.appendChild(summary);
-            const list = document.createElement('ul');
-            inputSources.forEach(function(src) {{
-                const li = document.createElement('li');
-                const kind = document.createElement('span');
-                kind.className = 'src-kind';
-                kind.textContent = src.title || 'Источник';
-                li.appendChild(kind);
-                if (src.project) {{
-                    const proj = document.createElement('span');
-                    proj.className = 'src-project';
-                    proj.textContent = src.project;
-                    li.appendChild(proj);
-                }}
-                if (src.topic) {{
-                    const topic = document.createElement('span');
-                    topic.className = 'src-label';
-                    topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
-                    li.appendChild(topic);
-                }}
-                if (src.quote) {{
-                    const quote = document.createElement('blockquote');
-                    quote.className = 'src-quote';
-                    quote.textContent = src.quote;
-                    li.appendChild(quote);
-                }}
-                if (src.href) {{
-                    const a = document.createElement('a');
-                    a.href = src.href;
-                    a.target = '_blank';
-                    a.rel = 'noopener noreferrer';
-                    a.textContent = src.label || src.href;
-                    li.appendChild(a);
-                }} else {{
-                    const span = document.createElement('span');
-                    span.className = 'src-label';
-                    span.textContent = src.label || '';
-                    li.appendChild(span);
-                }}
-                list.appendChild(li);
-            }});
-            details.appendChild(list);
-            div.appendChild(details);
-        }}
+        appendRagSources(div, inputSources);
         if (meta) {{
             const metaDiv = document.createElement('div');
             metaDiv.className = 'meta';

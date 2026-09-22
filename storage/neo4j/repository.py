@@ -723,6 +723,19 @@ class ZettelRepository:
     
     # вспомогательные методы
 
+    @staticmethod
+    def _as_datetime(value):
+        if value is None:
+            return None
+        if hasattr(value, "to_native"):
+            try:
+                return value.to_native()
+            except Exception:
+                pass
+        if isinstance(value, datetime):
+            return value
+        return None
+
     def _node_to_zettel(self, node_dict: dict) -> ZettelNode:
         """Конвертирует Neo4j node dict в ZettelNode."""
         return ZettelNode(
@@ -735,6 +748,8 @@ class ZettelRepository:
             tags=list(node_dict.get("tags", [])),
             is_root_topic=node_dict.get("is_root_topic", False),
             embedding=list(node_dict.get("embedding", [])) if node_dict.get("embedding") else None,
+            created_at=self._as_datetime(node_dict.get("created_at")),
+            updated_at=self._as_datetime(node_dict.get("updated_at")),
             source_input=node_dict.get("source_input") or "text",
             source_quote=node_dict.get("source_quote") or "",
         )

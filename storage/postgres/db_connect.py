@@ -63,8 +63,72 @@ def create_tables():
                     bot_answer TEXT
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS watch_sources (
+                    id SERIAL PRIMARY KEY,
+                    graph_id TEXT NOT NULL,
+                    project_slug TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    watch BOOLEAN NOT NULL DEFAULT FALSE,
+                    extract_child BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS watch_sources_uniq
+                ON watch_sources (graph_id, source_kind, source_path)
+            ''')
             conn.commit()
-            print('Таблица history_messages готова.')
+            print('Таблицы history_messages и watch_sources готовы.')
+
+
+def upsert_watch_source(
+    graph_id: str,
+    project_slug: str,
+    source_kind: str,
+    source_path: str,
+    watch: bool,
+    extract_child: bool = False,
+) -> None:
+    """Сохраняет флаг автообновления для директории или страницы Confluence."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                INSERT INTO watch_sources (
+                    graph_id, project_slug, source_kind, source_path,
+                    watch, extract_child, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (graph_id, source_kind, source_path)
+                DO UPDATE SET
+                    watch = EXCLUDED.watch,
+                    extract_child = EXCLUDED.extract_child,
+                    project_slug = EXCLUDED.project_slug,
+                    updated_at = NOW()
+                ''',
+                (graph_id, project_slug, source_kind, source_path, bool(watch), bool(extract_child)),
+            )
+            conn.commit()
+
+
+def list_watch_sources(watch_only: bool = True) -> list[dict]:
+    """Список источников для будущего auto-refresh."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            sql = '''
+                SELECT id, graph_id, project_slug, source_kind, source_path,
+                       watch, extract_child, created_at, updated_at
+                FROM watch_sources
+            '''
+            if watch_only:
+                sql += ' WHERE watch = TRUE'
+            sql += ' ORDER BY updated_at DESC'
+            cursor.execute(sql)
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 def update_history_messages(user_id, message_id, message_text, message_date, message_type, bot_answer):
     """Сохраняет пару «сообщение пользователя — ответ бота» в postgres."""
