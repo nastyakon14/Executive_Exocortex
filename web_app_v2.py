@@ -1662,7 +1662,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         </div>
         <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
-        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоне. На проекте загорится зелёный кружок, когда граф будет готов.</div>
+        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоновом режиме. На проекте загорится зелёный кружок, когда граф будет готов.</div>
     </div>
 </div>
 <div id="sourceModal" class="modal-overlay">
@@ -2317,7 +2317,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             });
             if (!finished) {
                 location.href = addPageUrl(form) + '?msg=' + encodeURIComponent(
-                    'Обработка продолжается в фоне. На проекте загорится зелёный статус, когда граф будет готов.'
+                    'Обработка продолжается в фоновом режиме. На проекте загорится зелёный статус, когда граф будет готов.'
                 ) + '&st=ok';
                 return false;
             }
@@ -2407,7 +2407,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                 }
             });
         } catch (err) {
-            appendFolderLog('Соединение закрыто. Обработка продолжается в фоне.', 'log-info');
+            appendFolderLog('Соединение закрыто. Обработка продолжается в фоновом режиме.', 'log-info');
         }
         hideLoading();
         if (btn) btn.disabled = false;
