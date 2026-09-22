@@ -574,16 +574,16 @@ def rag_search_payload(query: str, graph_ids: list[str], labels: dict[str, str],
         project_labels=labels or None,
     )
     log_event(log_key, query, "search_query", resp.answer)
+    used = resp.context.used_source_nodes(resp.answer)
     sources = []
     seen = set()
-    for node in resp.context.all_nodes:
+    for node in used:
         name = labels.get(node.user_id or "")
         if name and name not in seen:
             seen.add(name)
             sources.append(name)
     meta = (
-        f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · "
-        f"{len(resp.context.expanded_nodes)} узлов"
+        f"⏱ {resp.processing_time_ms}ms · {len(used)} источник(ов)"
     )
     if sources:
         meta += " · из: " + ", ".join(sources)
@@ -591,7 +591,7 @@ def rag_search_payload(query: str, graph_ids: list[str], labels: dict[str, str],
         "answer_html": format_llm_response(resp.answer),
         "meta": meta,
         "sources": sources,
-        "input_sources": collect_input_sources(resp.context.all_nodes, labels),
+        "input_sources": collect_input_sources(used, labels),
     }
 
 
@@ -3135,11 +3135,9 @@ async def api_search(slug: str, request: Request):
     resp = graphrag.query(graph_key, query)
     log_event(slug, query, "search_query", resp.answer)
     formatted = format_llm_response(resp.answer)
-    meta = (
-        f"⏱ {resp.processing_time_ms}ms · {len(resp.context.entry_points)} точек · "
-        f"{len(resp.context.expanded_nodes)} узлов"
-    )
-    input_sources = collect_input_sources(resp.context.all_nodes, labels)
+    used = resp.context.used_source_nodes(resp.answer)
+    meta = f"⏱ {resp.processing_time_ms}ms · {len(used)} источник(ов)"
+    input_sources = collect_input_sources(used, labels)
     return JSONResponse({
         "answer_html": formatted,
         "meta": meta,

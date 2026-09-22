@@ -2,6 +2,7 @@
 # изоляция по user_id: каждый пользователь ищет только в своём графе
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -95,6 +96,45 @@ class RetrievedContext:
         
         return "\n".join(lines)
 
+    def used_source_nodes(self, answer: str = "") -> List[ZettelNode]:
+        """Документы, на которых основан ответ: цитаты модели, иначе поисковые хиты по скору."""
+        pool = self.all_nodes
+        if not pool:
+            return []
+
+        cite_counts: Dict[str, int] = {}
+        for node in pool:
+            lid = (node.luhmann_id or "").strip()
+            if not lid:
+                continue
+            n = len(re.findall(rf"\[{re.escape(lid)}\](?!\d|[a-z]|\.)", answer or "", flags=re.I))
+            if n:
+                cite_counts[lid] = n
+
+        if cite_counts:
+            ranked = sorted(
+                [n for n in pool if (n.luhmann_id or "") in cite_counts],
+                key=lambda n: (
+                    -cite_counts.get(n.luhmann_id or "", 0),
+                    -(n.similarity or 0.0),
+                ),
+            )
+        else:
+            ranked = sorted(
+                self.entry_points or pool,
+                key=lambda n: -(n.similarity or 0.0),
+            )
+
+        docs: List[ZettelNode] = []
+        seen: set[str] = set()
+        for node in ranked:
+            key = (getattr(node, "source_input", None) or "text").strip() or "text"
+            if key in seen:
+                continue
+            seen.add(key)
+            docs.append(node)
+        return docs
+
 
 @dataclass
 class RAGResponse:
@@ -176,7 +216,10 @@ class GraphRetriever:
         else:
             candidates = (vector_hits or lexical_hits)[: self.search_limit]
 
-        context.entry_points = [node for node, _ in candidates]
+        context.entry_points = []
+        for node, score in candidates:
+            node.similarity = score if node.similarity is None else node.similarity
+            context.entry_points.append(node)
         
         if not context.entry_points:
             return context
@@ -314,6 +357,11 @@ class RAGGenerator:
                 "\nЕсли у мыслей указан проект, в ответе явно называй, "
                 "из какого проекта взята мысль."
             )
+        user_prompt += (
+            "\nОпирайся только на мысли, которые нужны для ответа. "
+            "После каждой такой мысли ставь её номер в квадратных скобках, например [1.2]. "
+            "Не ссылайся на мысли, которые не использовал."
+        )
 
         entity_map = None
         if self._privacy_anonymizer:
