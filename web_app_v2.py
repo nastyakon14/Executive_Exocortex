@@ -652,6 +652,10 @@ FILE_FORMAT_LABELS = {
     ".ppt": "PPT",
     ".doc": "DOC",
     ".docx": "DOCX",
+    ".xlsx": "Excel",
+    ".xls": "Excel",
+    ".xlsm": "Excel",
+    ".xlsb": "Excel",
     ".png": "PNG",
     ".jpg": "JPG",
     ".jpeg": "JPEG",
@@ -2190,7 +2194,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             </div>
             <div id="file-mode-upload">
                 <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitFileIngest(event, this)">
-                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.png,.jpg,.jpeg" required></div>
+                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.xlsx,.xls,.xlsm,.png,.jpg,.jpeg" required></div>
                     <button type="submit" class="btn">Обработать</button>
                 </form>
             </div>
@@ -2514,7 +2518,7 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
     ext = Path(file.filename).suffix.lower()
     if ext not in SUPPORTED_UPLOAD_EXTS:
         return RedirectResponse(
-            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg&st=err",
+            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg&st=err",
             status_code=303,
         )
 

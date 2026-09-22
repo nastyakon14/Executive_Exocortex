@@ -28,10 +28,17 @@ EXTRACTABLE_EXTENSIONS = (
     ".jpeg",
     ".doc",
     ".docx",
+    ".xlsx",
+    ".xls",
+    ".xlsm",
+    ".xlsb",
 )
 extensions = EXTRACTABLE_EXTENSIONS
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
+SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg)"
 
 TOO_LARGE_MESSAGE = "Превышен максимальный размер файла (50 МБ)"
+TOO_LARGE_EXCEL_MESSAGE = "Превышен максимальный размер Excel-файла (10 МБ)"
 
 
 class FileTooLargeError(ValueError):
@@ -79,7 +86,7 @@ def list_folder_files(folder_path, extract_child_content=False):
     if not files:
         return [], (
             "В директории нет поддерживаемых файлов "
-            "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .png, .jpg, .jpeg)"
+            + SUPPORTED_FILES_HINT
         )
     return files, None
 
@@ -97,7 +104,8 @@ def extract_file_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if not check_size(file_path, ext.lstrip(".")):
-            raise FileTooLargeError()
+            msg = TOO_LARGE_EXCEL_MESSAGE if ext in EXCEL_EXTENSIONS else TOO_LARGE_MESSAGE
+            raise FileTooLargeError(msg)
     except FileTooLargeError:
         raise
     except OSError as e:
@@ -126,6 +134,12 @@ def extract_file_text(file_path: str) -> str:
             except ImportError:
                 from image_reader_win import process_image
             return process_image(file_path) or ""
+        if ext in EXCEL_EXTENSIONS:
+            try:
+                from app.handlers.excel_reader import read_excel
+            except ImportError:
+                from excel_reader import read_excel
+            return read_excel(file_path) or ""
     except FileTooLargeError:
         raise
     except Exception as e:
