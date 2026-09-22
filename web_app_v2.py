@@ -98,6 +98,71 @@ EDIT_ICON = (
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
     '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>'
 )
+EXOCORTEX_LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-label="BVA Exocortex">
+  <defs>
+    <linearGradient id="bvaExoG" x1="8" y1="2" x2="74" y2="78" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c4b5fd"/>
+      <stop offset=".22" stop-color="#818cf8"/>
+      <stop offset=".58" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <radialGradient id="bvaExoV" cx="30" cy="24" r="52" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".28"/>
+      <stop offset=".42" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#1e1b4b" stop-opacity=".32"/>
+    </radialGradient>
+    <radialGradient id="bvaExoCore" cx="40" cy="39" r="8" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff"/>
+      <stop offset=".55" stop-color="#e9d5ff"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </radialGradient>
+  </defs>
+  <rect x="3" y="3" width="74" height="74" rx="22" fill="url(#bvaExoG)"/>
+  <rect x="3" y="3" width="74" height="74" rx="22" fill="url(#bvaExoV)"/>
+  <path d="M25 5.4h30c9.4 0 17 7.6 17 17V18c0-8.3-6.7-15-15-15H25z" fill="#fff" opacity=".14"/>
+  <rect x="4.4" y="4.4" width="71.2" height="71.2" rx="20.6" fill="none" stroke="#fff" stroke-opacity=".34" stroke-width="1.35"/>
+  <g fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M23 58c-10-8-11-26 1-37 10-9 28-10 40 1" stroke-width="2.6" opacity=".96"/>
+    <path d="M21 50c-6-10-2-24 12-31" stroke-width="1.35" opacity=".55"/>
+    <path d="M28 16c8-4 18-3 26 3" stroke-width="1.2" opacity=".4"/>
+    <path d="M18 42c2-9 8-16 16-20" stroke-width=".9" opacity=".28"/>
+  </g>
+  <g fill="none" stroke="#fff" stroke-width="1.35" stroke-linecap="round" opacity=".78">
+    <path d="M27 38 40 39 54 32"/>
+    <path d="M40 39 41 23"/>
+    <path d="M40 39 52 50"/>
+    <path d="M40 39 28 52"/>
+    <path d="M27 38 23 26"/>
+    <path d="M41 23 54 26"/>
+    <path d="M54 32 61 42"/>
+    <path d="M54 32 52 50"/>
+    <path d="M28 52 38 59"/>
+    <path d="M52 50 38 59"/>
+    <path d="M23 26 41 23"/>
+    <path d="M27 38 28 52"/>
+  </g>
+  <g fill="none" stroke="#e0e7ff" stroke-width=".7" stroke-dasharray="1.6 2.2" opacity=".55">
+    <circle cx="40" cy="39" r="11.2"/>
+  </g>
+  <g fill="#fff">
+    <circle cx="23" cy="26" r="2.3" opacity=".9"/>
+    <circle cx="41" cy="23" r="2.7"/>
+    <circle cx="54" cy="26" r="2.2" opacity=".9"/>
+    <circle cx="27" cy="38" r="2.8"/>
+    <circle cx="54" cy="32" r="2.6"/>
+    <circle cx="61" cy="42" r="2"/>
+    <circle cx="28" cy="52" r="2.5"/>
+    <circle cx="52" cy="50" r="2.4"/>
+    <circle cx="38" cy="59" r="2.2"/>
+    <circle cx="18" cy="44" r="1.35" opacity=".75"/>
+    <circle cx="48" cy="16" r="1.25" opacity=".7"/>
+    <circle cx="63" cy="54" r="1.15" opacity=".65"/>
+    <circle cx="32" cy="14" r="1.1" opacity=".6"/>
+  </g>
+  <circle cx="40" cy="39" r="6.4" fill="url(#bvaExoCore)"/>
+  <circle cx="40" cy="39" r="6.4" fill="none" stroke="#fff" stroke-width="1.15"/>
+  <circle cx="38.4" cy="37.2" r="1.7" fill="#fff" opacity=".85"/>
+</svg>"""
 
 
 def slugify_project(name: str) -> str:
@@ -764,6 +829,8 @@ body {
 .page-kicker { color: var(--muted); font-size: 13px; margin: 4px 0 12px; }
 .readonly-banner { background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(168,85,247,0.12)); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; margin-bottom: 16px; font-size: 14px; color: var(--text2); line-height: 1.5; }
 .hub-hero { text-align: center; padding: 28px 0 8px; }
+.hub-logo { width: 108px; height: 108px; margin: 0 auto 16px; display: block; filter: drop-shadow(0 14px 28px rgba(99,102,241,0.42)); }
+.hub-logo svg { width: 100%; height: 100%; display: block; }
 .hub-hero h1 { font-size: 32px; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 .hub-hero p { color: var(--muted); margin-top: 8px; font-size: 15px; }
 .hub-search { width: 100%; padding: 14px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; margin: 16px 0 20px; }
@@ -1377,6 +1444,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1411,6 +1479,11 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 
 
 # ========== PROJECTS HUB ==========
+
+@app.get("/favicon.svg")
+async def favicon():
+    return Response(content=EXOCORTEX_LOGO_SVG, media_type="image/svg+xml")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request, msg: str = "", st: str = ""):
@@ -1477,6 +1550,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
     body = f"""
     <div class="container hub">
         <div class="hub-hero">
+            <div class="hub-logo">{EXOCORTEX_LOGO_SVG}</div>
             <h1>BVA Exocortex</h1>
             <p>Пространство проектов: у каждого свой граф знаний, общий слой собирает всё вместе.</p>
         </div>
