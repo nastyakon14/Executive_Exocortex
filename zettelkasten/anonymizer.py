@@ -157,6 +157,39 @@ class AnonymizationResult:
 
 _TOKEN_INNER_RE = re.compile(r'^\[(.+)_(\d+)\]$')
 _WORD_CHARS = r'A-Za-zА-Яа-яЁё0-9'
+
+# Всегда маскируем бренд МТС, даже если NER его пропустил.
+HARDCODE_ORG_ALIASES = (
+    'МТС', 'мтс', 'Мтс',
+    'MTS', 'mts', 'Mts',
+    'Мобильные ТелеСистемы',
+    'Мобильные Телесистемы',
+    'Мобильные телесистемы',
+    'Мобильные теле системы',
+    'Мобильные Теле Системы',
+    'Мобильных ТелеСистем',
+    'Мобильными ТелеСистемами',
+    'Mobile TeleSystems',
+    'Mobile Telesystems',
+    'Mobile Tele Systems',
+    'ПАО МТС',
+    'ПАО «МТС»',
+    'ПАО "МТС"',
+    'АО МТС',
+    'МТС Банк',
+    'МТС-Банк',
+    'MTS Bank',
+)
+HARDCODE_ORG_PATTERNS = (
+    r'Мобильн[а-яё]*\s+Теле[\s\-]*[Сс]истем[а-яё]*',
+    r'Mobile\s+Tele[\s\-]*Systems?',
+    r'(?:ПАО|ОАО|АО)\s*[«"\']?\s*МТС\s*[»"\']?',
+    r'(?:ПАО|ОАО|АО)\s*[«"\']?\s*MTS\s*[»"\']?',
+    r'МТС[\s\-]?[Бб]анк[а-яё]*',
+    r'MTS[\s\-]?Bank',
+    rf'(?<![{_WORD_CHARS}])МТС(?![{_WORD_CHARS}])',
+    rf'(?<![{_WORD_CHARS}])MTS(?![{_WORD_CHARS}])',
+)
 _NAME_ENTITY_TYPES = {'ИМЯ', 'ОРГАНИЗАЦИЯ', 'АДРЕС', 'ГОРОД', 'СТРАНА'}
 _RU_SUFFIXES = (
     'ого', 'ему', 'ами', 'ями', 'ыми', 'ими',
@@ -379,7 +412,10 @@ class Anonymizer:
             counter = {}
 
         with self._lock:
-            text_after_regex, entities_regex = self._regex_pass(text, counter)
+            text_after_hard, entities_hard = self._hardcode_pass(text, counter)
+            entities.extend(entities_hard)
+
+            text_after_regex, entities_regex = self._regex_pass(text_after_hard, counter)
             entities.extend(entities_regex)
 
             if self.use_ner:
@@ -407,6 +443,7 @@ class Anonymizer:
         result = self.anonymize(prepared, counter=emap.type_counter)
         for entity in result.entities:
             emap.remember(entity)
+        self._bind_hardcode_aliases(emap, result.entities)
         return emap.canonicalize_text(result.anonymized_text)
 
     def unmask(self, text: str, entity_map: EntityMap) -> str:
@@ -452,6 +489,71 @@ class Anonymizer:
     def _generate_token(self, entity_type: str, counter: dict) -> str:
         counter[entity_type] = counter.get(entity_type, 0) + 1
         return f'[{entity_type}_{counter[entity_type]}]'
+
+    def _bind_hardcode_aliases(self, emap: EntityMap, entities: list[Entity]) -> None:
+        """Все написания МТС в сессии ведут на один токен организации."""
+        token = None
+        for entity in entities:
+            if entity.source == 'hardcode':
+                token = entity.token
+                break
+        if not token:
+            for alias in HARDCODE_ORG_ALIASES:
+                if alias in emap.orig_to_token:
+                    token = emap.orig_to_token[alias]
+                    break
+        if not token:
+            return
+        for alias in HARDCODE_ORG_ALIASES:
+            if alias not in emap.orig_to_token:
+                emap.orig_to_token[alias] = token
+
+    def _hardcode_pass(
+        self,
+        text: str,
+        counter: dict,
+    ) -> tuple[str, list[Entity]]:
+        """Костыльная маскировка фиксированных брендов (МТС и вариации)."""
+        entities: list[Entity] = []
+        all_matches: list[tuple[int, int, str, str]] = []
+
+        for pattern in HARDCODE_ORG_PATTERNS:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                original = m.group()
+                if self._is_token_like(original) or self._overlaps_existing_token(text, m.start(), m.end()):
+                    continue
+                all_matches.append((m.start(), m.end(), original, 'ОРГАНИЗАЦИЯ'))
+
+        all_matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        filtered: list[tuple[int, int, str, str]] = []
+        last_end = -1
+        for match in all_matches:
+            if match[0] >= last_end:
+                filtered.append(match)
+                last_end = match[1]
+
+        shared_token = None
+        shared_replacement = None
+        seen: dict[str, Entity] = {}
+        for start, end, original, entity_type in reversed(filtered):
+            if shared_token is None:
+                shared_token = self._generate_token(entity_type, counter)
+                shared_replacement = self._make_replacement(entity_type, shared_token)
+            if original not in seen:
+                entity = Entity(
+                    token=shared_token,
+                    entity_type=entity_type,
+                    original=original,
+                    fake_value=shared_replacement,
+                    start=start,
+                    end=end,
+                    source='hardcode',
+                )
+                seen[original] = entity
+                entities.append(entity)
+            text = text[:start] + shared_replacement + text[end:]
+
+        return text, entities
 
     @staticmethod
     def _is_token_like(original: str) -> bool:

@@ -5,6 +5,9 @@ import os
 import tempfile
 from pathlib import Path
 
+import pythoncom
+import win32com.client
+
 try:
     from app.handlers.pdf_reader_win import read_pdf
 except ImportError:
@@ -17,37 +20,41 @@ def _pages_to_text(data) -> str:
     return str(data or "")
 
 
-def convert_to_pdf(input_file, output_file=None):
-    import win32com.client
-
+def convert_to_pdf(input_file: str, output_file: str | None = None) -> str:
     input_file = os.path.abspath(input_file)
     if output_file is None:
         output_file = os.path.splitext(input_file)[0] + ".pdf"
     output_file = os.path.abspath(output_file)
 
-    word = win32com.client.Dispatch("Word.Application")
-    word.Visible = False
-    word.DisplayAlerts = False
-    word.AutomationSecurity = 3
+    # ← Инициализируем COM в текущем потоке
+    pythoncom.CoInitialize()
     try:
-        doc = word.Documents.Open(
-            input_file,
-            ConfirmConversions=False,
-            ReadOnly=True,
-            AddToRecentFiles=False,
-            PasswordDocument="",
-            Revert=True,
-        )
-        doc.SaveAs(output_file, FileFormat=17)
-        doc.Close(SaveChanges=False)
-        return output_file
-    except Exception as e:
-        raise RuntimeError(f"Ошибка конвертации Word: {e}") from e
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = False
+        word.AutomationSecurity = 3
+        try:
+            doc = word.Documents.Open(
+                input_file,
+                ConfirmConversions=False,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                PasswordDocument="",
+                Revert=True,
+            )
+            doc.SaveAs(output_file, FileFormat=17)
+            doc.Close(SaveChanges=False)
+            return output_file
+        except Exception as e:
+            raise RuntimeError(f"Ошибка конвертации Word: {e}") from e
+        finally:
+            word.Quit(SaveChanges=False)
     finally:
-        word.Quit(SaveChanges=False)
+        # ← Освобождаем COM после завершения работы
+        pythoncom.CoUninitialize()
 
 
-def read_word(input_path):
+def read_word(input_path: str) -> str:
     """`.doc` и `.docx` через Microsoft Word, затем извлечение текста из PDF."""
     with tempfile.TemporaryDirectory(prefix="word_pdf_") as tmp:
         output_path = os.path.join(tmp, Path(input_path).stem + ".pdf")

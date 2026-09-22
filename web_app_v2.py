@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import hashlib
 import json
@@ -17,9 +18,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
+import uvicorn
 
 from config.settings import settings
-from storage.postgres.db_connect import create_database, create_tables, update_history_messages
+from storage.postgres.db_connect import  create_database, create_tables, update_history_messages
 from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
 from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
@@ -37,11 +39,12 @@ from zettelkasten.graph_visualizer_v2 import (
     render_graph_html,
 )
 from zettelkasten.linker import GraphLinker, LocalEmbeddingModel
+# from zettelkasten.embeddings import MTSEmbeddings
 from zettelkasten.source_quote import find_source_quote
 
 load_dotenv()
 
-app = FastAPI(title="Project Exocortex Web App")
+app = FastAPI(title="BVA Exocortex Web App")
 
 create_database()
 create_tables()
@@ -123,8 +126,8 @@ INGEST_STATUS_LABELS = {
     "error": "Ошибка обработки",
 }
 INGEST_ACCEPTED_MSG = (
-    "Материал принят. Мысли разбираются в фоне. "
-    "На проекте загорится зелёный кружок, когда граф будет готов."
+    "Материал принят. Сущности разбиваются в фонеовом режиме "
+    "На проекте загорится зелёный статус, когда граф будет готов."
 )
 
 
@@ -162,7 +165,7 @@ def _load_projects_unlocked() -> list[dict]:
         data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
         projects = [_normalize_project(p) for p in (data.get("projects") or []) if isinstance(p, dict)]
     except Exception as e:
-        print(f"[web_app] projects load warning: {e}")
+        print(f"[web_app_v2] projects load warning: {e}")
         return []
     for item in projects:
         slug = item.get("slug")
@@ -205,7 +208,7 @@ def sync_projects_from_graph() -> list[dict]:
     try:
         graph_ids = linker.repository.list_graph_ids()
     except Exception as e:
-        print(f"[web_app] graph sync warning: {e}")
+        print(f"[web_app_v2] graph sync warning: {e}")
         graph_ids = []
 
     with _state_lock:
@@ -417,7 +420,7 @@ def run_ingest(
     ok = False
     ans = ""
     try:
-        print(f"[web_app_v2] ingest start slug={slug} chars={len(text or '')}")
+        print(f"[_v2] ingest start slug={slug} chars={len(text or '')}")
         with _ingest_run_lock:
             set_ingest_phase(slug, "linking")
             ok, ans = save_user_note(graph_id, text, on_stage=on_stage, source_input=source_input)
@@ -541,15 +544,15 @@ def save_user_note(
         detail = (
             f"Фрагмент {index} из {total}"
             if total > 1
-            else "Атомизатор разбирает текст на мысли"
+            else "Атомизатор разбивает текст на сущности"
         )
-        stage("atomize", "Извлечение атомарных мыслей", detail)
+        stage("atomize", "Извлечение атомарных сущностей", detail)
 
     stage("mask", "Обезличивание данных", "Конфиденциальные данные скрываются перед моделью")
     entity_map = EntityMap()
     masked_text = pii_anonymizer.mask(text, entity_map)
 
-    stage("atomize", "Извлечение атомарных мыслей", "Атомизатор разбирает текст на мысли")
+    stage("atomize", "Извлечение атомарных сущностей", "Атомизатор разбивает текст на фрагменты")
     raw_cards = atomizer.atomize(
         text=masked_text,
         current_db_max_root_id=linker.repository.get_max_root_id(user_id),
@@ -1426,7 +1429,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
                 active_count += 1
                 total_all += n
     except Exception as e:
-        print(f"[web_app] stats warning: {e}")
+        print(f"[web_app_v2] stats warning: {e}")
 
     alert = ""
     if msg:
@@ -1451,7 +1454,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
             <a class="project-card-link" href="/p/{escape(slug)}">
                 <h3><span>{escape(name)}</span>{badge}</h3>
                 {desc_html}
-                <p>{n} мыслей в графе</p>
+                <p>{n} сущности(ей) в графе</p>
                 {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
         </div>
@@ -1478,17 +1481,17 @@ async def root(request: Request, msg: str = "", st: str = ""):
             <p>Пространство проектов: у каждого свой граф знаний, общий слой собирает всё вместе.</p>
         </div>
         {alert}
-        <input class="hub-search" id="hubSearch" type="search" placeholder="Найти проект по названию..." />
+        <input class="hub-search" id="hubSearch" type="search" placeholder="Найти проект по названию или описанию..." />
 
         <div class="hub-actions">
             <a class="common-card" href="/p/{COMMON_SLUG}">
                 <h2>Общий граф</h2>
-                <p>Единый слой по всем активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять заметки.</p>
-                <div class="common-meta">{active_count} проектов · {total_all} мыслей</div>
+                <p>Единый слой по всем активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять данные.</p>
+                <div class="common-meta">{active_count} проектов · {total_all} сущности(ей)</div>
             </a>
             <a class="common-card contour-card" href="/contour">
                 <h2>Совместный поиск</h2>
-                <p>Соберите изолированный контур из нескольких проектов и задайте вопрос только по ним. Графы остаются раздельными.</p>
+                <p>Соберите изолированный контур из нескольких проектов и задайте вопрос только по ним.</p>
                 <div class="common-meta">до {CONTOUR_MAX_PROJECTS} проектов · только поиск</div>
             </a>
         </div>
@@ -1574,7 +1577,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
         });
     });
     """
-    return HTMLResponse(html_page("Проекты — Project Exocortex", body, js))
+    return HTMLResponse(html_page("Проекты — BVA Exocortex", body, js))
 
 
 @app.post("/projects/create")
@@ -1662,8 +1665,8 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
                 <h1>Общий граф</h1>
                 <p>Сводный слой знаний по активным проектам</p>
             </div>
-            <div class="readonly-banner">Этот граф только для навигации и поиска. Новые заметки добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
-            <div class="msg-box">Сейчас объединено {n} мыслей из {len(scope["graph_ids"])} проектов.</div>
+            <div class="readonly-banner">Этот граф только для навигации и поиска. Новые данные добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
+            <div class="msg-box">Сейчас объединено {n} сущности(ей) из {len(scope["graph_ids"])} проектов.</div>
             <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
             <a href="/contour" class="menu-btn"><span class="icon">🧩</span><span>Совместный поиск по выбранным проектам</span></a>
             <a href="/p/{COMMON_SLUG}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть общий граф</span></a>
@@ -1690,7 +1693,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         else '<p class="project-desc empty">Нет описания — нажмите карандаш, чтобы добавить.</p>'
     )
     destroy_copy = (
-        f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» и все связанные мысли будут удалены.'
+        f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» и все связанные сущности будут удалены.'
         if n > 0
         else f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» будет удалён.'
     )
@@ -1705,14 +1708,14 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
                 <button type="button" class="icon-edit inline" id="openEditModal" title="Редактировать" aria-label="Редактировать проект">{EDIT_ICON}</button>
             </div>
             {desc_html}
-            <p class="project-count">📚 {n} мыслей в проекте</p>
+            <p class="project-count">📚 {n} сущности(ей) в проекте</p>
             <p class="project-count">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}</p>
-            {('<p class="project-count">Новые мысли появятся в графе и поиске, когда кружок станет зелёным.</p>' if scope.get("ingest_status") in {"indexed", "linking"} else "")}
+            {('<p class="project-count">Новые сущности появятся в графе и поиске, когда статус станет зелёным.</p>' if scope.get("ingest_status") in {"indexed", "linking"} else "")}
         </div>
-        <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Добавить новую заметку</span></a>
-        <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск мыслей по запросу</span></a>
+        <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Загрузить новые данные</span></a>
+        <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск фрагментов по запросу</span></a>
         <a href="/p/{escape(slug)}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
-        <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить заметку</span></a>
+        <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить данные</span></a>
         <div class="meta-actions">
             <form action="/p/{escape(slug)}/archive" method="post">
                 <input type="hidden" name="archived" value="{archive_action}">
@@ -1851,10 +1854,10 @@ async def project_destroy(slug: str):
     try:
         linker.repository.delete_graph(scope["graph_id"])
     except Exception as e:
-        print(f"[web_app] delete graph warning: {e}")
+        print(f"[web_app_v2] delete graph warning: {e}")
         return RedirectResponse(f"/p/{slug}?msg=Не удалось удалить граф проекта&st=err", status_code=303)
     remove_project(slug)
-    label = "пустой проект" if n == 0 else "проект и все его мысли"
+    label = "пустой проект" if n == 0 else "проект и все его сущности"
     return RedirectResponse(f"/?msg=Удалён {label}: {escape(scope['name'])}&st=ok", status_code=303)
 
 
@@ -1866,7 +1869,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
     if scope["readonly"]:
-        return RedirectResponse(f"/p/{slug}?msg=В общий граф нельзя добавлять заметки&st=err", status_code=303)
+        return RedirectResponse(f"/p/{slug}?msg=В общий граф нельзя добавлять новые данные&st=err", status_code=303)
 
     alert = ""
     if msg:
@@ -1877,11 +1880,11 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
     <div class="container">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>➕ Добавить заметку</h2></div>
+        <div class="page-header"><h2>➕ Загрузить новые данные</h2></div>
         
         {alert}
         
-        <div class="msg-box">Отправьте текст, файл, путь к папке или ссылку Confluence — заметка попадёт в граф проекта.</div>
+        <div class="msg-box">Отправьте текст, файл, путь к папке или ссылку Confluence — информация встроится в граф проекта.</div>
         
         <div class="tabs">
             <div class="tab active" onclick="showTab('text', this)">📝 Текст</div>
@@ -1890,8 +1893,8 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
         </div>
         
         <div id="tab-text" class="tab-content active">
-            <form action="/p/{escape(slug)}/add/text" method="post" data-enter-submit="true" onsubmit="return submitIngest(event, this, PIPELINES.text, 'Добавление заметки', 'Готовим текст к разбору')">
-                <div class="form-group"><textarea name="note_text" placeholder="Введите заметку..." required></textarea></div>
+            <form action="/p/{escape(slug)}/add/text" method="post" data-enter-submit="true" onsubmit="return submitIngest(event, this, PIPELINES.text, 'Добавление новых данных', 'Готовим текст к разбору')">
+                <div class="form-group"><textarea name="note_text" placeholder="Введите текст..." required></textarea></div>
                 <button type="submit" class="btn">Сохранить</button>
             </form>
         </div>
@@ -1941,29 +1944,29 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
     js = """
     const PIPELINES = {
         text: [
-            {key: 'prepare', label: 'Подготовка заметки'},
+            {key: 'prepare', label: 'Подготовка данных'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         file: [
             {key: 'read', label: 'Чтение файла'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         confluence: [
             {key: 'fetch', label: 'Загрузка страницы Confluence'},
             {key: 'read', label: 'Разбор содержимого'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         folder: [
             {key: 'scan', label: 'Поиск файлов в директории'},
             {key: 'read', label: 'Чтение файла'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных мыслей'},
+            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
             {key: 'link', label: 'Связывание в граф'}
         ]
     };
@@ -2022,7 +2025,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             });
             if (!finished) {
                 location.href = addPageUrl(form) + '?msg=' + encodeURIComponent(
-                    'Обработка продолжается в фоне. На проекте загорится зелёный кружок, когда граф будет готов.'
+                    'Обработка продолжается в фоне. На проекте загорится зелёный статус, когда граф будет готов.'
                 ) + '&st=ok';
                 return false;
             }
@@ -2127,7 +2130,7 @@ def _writable_scope(slug: str):
     if not scope:
         return None, RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
     if scope["readonly"]:
-        return None, RedirectResponse(f"/p/{slug}?msg=В общий граф нельзя добавлять или удалять заметки&st=err", status_code=303)
+        return None, RedirectResponse(f"/p/{slug}?msg=В общем граф нельзя добавлять или удалять данные&st=err", status_code=303)
     return scope, None
 
 
@@ -2189,11 +2192,11 @@ async def add_text(slug: str, request: Request, note_text: str = Form("")):
         return err
     text = note_text.strip()
     if not text:
-        return RedirectResponse(f"/p/{slug}/add?msg=Введите текст заметки&st=err", status_code=303)
+        return RedirectResponse(f"/p/{slug}/add?msg=Введите текст&st=err", status_code=303)
 
     def work(on_stage):
         if on_stage:
-            on_stage("prepare", "Подготовка заметки", "Проверяем текст")
+            on_stage("prepare", "Подготовка данных", "Проверяем текст")
         return run_ingest(slug, scope["graph_id"], text, "text", "text_artifact", text, on_stage=on_stage)
 
     if not _wants_sse(request):
@@ -2406,7 +2409,7 @@ async def contour_page(request: Request):
             <span class="contour-check"></span>
             <h3>{escape(item['name'])}</h3>
             <div class="desc">{desc}</div>
-            <div class="meta">{item['count']} мыслей</div>
+            <div class="meta">{item['count']} сущности(ей)</div>
         </button>
         """
     if not catalog:
@@ -2419,7 +2422,7 @@ async def contour_page(request: Request):
         <div class="page-header"><h2>Совместный поиск</h2></div>
         <div class="contour-banner">
             <h2>Графы не сливаются</h2>
-            <p>Выберите от {CONTOUR_MIN_PROJECTS} до {CONTOUR_MAX_PROJECTS} проектов. Вопрос пойдёт в GraphRAG только по ним. Каждый проект по-прежнему открывается отдельно, заметки туда не записываются.</p>
+            <p>Выберите от {CONTOUR_MIN_PROJECTS} до {CONTOUR_MAX_PROJECTS} проектов. Вопрос пойдёт в в базу знаний только по ним.</p>
         </div>
         <div class="contour-toolbar">
             <div class="contour-count" id="contourCount">Выбрано <strong>0</strong> из {CONTOUR_MAX_PROJECTS}</div>
@@ -2724,7 +2727,7 @@ async def search_page(slug: str):
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
 
     hint = (
-        "Задайте вопрос по всем активным проектам сразу. У каждой найденной мысли будет подпись, из какого проекта она пришла."
+        "Задайте вопрос по всем активным проектам сразу. У каждой найденной сущности будет подпись, из какого проекта она пришла."
         if scope["readonly"]
         else "Задайте вопрос, и я найду релевантную информацию из графа этого проекта."
     )
@@ -2732,8 +2735,8 @@ async def search_page(slug: str):
     <div class="container wide">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🔍 Поиск мыслей</h2></div>
-        {"<div class='readonly-banner'>Поиск идёт по объединённому графу. Добавлять заметки здесь нельзя.</div>" if scope["readonly"] else ""}
+        <div class="page-header"><h2>🔍 Поиск фрагментов</h2></div>
+        {"<div class='readonly-banner'>Поиск идёт по объединённому графу. Добавлять данные здесь нельзя.</div>" if scope["readonly"] else ""}
         
         <div class="chat-container">
             <div class="chat-messages" id="chatMessages">
@@ -2962,7 +2965,7 @@ async def view_page(slug: str, request: Request):
                 {project_nav(scope)}
                 <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
                 <div class="page-header"><h2>💡 Общий граф</h2></div>
-                <div class="alert alert-error">📭 Пока нет мыслей ни в одном проекте.</div>
+                <div class="alert alert-error">📭 Пока нет сущностей ни в одном проекте.</div>
             </div>
             """
             return HTMLResponse(html_page("Общий граф", body))
@@ -2975,8 +2978,8 @@ async def view_page(slug: str, request: Request):
             {project_nav(scope)}
             <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
             <div class="page-header"><h2>💡 База знаний</h2></div>
-            <div class="alert alert-error">📭 Граф пуст. Добавьте первую заметку!</div>
-            <a href="/p/{escape(slug)}/add" class="btn" style="text-decoration:none;text-align:center;display:block;margin-top:16px">➕ Добавить заметку</a>
+            <div class="alert alert-error">📭 Граф пуст. Загрузите первые данные!</div>
+            <a href="/p/{escape(slug)}/add" class="btn" style="text-decoration:none;text-align:center;display:block;margin-top:16px">➕ Добавить данные</a>
         </div>
         """
         return HTMLResponse(html_page("База знаний", body))
@@ -3016,13 +3019,13 @@ async def delete_page(slug: str, msg: str = "", st: str = ""):
     <div class="container">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🗑 Удалить заметку</h2></div>
+        <div class="page-header"><h2>🗑 Удалить данные</h2></div>
         
         {alert}
         
-        <div class="msg-box">Опишите мысль, которую хотите найти и удалить.</div>
+        <div class="msg-box">Опишите фрагмент, который хотите найти и удалить.</div>
         
-        <form action="/p/{escape(slug)}/delete/search" method="post" data-enter-submit="true" data-loading-text="Поиск" data-loading-subtext="Ищем похожие заметки" onsubmit="return submitWithLoading(this, 'Поиск заметок', 'Ищем похожие мысли в базе знаний')">
+        <form action="/p/{escape(slug)}/delete/search" method="post" data-enter-submit="true" data-loading-text="Поиск" data-loading-subtext="Ищем похожие фрагменты" onsubmit="return submitWithLoading(this, 'Поиск заметок', 'Ищем похожие фрагменты в базе знаний')">
             <div class="form-group"><textarea name="q" placeholder="Что удалить..." required></textarea></div>
             <button type="submit" class="btn">Найти</button>
         </form>
@@ -3086,7 +3089,7 @@ async def delete_search(slug: str, q: str = Form("")):
     <div class="container">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🗑 Удалить заметку</h2></div>
+        <div class="page-header"><h2>🗑 Удалить данные</h2></div>
         
         <div class="msg-box">Найдено {len(cached)} заметок. Нажмите на карточку, чтобы просмотреть и удалить.</div>
         
@@ -3099,11 +3102,11 @@ async def delete_search(slug: str, q: str = Form("")):
         
         <div id="deleteModal" class="modal-overlay">
             <div class="modal-box">
-                <h3>🗑 Удалить эту мысль?</h3>
+                <h3>🗑 Удалить эту сущность?</h3>
                 <div class="card-id" id="modalCardId"></div>
                 <div class="modal-topic" id="modalTopic" style="font-weight:600;color:var(--accent);margin:8px 0;font-size:15px"></div>
                 <div class="quote" id="modalQuote"></div>
-                <p>Это действие нельзя отменить. Мысль и все связанные данные будут удалены.</p>
+                <p>Это действие нельзя отменить. Сущность и все связанные данные будут удалены.</p>
                 <div class="modal-btns">
                     <button type="button" class="cancel" onclick="hideDeleteModal()">Отмена</button>
                     <button type="button" class="confirm" onclick="confirmDelete()">Удалить</button>
@@ -3140,7 +3143,7 @@ async def delete_search(slug: str, q: str = Form("")):
     function confirmDelete() {
         if (pendingDeleteIdx !== null) {
             document.getElementById('deleteIdx').value = pendingDeleteIdx + 1;
-            showLoading('Удаление', 'Удаляем мысль из базы знаний');
+            showLoading('Удаление', 'Удаляем сущность из базы знаний');
             document.getElementById('deleteForm').submit();
         }
     }
@@ -3153,7 +3156,7 @@ async def delete_search(slug: str, q: str = Form("")):
         if (e.key === 'Escape') hideDeleteModal();
     });
     """
-    return HTMLResponse(html_page("Найденные заметки", body, js))
+    return HTMLResponse(html_page("Найденные фрагменты", body, js))
 
 
 @app.post("/p/{slug}/delete/confirm")
@@ -3174,12 +3177,10 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
         return RedirectResponse(f"/p/{slug}/delete?msg=Не удалось удалить&st=err", status_code=303)
 
     stats = linker.get_user_stats(uid)
-    msg = f"🗑 Удалено [{res['luhmann_id']}]\nУдалено: {res['deleted_count']} мысль(ей)\n📚 Осталось: {stats['total_cards']}"
+    msg = f"🗑 Удалено [{res['luhmann_id']}]\nУдалено: {res['deleted_count']} сущности(ей)\n📚 Осталось: {stats['total_cards']}"
     log_event(slug, f"Удаление: {sel['content'][:50]}", "delete_query", msg)
     return RedirectResponse(f"/p/{slug}/delete?msg={escape(msg)}&st=ok", status_code=303)
 
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("WEB_APP_PORT", "8009"))
-    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8008, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8009, reload=False)
