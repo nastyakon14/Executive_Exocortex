@@ -39,11 +39,24 @@ def cleaning_text(text):
 
 def extract_text_pdf2image(page):
     """Конвертирует страницу pdf в изображение и извлекает текст через tesseract."""
+    image = None
     try:
-        image = page.to_image(resolution=300).original
+        image = page.to_image(resolution=150).original
         text = cleaning_text(pytesseract.image_to_string(image, lang="rus+eng").strip())
+    except MemoryError:
+        text = ""
     except Exception:
         text = ""
+    finally:
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
+        try:
+            page.flush_cache()
+        except Exception:
+            pass
     return text
 
 
@@ -99,13 +112,21 @@ def read_pdf(file_path):
                 ocr = extract_text_pdf2image(page)
                 if ocr:
                     text = ocr
+            try:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    if not table:
+                        continue
+                    header = table[0] if table else []
+                    rows = table[1:] if len(table) > 1 else []
+                    df = pd.DataFrame(rows, columns=header)
+                    text = (text or "") + f"\n\n{df.to_markdown()}"
+            except Exception:
+                pass
             page_text_dict[page_num] = text
-
-        try:
-            tables = extract_tables(file_path)
-            if tables:
-                page_text_dict = tables_to_pages(tables, page_text_dict)
-        except Exception:
-            pass
+            try:
+                page.flush_cache()
+            except Exception:
+                pass
 
     return page_text_dict

@@ -15,7 +15,7 @@ load_dotenv()
 
 from app.handlers.confluence import get_confluence_page_content
 from app.handlers.folders_mac import FileTooLargeError, extract_file_text
-from storage.postgres.db_connect import list_watch_sources, mark_watch_synced
+from storage.postgres.db_connect import list_watch_sources, mark_watch_synced, upsert_ingest_digest
 
 from auto_refresh.confluence_checker import check_confluence_change
 from auto_refresh.folder_checker import check_folder_changes, folder_hashes
@@ -35,6 +35,11 @@ def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_t
         linker.repository.delete_by_source_input(graph_id, source_input)
         set_ingest_phase(slug, "refreshing")
         ok, ans = save_user_note(graph_id, text, source_input=source_input)
+    if ok:
+        try:
+            upsert_ingest_digest(graph_id, source_input, _text_hash(text))
+        except Exception as e:
+            print(f"[auto_refresh] digest save warning: {e}")
     log_event(slug, log_text, "auto_refresh", ans)
     return ok, ans
 

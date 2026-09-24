@@ -74,10 +74,13 @@ def extract_png(input_path) -> str:
         return ""
     img = PIL.Image.open(input_path)
     try:
-        text = cleaning_text(pytesseract.image_to_string(img, lang="rus+eng").strip())
-    except Exception:
-        text = cleaning_text(pytesseract.image_to_string(img).strip())
-    return text if text else "Текст не найден"
+        try:
+            text = cleaning_text(pytesseract.image_to_string(img, lang="rus+eng").strip())
+        except Exception:
+            text = cleaning_text(pytesseract.image_to_string(img).strip())
+        return text if text else "Текст не найден"
+    finally:
+        img.close()
 
 
 def df_to_markdown(df: pd.DataFrame) -> str:

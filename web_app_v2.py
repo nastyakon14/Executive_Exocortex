@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import gc
 import hashlib
 import json
 import os
@@ -24,9 +25,12 @@ from config.settings import settings
 from storage.postgres.db_connect import (
     create_database,
     create_tables,
+    find_ingest_digest_by_hash,
+    get_ingest_digest,
     list_watch_sources,
     mark_watch_synced_path,
     update_history_messages,
+    upsert_ingest_digest,
     upsert_watch_source,
 )
 from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
@@ -202,6 +206,7 @@ INGEST_ACCEPTED_MSG = (
     "Материал принят. Карточки разбиваются в фоновом режиме. "
     "На проекте загорится зелёный статус, когда граф будет готов."
 )
+INGEST_SKIP_MSG = "Этот материал уже есть в графе — повторная обработка не нужна."
 
 
 def _normalize_project(item: dict) -> dict:
@@ -592,6 +597,10 @@ def reset_stale_ingest_status() -> None:
             _save_projects_unlocked(projects)
 
 
+def _content_digest(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 def run_ingest(
     slug: str,
     graph_id: str,
@@ -601,6 +610,20 @@ def run_ingest(
     log_text: str,
     on_stage=None,
 ) -> tuple[bool, str]:
+    digest = _content_digest(text) if (text or "").strip() else ""
+    if digest:
+        try:
+            if find_ingest_digest_by_hash(graph_id, digest):
+                print(f"[web_app_v2] ingest skip duplicate slug={slug} source={source_input}")
+                log_event(slug, log_text, log_type, INGEST_SKIP_MSG)
+                return True, INGEST_SKIP_MSG
+            prev = get_ingest_digest(graph_id, source_input)
+            if prev and prev != digest:
+                deleted = linker.repository.delete_by_source_input(graph_id, source_input)
+                print(f"[web_app_v2] ingest replace source={source_input} deleted={deleted}")
+        except Exception as e:
+            print(f"[web_app_v2] ingest digest check warning: {e}")
+
     begin_ingest(slug, "indexed")
     ok = False
     ans = ""
@@ -609,6 +632,11 @@ def run_ingest(
         with _ingest_run_lock:
             set_ingest_phase(slug, "linking")
             ok, ans = save_user_note(graph_id, text, on_stage=on_stage, source_input=source_input)
+        if ok and digest:
+            try:
+                upsert_ingest_digest(graph_id, source_input, digest)
+            except Exception as e:
+                print(f"[web_app_v2] ingest digest save warning: {e}")
         log_event(slug, log_text, log_type, ans)
         print(f"[web_app_v2] ingest done slug={slug} ok={ok}")
         return ok, ans
@@ -739,6 +767,18 @@ def rag_search_payload(query: str, graph_ids: list[str], labels: dict[str, str],
     }
 
 
+def _release_mem() -> None:
+    gc.collect()
+    try:
+        import torch
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def save_user_note(
     user_id: str,
     text: str,
@@ -757,34 +797,39 @@ def save_user_note(
         )
         stage("atomize", "Извлечение атомарных карточек", detail)
 
-    stage("mask", "Обезличивание данных", "Конфиденциальные данные скрываются перед моделью")
-    entity_map = EntityMap()
-    masked_text = pii_anonymizer.mask(text, entity_map)
+    try:
+        stage("mask", "Обезличивание данных", "Конфиденциальные данные скрываются перед моделью")
+        entity_map = EntityMap()
+        masked_text = pii_anonymizer.mask(text, entity_map)
 
-    stage("atomize", "Извлечение атомарных карточек", "Атомизатор разбивает текст на фрагменты")
-    raw_cards = atomizer.atomize(
-        text=masked_text,
-        current_db_max_root_id=linker.repository.get_max_root_id(user_id),
-        on_progress=atom_progress,
-    )
-    if isinstance(raw_cards, str):
-        return False, f"Ошибка: {raw_cards}"
+        stage("atomize", "Извлечение атомарных карточек", "Атомизатор разбивает текст на фрагменты")
+        raw_cards = atomizer.atomize(
+            text=masked_text,
+            current_db_max_root_id=linker.repository.get_max_root_id(user_id),
+            on_progress=atom_progress,
+        )
+        if isinstance(raw_cards, str):
+            return False, f"Ошибка: {raw_cards}"
 
-    for card in raw_cards:
-        unmask_card(card, entity_map)
-        card.source_input = (source_input or "").strip() or "text"
-        card.source_quote = find_source_quote(text, card.content)
+        for card in raw_cards:
+            unmask_card(card, entity_map)
+            card.source_input = (source_input or "").strip() or "text"
+            card.source_quote = find_source_quote(text, card.content)
 
-    total = len(raw_cards)
+        total = len(raw_cards)
 
-    def link_progress(index: int, count: int, topic: str = "") -> None:
-        hint = f" · «{topic}»" if topic else ""
-        stage("link", "Связывание в граф", f"Карточка {index} из {count}{hint}")
+        def link_progress(index: int, count: int, topic: str = "") -> None:
+            hint = f" · «{topic}»" if topic else ""
+            stage("link", "Связывание в граф", f"Карточка {index} из {count}{hint}")
 
-    stage("link", "Связывание в граф", f"Линкер встраивает {total} карточек")
-    linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
-    stats = linker.get_user_stats(user_id)
-    return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
+        stage("link", "Связывание в граф", f"Линкер встраивает {total} карточек")
+        linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
+        stats = linker.get_user_stats(user_id)
+        return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
+    except MemoryError:
+        return False, "Не хватило памяти при обработке текста. Возьмите файл меньшего размера или загрузите папку частями."
+    finally:
+        _release_mem()
 
 
 SUPPORTED_UPLOAD_EXTS = set(EXTRACTABLE_EXTENSIONS)
@@ -2840,8 +2885,13 @@ async def add_folder(
                         hashes[abs_path] = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
             except FileTooLargeError as e:
                 ok, ans = False, str(e)
+            except MemoryError:
+                gc.collect()
+                ok, ans = False, "Не хватило памяти на обработку файла. Загрузите папку частями."
             except Exception as e:
                 ok, ans = False, str(e)
+            finally:
+                gc.collect()
             if ok:
                 ok_n += 1
             else:
@@ -3635,4 +3685,4 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8007, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8006, reload=False)

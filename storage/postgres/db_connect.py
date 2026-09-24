@@ -83,8 +83,21 @@ def create_tables():
             cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP')
             cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS content_hash TEXT')
             cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS last_error TEXT')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS ingest_digests (
+                    graph_id TEXT NOT NULL,
+                    source_input TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (graph_id, source_input)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS ingest_digests_hash_idx
+                ON ingest_digests (graph_id, content_hash)
+            ''')
             conn.commit()
-            print('Таблицы history_messages и watch_sources готовы.')
+            print('Таблицы history_messages, watch_sources и ingest_digests готовы.')
 
 
 def upsert_watch_source(
@@ -212,6 +225,63 @@ def mark_watch_synced_path(
                     ''',
                     (error or "Ошибка автообновления", graph_id, source_kind, source_path),
                 )
+            conn.commit()
+
+
+def find_ingest_digest_by_hash(graph_id: str, content_hash: str) -> dict | None:
+    """Возвращает запись, если этот текст уже встраивали в граф."""
+    if not graph_id or not content_hash:
+        return None
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT graph_id, source_input, content_hash, created_at
+                FROM ingest_digests
+                WHERE graph_id = %s AND content_hash = %s
+                LIMIT 1
+                ''',
+                (graph_id, content_hash),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+
+def get_ingest_digest(graph_id: str, source_input: str) -> str | None:
+    """Хэш последнего успешного ingest для этого источника."""
+    if not graph_id or not source_input:
+        return None
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT content_hash FROM ingest_digests
+                WHERE graph_id = %s AND source_input = %s
+                ''',
+                (graph_id, source_input),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+
+def upsert_ingest_digest(graph_id: str, source_input: str, content_hash: str) -> None:
+    """Запоминает хэш текста после успешного ingest."""
+    if not graph_id or not source_input or not content_hash:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                INSERT INTO ingest_digests (graph_id, source_input, content_hash, created_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (graph_id, source_input)
+                DO UPDATE SET content_hash = EXCLUDED.content_hash, created_at = NOW()
+                ''',
+                (graph_id, source_input, content_hash),
+            )
             conn.commit()
 
 

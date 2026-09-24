@@ -630,12 +630,37 @@ class Anonymizer:
         counter: dict,
     ) -> tuple[str, list[Entity]]:
         """Второй проход: NER через Natasha"""
+        if len(text) > 16000:
+            parts: list[str] = []
+            entities: list[Entity] = []
+            i = 0
+            while i < len(text):
+                end = min(i + 16000, len(text))
+                if end < len(text):
+                    cut = text.rfind("\n", i + 8000, end)
+                    if cut <= i:
+                        cut = text.rfind(". ", i + 8000, end)
+                        end = cut + 1 if cut > i else end
+                    else:
+                        end = cut
+                masked, ents = self._ner_pass(text[i:end], counter)
+                parts.append(masked)
+                entities.extend(ents)
+                i = end
+            return "".join(parts), entities
+
         entities: list[Entity] = []
         seen: dict[str, Entity] = {}
 
-        doc = Doc(text)  # приводит к виду Doc(text='\nИванов Иван Иванович работает в компании Газпро...)
-        doc.segment(self.segmenter) # Doc(text='\nИванов Иван Иванович работает в компании Газпро..., tokens=[...], sents=[...])
-        doc.tag_ner(self.ner_tagger) # Doc(text='\nИванов Иван Иванович работает в компании Газпро..., tokens=[...], spans=[...], sents=[...])
+        try:
+            doc = Doc(text)
+        except MemoryError:
+            return text, []
+        try:
+            doc.segment(self.segmenter)
+            doc.tag_ner(self.ner_tagger)
+        except MemoryError:
+            return text, []
         # doc.sents - разбивает по предложения 
         # doc.tokens - разбивает по словам 
         # doc.spans - разбивает по сущностям (org, per, loc)

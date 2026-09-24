@@ -1,4 +1,5 @@
 """Обход папки и извлечение текста на Windows."""
+import gc
 import os
 from pathlib import Path
 
@@ -39,6 +40,10 @@ SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xls
 
 TOO_LARGE_MESSAGE = "Превышен максимальный размер файла (50 МБ)"
 TOO_LARGE_EXCEL_MESSAGE = "Превышен максимальный размер Excel-файла (10 МБ)"
+MEMORY_ERROR_MESSAGE = (
+    "Не хватило памяти на обработку файла. "
+    "Загрузите папку частями или возьмите меньшие файлы."
+)
 
 
 class FileTooLargeError(ValueError):
@@ -142,6 +147,9 @@ def extract_file_text(file_path: str) -> str:
             return read_excel(file_path) or ""
     except FileTooLargeError:
         raise
+    except MemoryError as e:
+        gc.collect()
+        raise ValueError(f"{MEMORY_ERROR_MESSAGE} Файл: «{os.path.basename(file_path)}»") from e
     except Exception as e:
         raise ValueError(f"Не удалось извлечь текст из «{os.path.basename(file_path)}»: {e}") from e
     raise ValueError(f"Неподдерживаемый формат: {ext}")
