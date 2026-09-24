@@ -16,7 +16,8 @@ load_dotenv()
 from app.handlers.confluence import get_confluence_page_content
 from app.handlers.folders_mac import FileTooLargeError, extract_file_text
 from storage.postgres.db_connect import (
-    find_ingest_digest_by_hash,
+    delete_ingest_digest,
+    get_ingest_digest,
     list_watch_sources,
     mark_watch_synced,
     upsert_ingest_digest,
@@ -33,26 +34,36 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
-def _already_ingested(graph_id: str, _source_input: str, digest: str, stored_hash: str = "") -> bool:
+def _same_source_text(graph_id: str, source_input: str, digest: str, stored_hash: str = "") -> bool:
+    """Пропуск только если не изменился текст этого пути или URL, не чужого источника."""
     if not digest:
         return False
     if stored_hash and digest == stored_hash:
         return True
     try:
-        if find_ingest_digest_by_hash(graph_id, digest):
-            return True
+        prev = get_ingest_digest(graph_id, source_input)
     except Exception as e:
         print(f"[auto_refresh] digest lookup warning: {e}")
-    return False
+        return False
+    return bool(prev and prev == digest)
+
+
+def _drop_source(graph_id: str, source_input: str) -> None:
+    from web_app_v2 import linker
+
+    linker.repository.delete_by_source_input(graph_id, source_input)
+    try:
+        delete_ingest_digest(graph_id, source_input)
+    except Exception as e:
+        print(f"[auto_refresh] digest delete warning: {e}")
 
 
 def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_text: str) -> tuple[bool, str]:
-    from web_app_v2 import _ingest_run_lock, linker, log_event, save_user_note, set_ingest_phase
+    from web_app_v2 import _ingest_run_lock, ingest_replacing, log_event, set_ingest_phase
 
     with _ingest_run_lock:
-        linker.repository.delete_by_source_input(graph_id, source_input)
         set_ingest_phase(slug, "refreshing")
-        ok, ans = save_user_note(graph_id, text, source_input=source_input)
+        ok, ans = ingest_replacing(graph_id, text, source_input)
     if ok:
         try:
             upsert_ingest_digest(graph_id, source_input, _text_hash(text))
@@ -72,14 +83,15 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     updated = skipped = failed = 0
     last_err = ""
 
-    from web_app_v2 import _ingest_run_lock, linker
+    from web_app_v2 import _ingest_run_lock
 
     for stale in probe.get("stale") or []:
         try:
             with _ingest_run_lock:
-                linker.repository.delete_by_source_input(graph_id, stale)
+                _drop_source(graph_id, stale)
             hashes.pop(stale, None)
             hashes.pop(os.path.abspath(stale), None)
+            updated += 1
         except Exception as e:
             failed += 1
             last_err = str(e)
@@ -87,14 +99,18 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     for path in probe.get("files") or []:
         try:
             text = extract_file_text(path)
-            if not (text or "").strip():
-                skipped += 1
-                continue
             digest = _text_hash(text)
-            if _already_ingested(graph_id, path, digest, hashes.get(path) or ""):
+            if _same_source_text(graph_id, path, digest, hashes.get(path) or ""):
                 hashes[path] = digest
                 skipped += 1
                 print(f"[auto_refresh] folder skip unchanged {os.path.basename(path)}")
+                continue
+            if not (text or "").strip():
+                print(f"[auto_refresh] folder drop empty {os.path.basename(path)}")
+                with _ingest_run_lock:
+                    _drop_source(graph_id, path)
+                hashes[path] = digest
+                updated += 1
                 continue
             print(f"[auto_refresh] folder ingest {os.path.basename(path)}")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
@@ -102,21 +118,28 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 hashes[path] = digest
                 updated += 1
             else:
+                hashes.pop(path, None)
                 failed += 1
                 last_err = ans
         except FileTooLargeError as e:
+            hashes.pop(path, None)
             failed += 1
             last_err = str(e)
         except Exception as e:
+            hashes.pop(path, None)
             failed += 1
             last_err = str(e)
 
-    if failed and not updated:
+    payload = json.dumps(hashes, ensure_ascii=False)
+    if failed and updated == 0 and skipped == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
-        mark_watch_synced(source["id"], content_hash=json.dumps(hashes, ensure_ascii=False), synced=True)
-        if failed:
-            mark_watch_synced(source["id"], error=last_err, synced=False)
+        mark_watch_synced(
+            source["id"],
+            content_hash=payload,
+            error=last_err if failed else "",
+            synced=True,
+        )
     return updated, skipped, failed, last_err
 
 
@@ -142,7 +165,7 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         return 0, 0, 1, err
 
     digest = _text_hash(text)
-    if _already_ingested(graph_id, url, digest, source.get("content_hash") or ""):
+    if _same_source_text(graph_id, url, digest, source.get("content_hash") or ""):
         print(f"[auto_refresh] confluence skip unchanged {url}")
         mark_watch_synced(source["id"], content_hash=digest, synced=True)
         try:

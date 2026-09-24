@@ -614,14 +614,18 @@ def run_ingest(
     digest = _content_digest(text) if (text or "").strip() else ""
     if digest:
         try:
-            if find_ingest_digest_by_hash(graph_id, digest):
-                print(f"[web_app_v2] ingest skip duplicate slug={slug} source={source_input}")
+            prev = get_ingest_digest(graph_id, source_input)
+            if prev and prev == digest:
+                print(f"[web_app_v2] ingest skip same source slug={slug} source={source_input}")
                 log_event(slug, log_text, log_type, INGEST_SKIP_MSG)
                 return True, INGEST_SKIP_MSG
-            prev = get_ingest_digest(graph_id, source_input)
-            if prev and prev != digest:
-                deleted = linker.repository.delete_by_source_input(graph_id, source_input)
-                print(f"[web_app_v2] ingest replace source={source_input} deleted={deleted}")
+            if not prev:
+                other = find_ingest_digest_by_hash(graph_id, digest)
+                own_cards = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
+                if other and not own_cards:
+                    print(f"[web_app_v2] ingest skip duplicate slug={slug} source={source_input}")
+                    log_event(slug, log_text, log_type, INGEST_SKIP_MSG)
+                    return True, INGEST_SKIP_MSG
         except Exception as e:
             print(f"[web_app_v2] ingest digest check warning: {e}")
 
@@ -632,7 +636,7 @@ def run_ingest(
         print(f"[_v2] ingest start slug={slug} chars={len(text or '')}")
         with _ingest_run_lock:
             set_ingest_phase(slug, "linking")
-            ok, ans = save_user_note(graph_id, text, on_stage=on_stage, source_input=source_input)
+            ok, ans = ingest_replacing(graph_id, text, source_input, on_stage=on_stage)
         if ok and digest:
             try:
                 upsert_ingest_digest(graph_id, source_input, digest)
@@ -785,6 +789,7 @@ def save_user_note(
     text: str,
     on_stage=None,
     source_input: str = "text",
+    exclude_zettel_ids: set | None = None,
 ) -> tuple[bool, str]:
     def stage(key: str, title: str, sub: str = "") -> None:
         if on_stage:
@@ -824,13 +829,45 @@ def save_user_note(
             stage("link", "Связывание в граф", f"Карточка {index} из {count}{hint}")
 
         stage("link", "Связывание в граф", f"Линкер встраивает {total} карточек")
-        linker.link_and_insert(user_id=user_id, new_cards=raw_cards, on_progress=link_progress)
+        linker.link_and_insert(
+            user_id=user_id,
+            new_cards=raw_cards,
+            on_progress=link_progress,
+            exclude_zettel_ids=exclude_zettel_ids,
+        )
         stats = linker.get_user_stats(user_id)
         return True, f"✅ Записано в граф знаний.\n📚 Размер базы: {stats['total_cards']} карточек"
     except MemoryError:
         return False, "Не хватило памяти при обработке текста. Возьмите файл меньшего размера или загрузите папку частями."
     finally:
         _release_mem()
+
+
+def ingest_replacing(
+    graph_id: str,
+    text: str,
+    source_input: str,
+    on_stage=None,
+) -> tuple[bool, str]:
+    """Сначала встраивает новую версию, старые карточки этого источника снимает только после успеха."""
+    old_ids = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
+    old_set = set(old_ids)
+    ok, ans = save_user_note(
+        graph_id,
+        text,
+        on_stage=on_stage,
+        source_input=source_input,
+        exclude_zettel_ids=old_set,
+    )
+    if ok:
+        if old_ids:
+            linker.repository.delete_zettel_ids(graph_id, old_ids)
+        return True, ans
+    current = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
+    fresh = [item for item in current if item not in old_set]
+    if fresh:
+        linker.repository.delete_zettel_ids(graph_id, fresh)
+    return False, ans
 
 
 SUPPORTED_UPLOAD_EXTS = set(EXTRACTABLE_EXTENSIONS)

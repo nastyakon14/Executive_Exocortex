@@ -25,10 +25,11 @@ def check_confluence_change(source: dict) -> dict:
         remote = remote.astimezone(timezone.utc)
 
     synced = as_utc(source.get("last_synced_at"))
-    if synced is None:
-        print(f"[auto_refresh] confluence first check, stamp only {url}")
+    has_hash = bool((source.get("content_hash") or "").strip())
+    if synced is None or not has_hash:
+        print(f"[auto_refresh] confluence needs body check {url}")
         return {
-            "changed": False,
+            "changed": True,
             "remote_mtime": remote,
             "error": None,
         }

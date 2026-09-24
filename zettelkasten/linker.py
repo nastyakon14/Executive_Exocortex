@@ -259,6 +259,7 @@ class GraphLinker:
         user_id: str,
         new_cards: List[ZettelCard],
         on_progress: Optional[Callable[[int, int, str], None]] = None,
+        exclude_zettel_ids: Optional[set] = None,
     ) -> List[LinkResult]:
         """
         Обрабатывает список карточек от Atomizer и встраивает в граф пользователя.
@@ -270,23 +271,26 @@ class GraphLinker:
         """
         results: List[LinkResult] = []
         self._luhmann_remap = {}
+        self._exclude_zettel_ids = set(exclude_zettel_ids or ())
         total = len(new_cards)
-        
-        for i, card in enumerate(new_cards, 1):
-            if on_progress:
-                on_progress(i, total, card.topic or "")
-            
-            embedding = self.embedding_model.embed_passage(card.content)
-            
-            # дочерние мысли внутри одного сообщения не требуют llm-решения
-            if not card.is_root_topic and card.parent_luhmann_id in self._luhmann_remap:
-                result = self._handle_inner_child(user_id, card, embedding)
-            else:
-                result = self._handle_root_card(user_id, card, embedding)
-            
-            results.append(result)
-        
-        return results
+
+        try:
+            for i, card in enumerate(new_cards, 1):
+                if on_progress:
+                    on_progress(i, total, card.topic or "")
+
+                embedding = self.embedding_model.embed_passage(card.content)
+
+                # дочерние мысли внутри одного сообщения не требуют llm-решения
+                if not card.is_root_topic and card.parent_luhmann_id in self._luhmann_remap:
+                    result = self._handle_inner_child(user_id, card, embedding)
+                else:
+                    result = self._handle_root_card(user_id, card, embedding)
+
+                results.append(result)
+            return results
+        finally:
+            self._exclude_zettel_ids = set()
     
     def _handle_inner_child(self, user_id: str, card: ZettelCard, embedding: List[float]) -> LinkResult:
         """Карточка уже привязана к родителю внутри текущего сообщения."""
@@ -335,6 +339,7 @@ class GraphLinker:
             query_embedding=self.embedding_model.embed_query(card.content),
             limit=self.max_candidates,
             similarity_threshold=self.similarity_threshold,
+            exclude_ids=getattr(self, "_exclude_zettel_ids", None),
         )
         
         # print(f"   🔍 Vector search: {len(candidates)} кандидатов")
@@ -356,6 +361,11 @@ class GraphLinker:
         decision = self._ask_llm(card, contexts)
         # print(f"   🤖 LLM: {decision.action.value.upper()} | {decision.reasoning}")
         
+        blocked = getattr(self, "_exclude_zettel_ids", set())
+        if decision.target_zettel_id and decision.target_zettel_id in blocked:
+            return self._apply_new_root(
+                user_id, card, embedding, "Старая версия этого источника не используется как цель", len(candidates)
+            )
         if decision.action == LinkAction.NEW_ROOT:
             return self._apply_new_root(user_id, card, embedding, decision.reasoning, len(candidates))
         elif decision.action == LinkAction.CHILD_OF:

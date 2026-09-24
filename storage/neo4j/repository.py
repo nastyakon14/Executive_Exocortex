@@ -512,6 +512,49 @@ class ZettelRepository:
             result = self.client.execute_read(query, {"user_id": user_id})
         return [row["source_input"] for row in (result or []) if row.get("source_input")]
 
+    def list_zettel_ids_by_source(self, user_id: str, source_input: str) -> list[str]:
+        """Идентификаторы карточек одного файла или страницы."""
+        if not source_input:
+            return []
+        query = """
+        MATCH (z:Zettel {user_id: $user_id, source_input: $source_input})
+        RETURN z.zettel_id AS zettel_id
+        """
+        result = self.client.execute_read(
+            query, {"user_id": user_id, "source_input": source_input}
+        )
+        return [row["zettel_id"] for row in (result or []) if row.get("zettel_id")]
+
+    def delete_zettel_ids(self, user_id: str, zettel_ids: list[str]) -> int:
+        """Удаляет только перечисленные карточки, без чужих дочерних узлов."""
+        ids = [item for item in (zettel_ids or []) if item]
+        if not ids:
+            return 0
+        query = """
+        MATCH (z:Zettel {user_id: $user_id})
+        WHERE z.zettel_id IN $ids
+        WITH collect(z) AS nodes
+        FOREACH (node IN nodes | DETACH DELETE node)
+        RETURN size(nodes) AS deleted_count
+        """
+        result = self.client.execute_write(query, {"user_id": user_id, "ids": ids})
+        deleted = result[0]["deleted_count"] if result else 0
+        self._delete_orphan_entities(user_id)
+        self._max_root_id_cache.pop(user_id, None)
+        return int(deleted or 0)
+
+    def _delete_orphan_entities(self, user_id: str) -> None:
+        cleanup_query = """
+        MATCH (e:Entity {user_id: $user_id})
+        WHERE NOT EXISTS {
+            MATCH (:Zettel {user_id: $user_id})-[:MENTIONS]->(e)
+        }
+        WITH collect(e) AS orphan_entities
+        FOREACH (ent IN orphan_entities | DELETE ent)
+        RETURN size(orphan_entities) AS removed_entities
+        """
+        self.client.execute_write(cleanup_query, {"user_id": user_id})
+
     def delete_by_source_input(self, user_id: str, source_input: str) -> int:
         """Удаляет все мысли одного файла или страницы перед повторным ingest."""
         query = """
@@ -524,16 +567,7 @@ class ZettelRepository:
             query, {"user_id": user_id, "source_input": source_input}
         )
         deleted = result[0]["deleted_count"] if result else 0
-        cleanup_query = """
-        MATCH (e:Entity {user_id: $user_id})
-        WHERE NOT EXISTS {
-            MATCH (:Zettel {user_id: $user_id})-[:MENTIONS]->(e)
-        }
-        WITH collect(e) AS orphan_entities
-        FOREACH (ent IN orphan_entities | DELETE ent)
-        RETURN size(orphan_entities) AS removed_entities
-        """
-        self.client.execute_write(cleanup_query, {"user_id": user_id})
+        self._delete_orphan_entities(user_id)
         self._max_root_id_cache.pop(user_id, None)
         return int(deleted or 0)
     
@@ -545,12 +579,15 @@ class ZettelRepository:
         query_embedding: List[float],
         limit: int = 5,
         similarity_threshold: float = 0.3,
+        exclude_ids: Optional[set] = None,
     ) -> List[Tuple[ZettelNode, float]]:
         """
         Семантический поиск по эмбеддингам для узлов данного user_id.
         """
         # vector index в neo4j не фильтрует по user_id, поэтому считаем cosine в python
-        return self._vector_search_python_fallback(user_id, query_embedding, limit, similarity_threshold)
+        return self._vector_search_python_fallback(
+            user_id, query_embedding, limit, similarity_threshold, exclude_ids
+        )
     
     def _vector_search_python_fallback(
         self,
@@ -558,6 +595,7 @@ class ZettelRepository:
         query_embedding: List[float],
         limit: int,
         threshold: float,
+        exclude_ids: Optional[set] = None,
     ) -> List[Tuple[ZettelNode, float]]:
         """
         Косинусный поиск в Python с фильтрацией по user_id.
@@ -576,10 +614,13 @@ class ZettelRepository:
         
         query_vec = np.array(query_embedding)
         query_norm = np.linalg.norm(query_vec)
+        blocked = exclude_ids or set()
         
         candidates = []
         for row in result:
             z = row["z"]
+            if z.get("zettel_id") in blocked:
+                continue
             emb = np.array(z["embedding"])
             emb_norm = np.linalg.norm(emb)
             

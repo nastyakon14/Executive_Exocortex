@@ -48,7 +48,7 @@ def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], 
 def check_folder_changes(source: dict) -> dict:
     """
     Возвращает {files, stale, error}.
-    files — пути, у которых mtime новее last_synced_at, либо ещё нет хеша.
+    files — пути без хэша или с mtime новее last_synced_at.
     stale — source_input в графе, которых уже нет на диске.
     """
     folder = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
@@ -65,7 +65,7 @@ def check_folder_changes(source: dict) -> dict:
             newer = synced is not None and file_mtime_utc(path) > synced
         except OSError:
             continue
-        if newer or (hashes and path not in hashes):
+        if path not in hashes or newer:
             changed.append(path)
 
     prefix = folder if folder.endswith(os.sep) else folder + os.sep

@@ -175,11 +175,11 @@ def mark_watch_synced(
                     UPDATE watch_sources
                     SET last_synced_at = NOW(),
                         content_hash = COALESCE(%s, content_hash),
-                        last_error = '',
+                        last_error = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     ''',
-                    (content_hash, watch_id),
+                    (content_hash, error or "", watch_id),
                 )
             else:
                 cursor.execute(
@@ -210,11 +210,11 @@ def mark_watch_synced_path(
                     UPDATE watch_sources
                     SET last_synced_at = NOW(),
                         content_hash = COALESCE(%s, content_hash),
-                        last_error = '',
+                        last_error = %s,
                         updated_at = NOW()
                     WHERE graph_id = %s AND source_kind = %s AND source_path = %s
                     ''',
-                    (content_hash, graph_id, source_kind, source_path),
+                    (content_hash, error or "", graph_id, source_kind, source_path),
                 )
             else:
                 cursor.execute(
@@ -281,6 +281,22 @@ def upsert_ingest_digest(graph_id: str, source_input: str, content_hash: str) ->
                 DO UPDATE SET content_hash = EXCLUDED.content_hash, created_at = NOW()
                 ''',
                 (graph_id, source_input, content_hash),
+            )
+            conn.commit()
+
+
+def delete_ingest_digest(graph_id: str, source_input: str) -> None:
+    """Снимает отпечаток, когда карточки источника удалены."""
+    if not graph_id or not source_input:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                DELETE FROM ingest_digests
+                WHERE graph_id = %s AND source_input = %s
+                ''',
+                (graph_id, source_input),
             )
             conn.commit()
 
