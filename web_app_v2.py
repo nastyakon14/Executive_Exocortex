@@ -198,6 +198,7 @@ _ingest_run_lock = threading.Lock()
 INGEST_STATUS_LABELS = {
     "indexed": "Индексирован",
     "linking": "Встраивание в граф",
+    "checking": "Проверка источников",
     "refreshing": "Автообновление графа",
     "ready": "Готов",
     "error": "Ошибка обработки",
@@ -497,7 +498,7 @@ def with_live_ingest(item: dict) -> dict:
         else:
             status = row.get("ingest_status") or "ready"
             error = row.get("ingest_error") or ""
-            if status in {"indexed", "linking", "refreshing"}:
+            if status in {"indexed", "linking", "checking", "refreshing"}:
                 status, error = "error", "Обработка прервана. Загрузите материал снова."
     if status not in INGEST_STATUS_LABELS:
         status = "ready"
@@ -582,7 +583,7 @@ def reset_stale_ingest_status() -> None:
                 continue
             if _ingest_jobs.get(slug, 0) > 0:
                 continue
-            if item.get("ingest_status") in {"indexed", "linking", "refreshing"}:
+            if item.get("ingest_status") in {"indexed", "linking", "checking", "refreshing"}:
                 item["ingest_status"] = "error"
                 item["ingest_error"] = "Обработка прервана. Загрузите материал снова."
                 _set_ingest_snapshot(slug, "error", item["ingest_error"])
@@ -1146,9 +1147,9 @@ body {
 .status-dot.ready { background: #22c55e; }
 .status-dot.indexed { background: #f97316; }
 .status-dot.linking { background: #eab308; }
-.status-dot.refreshing { background: #38bdf8; }
+.status-dot.checking, .status-dot.refreshing { background: #38bdf8; }
 .status-dot.error { background: #ef4444; }
-.status-dot.indexed, .status-dot.linking, .status-dot.refreshing { animation: status-pulse 1.2s ease-in-out infinite; }
+.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing { animation: status-pulse 1.2s ease-in-out infinite; }
 @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .status-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .status-row.status-error { color: #ef4444; align-items: flex-start; }
@@ -1823,7 +1824,7 @@ document.addEventListener('keydown', function(e) {
 })();
 
 (function() {
-    if (document.querySelector('.status-dot.indexed, .status-dot.linking, .status-dot.refreshing')) {
+    if (document.querySelector('.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing')) {
         setTimeout(function() { location.reload(); }, 3000);
     }
 })();
@@ -2183,7 +2184,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         if n > 0
         else f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» будет удалён.'
     )
-    ingest_busy = scope.get("ingest_status") in {"indexed", "linking", "refreshing"}
+    ingest_busy = scope.get("ingest_status") in {"indexed", "linking", "checking", "refreshing"}
     watch_n = 0
     try:
         watch_n = len(list_watch_sources(watch_only=True, project_slug=slug))
@@ -2292,7 +2293,7 @@ async def refresh_graph_now(slug: str):
     with _state_lock:
         if _ingest_jobs.get(slug, 0) > 0:
             return RedirectResponse(f"/p/{slug}?msg=Проект уже обрабатывается&st=err", status_code=303)
-    begin_ingest(slug, "refreshing")
+    begin_ingest(slug, "checking")
 
     def work():
         try:

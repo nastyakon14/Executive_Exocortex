@@ -26,6 +26,7 @@ def connect_Confluence():
         username=login,
         password=pswd,
         verify_ssl=False,
+        timeout=30,
     )
 
 

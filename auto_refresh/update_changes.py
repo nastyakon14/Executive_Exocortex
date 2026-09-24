@@ -15,7 +15,12 @@ load_dotenv()
 
 from app.handlers.confluence import get_confluence_page_content
 from app.handlers.folders_mac import FileTooLargeError, extract_file_text
-from storage.postgres.db_connect import list_watch_sources, mark_watch_synced, upsert_ingest_digest
+from storage.postgres.db_connect import (
+    find_ingest_digest_by_hash,
+    list_watch_sources,
+    mark_watch_synced,
+    upsert_ingest_digest,
+)
 
 from auto_refresh.confluence_checker import check_confluence_change
 from auto_refresh.folder_checker import check_folder_changes, folder_hashes
@@ -26,6 +31,19 @@ _scheduler_started = False
 
 def _text_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _already_ingested(graph_id: str, _source_input: str, digest: str, stored_hash: str = "") -> bool:
+    if not digest:
+        return False
+    if stored_hash and digest == stored_hash:
+        return True
+    try:
+        if find_ingest_digest_by_hash(graph_id, digest):
+            return True
+    except Exception as e:
+        print(f"[auto_refresh] digest lookup warning: {e}")
+    return False
 
 
 def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_text: str) -> tuple[bool, str]:
@@ -73,9 +91,12 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 skipped += 1
                 continue
             digest = _text_hash(text)
-            if hashes.get(path) == digest:
+            if _already_ingested(graph_id, path, digest, hashes.get(path) or ""):
+                hashes[path] = digest
                 skipped += 1
+                print(f"[auto_refresh] folder skip unchanged {os.path.basename(path)}")
                 continue
+            print(f"[auto_refresh] folder ingest {os.path.basename(path)}")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
             if ok:
                 hashes[path] = digest
@@ -104,9 +125,11 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         mark_watch_synced(source["id"], error=probe["error"], synced=False)
         return 0, 0, 1, probe["error"]
     if not probe.get("changed"):
+        mark_watch_synced(source["id"], content_hash=source.get("content_hash") or None, synced=True)
         return 0, 1, 0, ""
 
     url = source["source_path"]
+    graph_id = source["graph_id"]
     text = get_confluence_page_content(url)
     if (
         not (text or "").strip()
@@ -119,11 +142,17 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         return 0, 0, 1, err
 
     digest = _text_hash(text)
-    if digest and digest == (source.get("content_hash") or ""):
+    if _already_ingested(graph_id, url, digest, source.get("content_hash") or ""):
+        print(f"[auto_refresh] confluence skip unchanged {url}")
         mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        try:
+            upsert_ingest_digest(graph_id, url, digest)
+        except Exception as e:
+            print(f"[auto_refresh] digest save warning: {e}")
         return 0, 1, 0, ""
 
-    ok, ans = _ingest_source(slug, source["graph_id"], text, url, f"[auto] {url}")
+    print(f"[auto_refresh] confluence ingest {url}")
+    ok, ans = _ingest_source(slug, graph_id, text, url, f"[auto] {url}")
     if ok:
         mark_watch_synced(source["id"], content_hash=digest, synced=True)
         return 1, 0, 0, ""
@@ -148,7 +177,7 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
         return {"ok": True, "updated": 0, "skipped": 0, "failed": 0, "message": "Нет источников с отслеживанием изменений"}
 
     if manage_status:
-        begin_ingest(slug, "refreshing")
+        begin_ingest(slug, "checking")
     updated = skipped = failed = 0
     errors: list[str] = []
     try:

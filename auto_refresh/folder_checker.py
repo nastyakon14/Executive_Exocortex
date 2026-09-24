@@ -10,14 +10,14 @@ except ImportError:
     from folders_mac import EXTRACTABLE_EXTENSIONS, list_folder_files
 
 
-def as_utc(value) -> datetime:
+def as_utc(value) -> datetime | None:
     if value is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return None
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return datetime.fromtimestamp(value.timestamp(), tz=timezone.utc)
         return value.astimezone(timezone.utc)
-    return datetime.min.replace(tzinfo=timezone.utc)
+    return None
 
 
 def file_mtime_utc(path: str) -> datetime:
@@ -62,7 +62,7 @@ def check_folder_changes(source: dict) -> dict:
     changed = []
     for path in files:
         try:
-            newer = file_mtime_utc(path) > synced
+            newer = synced is not None and file_mtime_utc(path) > synced
         except OSError:
             continue
         if newer or (hashes and path not in hashes):

@@ -25,8 +25,20 @@ def check_confluence_change(source: dict) -> dict:
         remote = remote.astimezone(timezone.utc)
 
     synced = as_utc(source.get("last_synced_at"))
+    if synced is None:
+        print(f"[auto_refresh] confluence first check, stamp only {url}")
+        return {
+            "changed": False,
+            "remote_mtime": remote,
+            "error": None,
+        }
+    changed = remote > synced
+    print(
+        f"[auto_refresh] confluence check changed={changed} "
+        f"remote={remote.isoformat()} synced={synced.isoformat()}"
+    )
     return {
-        "changed": remote > synced,
+        "changed": changed,
         "remote_mtime": remote,
         "error": None,
     }
