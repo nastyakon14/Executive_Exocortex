@@ -408,6 +408,32 @@ class ZettelRepository:
         result = self.client.execute_read(query, {"user_ids": user_ids})
         return result[0]["cnt"] if result else 0
 
+    def latest_card_times(self, user_ids: List[str]) -> dict:
+        """Максимум created_at/updated_at карточек по каждому графу."""
+        if not user_ids:
+            return {}
+        query = """
+        MATCH (z:Zettel)
+        WHERE z.user_id IN $user_ids
+        RETURN z.user_id AS user_id,
+               max(z.updated_at) AS updated_at,
+               max(z.created_at) AS created_at
+        """
+        result = self.client.execute_read(query, {"user_ids": user_ids})
+        times = {}
+        for row in result or []:
+            uid = row.get("user_id")
+            if not uid:
+                continue
+            candidates = [
+                self._as_datetime(row.get("updated_at")),
+                self._as_datetime(row.get("created_at")),
+            ]
+            best = max((dt for dt in candidates if dt is not None), default=None)
+            if best is not None:
+                times[uid] = best
+        return times
+
     def delete_graph(self, user_id: str) -> int:
         """Удаляет все мысли и сущности одного проекта."""
         query = """
@@ -468,6 +494,48 @@ class ZettelRepository:
             "deleted_count": deleted_count,
             "removed_entities": removed_entities,
         }
+
+    def list_source_inputs(self, user_id: str, prefix: str = "") -> list[str]:
+        """Уникальные source_input карточек проекта, опционально с префиксом пути."""
+        if prefix:
+            query = """
+            MATCH (z:Zettel {user_id: $user_id})
+            WHERE z.source_input STARTS WITH $prefix
+            RETURN DISTINCT z.source_input AS source_input
+            """
+            result = self.client.execute_read(query, {"user_id": user_id, "prefix": prefix})
+        else:
+            query = """
+            MATCH (z:Zettel {user_id: $user_id})
+            RETURN DISTINCT z.source_input AS source_input
+            """
+            result = self.client.execute_read(query, {"user_id": user_id})
+        return [row["source_input"] for row in (result or []) if row.get("source_input")]
+
+    def delete_by_source_input(self, user_id: str, source_input: str) -> int:
+        """Удаляет все мысли одного файла или страницы перед повторным ingest."""
+        query = """
+        MATCH (z:Zettel {user_id: $user_id, source_input: $source_input})
+        WITH collect(z) AS nodes
+        FOREACH (node IN nodes | DETACH DELETE node)
+        RETURN size(nodes) AS deleted_count
+        """
+        result = self.client.execute_write(
+            query, {"user_id": user_id, "source_input": source_input}
+        )
+        deleted = result[0]["deleted_count"] if result else 0
+        cleanup_query = """
+        MATCH (e:Entity {user_id: $user_id})
+        WHERE NOT EXISTS {
+            MATCH (:Zettel {user_id: $user_id})-[:MENTIONS]->(e)
+        }
+        WITH collect(e) AS orphan_entities
+        FOREACH (ent IN orphan_entities | DELETE ent)
+        RETURN size(orphan_entities) AS removed_entities
+        """
+        self.client.execute_write(cleanup_query, {"user_id": user_id})
+        self._max_root_id_cache.pop(user_id, None)
+        return int(deleted or 0)
     
     # семантический поиск по эмбеддингам (только внутри user_id)
 

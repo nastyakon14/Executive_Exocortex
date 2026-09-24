@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
@@ -21,7 +21,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Resp
 import uvicorn
 
 from config.settings import settings
-from storage.postgres.db_connect import create_database, create_tables, update_history_messages, upsert_watch_source
+from storage.postgres.db_connect import (
+    create_database,
+    create_tables,
+    list_watch_sources,
+    mark_watch_synced_path,
+    update_history_messages,
+    upsert_watch_source,
+)
 from app.handlers.confluence import CONFLUENCE_HOST, get_confluence_page_content
 from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
@@ -187,6 +194,7 @@ _ingest_run_lock = threading.Lock()
 INGEST_STATUS_LABELS = {
     "indexed": "Индексирован",
     "linking": "Встраивание в граф",
+    "refreshing": "Автообновление графа",
     "ready": "Готов",
     "error": "Ошибка обработки",
 }
@@ -201,6 +209,8 @@ def _normalize_project(item: dict) -> dict:
     item.setdefault("archived", False)
     item.setdefault("ingest_status", "ready")
     item.setdefault("ingest_error", "")
+    item.setdefault("data_updated_at", "")
+    item.setdefault("data_updated_kind", "")
     if item.get("ingest_status") not in INGEST_STATUS_LABELS:
         item["ingest_status"] = "ready"
     return item
@@ -268,6 +278,116 @@ def save_projects(projects: list[dict]) -> None:
         _save_projects_unlocked(projects)
 
 
+def _moscow_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/Moscow")
+    except Exception:
+        return timezone(timedelta(hours=3))
+
+
+def _as_aware_utc(value) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return datetime.fromtimestamp(value.timestamp(), tz=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            raw = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def _format_moscow(value) -> str:
+    dt = _as_aware_utc(value)
+    if not dt:
+        return ""
+    return dt.astimezone(_moscow_tz()).strftime("%d.%m.%Y %H:%M")
+
+
+def data_freshness_html(item: dict) -> str:
+    stamp = item.get("data_updated_at") or ""
+    shown = _format_moscow(stamp)
+    if not shown:
+        return '<p class="project-fresh">Данные ещё не загружались</p>'
+    label = "Последнее обновление" if item.get("data_updated_kind") == "refresh" else "Последняя загрузка"
+    return f'<p class="project-fresh">{label}: {escape(shown)}</p>'
+
+
+def touch_project_data(slug: str, kind: str) -> None:
+    """Пишет дату последней загрузки или автообновления графа."""
+    now = datetime.now(timezone.utc).isoformat()
+    kind = "refresh" if kind == "refresh" else "upload"
+    with _state_lock:
+        projects = _load_projects_unlocked()
+        for item in projects:
+            if item.get("slug") == slug:
+                item["data_updated_at"] = now
+                item["data_updated_kind"] = kind
+                _save_projects_unlocked(projects)
+                return
+
+
+def _backfill_data_times(projects: list[dict]) -> list[dict]:
+    missing = [p for p in projects if p.get("graph_id") and not (p.get("data_updated_at") or "").strip()]
+    if not missing:
+        return projects
+    times = {}
+    try:
+        times = linker.repository.latest_card_times([p["graph_id"] for p in missing])
+    except Exception as e:
+        print(f"[web_app_v2] data time backfill warning: {e}")
+    watch_latest: dict[str, datetime] = {}
+    try:
+        for src in list_watch_sources(watch_only=False):
+            slug = src.get("project_slug")
+            ts = _as_aware_utc(src.get("last_synced_at"))
+            if slug and ts and (slug not in watch_latest or ts > watch_latest[slug]):
+                watch_latest[slug] = ts
+    except Exception as e:
+        print(f"[web_app_v2] watch time backfill warning: {e}")
+
+    changed = False
+    with _state_lock:
+        current = _load_projects_unlocked()
+        by_slug = {p.get("slug"): p for p in current}
+        for item in missing:
+            live = by_slug.get(item.get("slug"))
+            if not live or (live.get("data_updated_at") or "").strip():
+                continue
+            neo = times.get(item.get("graph_id"))
+            neo = _as_aware_utc(neo)
+            watch = watch_latest.get(item.get("slug"))
+            best = None
+            kind = "upload"
+            if neo and watch:
+                if watch >= neo:
+                    best, kind = watch, "refresh"
+                else:
+                    best, kind = neo, "upload"
+            elif watch:
+                best, kind = watch, "refresh"
+            elif neo:
+                best, kind = neo, "upload"
+            if not best:
+                continue
+            live["data_updated_at"] = best.astimezone(timezone.utc).isoformat()
+            live["data_updated_kind"] = kind
+            item["data_updated_at"] = live["data_updated_at"]
+            item["data_updated_kind"] = kind
+            changed = True
+        if changed:
+            _save_projects_unlocked(current)
+    return projects
+
+
 def sync_projects_from_graph() -> list[dict]:
     """Подтягивает графы из Neo4j, чтобы старые данные не потерялись."""
     try:
@@ -316,7 +436,7 @@ def sync_projects_from_graph() -> list[dict]:
 
         if changed:
             _save_projects_unlocked(projects)
-        return projects
+    return _backfill_data_times(projects)
 
 
 def get_project(slug: str) -> dict | None:
@@ -372,7 +492,7 @@ def with_live_ingest(item: dict) -> dict:
         else:
             status = row.get("ingest_status") or "ready"
             error = row.get("ingest_error") or ""
-            if status in {"indexed", "linking"}:
+            if status in {"indexed", "linking", "refreshing"}:
                 status, error = "error", "Обработка прервана. Загрузите материал снова."
     if status not in INGEST_STATUS_LABELS:
         status = "ready"
@@ -457,7 +577,7 @@ def reset_stale_ingest_status() -> None:
                 continue
             if _ingest_jobs.get(slug, 0) > 0:
                 continue
-            if item.get("ingest_status") in {"indexed", "linking"}:
+            if item.get("ingest_status") in {"indexed", "linking", "refreshing"}:
                 item["ingest_status"] = "error"
                 item["ingest_error"] = "Обработка прервана. Загрузите материал снова."
                 _set_ingest_snapshot(slug, "error", item["ingest_error"])
@@ -499,6 +619,8 @@ def run_ingest(
         print(f"[web_app_v2] ingest background error: {e}")
         return False, ans
     finally:
+        if ok:
+            touch_project_data(slug, "upload")
         end_ingest(slug, ok=ok, message="" if ok else (ans or "Не удалось встроить материал в граф"))
 
 
@@ -509,11 +631,29 @@ def _queue_ingest(slug: str, graph_id: str, text: str, source_input: str, log_ty
 reset_stale_ingest_status()
 
 
+def _boot_auto_refresh() -> None:
+    if os.getenv("AUTO_REFRESH", "1").strip().lower() in {"0", "false", "no", "off"}:
+        print("[auto_refresh] scheduler disabled")
+        return
+    from auto_refresh.update_changes import start_nightly_scheduler
+    start_nightly_scheduler()
+
+
+_boot_auto_refresh()
+
+
 def resolve_scope(slug: str) -> dict | None:
     if slug == COMMON_SLUG:
         projects = sync_projects_from_graph()
         active = [p for p in projects if p.get("graph_id") and not p.get("archived")]
         graph_ids = [p["graph_id"] for p in active]
+        latest = None
+        latest_kind = ""
+        for p in active:
+            dt = _as_aware_utc(p.get("data_updated_at"))
+            if dt and (latest is None or dt > latest):
+                latest = dt
+                latest_kind = p.get("data_updated_kind") or "upload"
         return {
             "slug": COMMON_SLUG,
             "name": "Общий граф",
@@ -525,6 +665,8 @@ def resolve_scope(slug: str) -> dict | None:
             "archived": False,
             "ingest_status": "ready",
             "ingest_error": "",
+            "data_updated_at": latest.isoformat() if latest else "",
+            "data_updated_kind": latest_kind,
         }
     projects = sync_projects_from_graph()
     item = next((p for p in projects if p.get("slug") == slug), None)
@@ -542,6 +684,8 @@ def resolve_scope(slug: str) -> dict | None:
         "archived": bool(live.get("archived")),
         "ingest_status": live.get("ingest_status") or "ready",
         "ingest_error": live.get("ingest_error") or "",
+        "data_updated_at": live.get("data_updated_at") or "",
+        "data_updated_kind": live.get("data_updated_kind") or "",
     }
 
 
@@ -957,13 +1101,15 @@ body {
 .status-dot.ready { background: #22c55e; }
 .status-dot.indexed { background: #f97316; }
 .status-dot.linking { background: #eab308; }
+.status-dot.refreshing { background: #38bdf8; }
 .status-dot.error { background: #ef4444; }
-.status-dot.indexed, .status-dot.linking { animation: status-pulse 1.2s ease-in-out infinite; }
+.status-dot.indexed, .status-dot.linking, .status-dot.refreshing { animation: status-pulse 1.2s ease-in-out infinite; }
 @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .status-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .status-row.status-error { color: #ef4444; align-items: flex-start; }
 .status-row.status-error span { line-height: 1.35; }
 .project-card .status-row { margin-top: 8px; }
+.project-fresh { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .icon-edit { position: absolute; top: 12px; right: 10px; z-index: 2; width: 30px; height: 30px; border: none; background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.35; transition: opacity 0.15s, background 0.15s, color 0.15s; }
 .project-card:hover .icon-edit, .icon-edit:focus { opacity: 1; }
 .icon-edit:hover { background: var(--card2); color: var(--accent); }
@@ -981,6 +1127,7 @@ body {
 .project-desc { color: var(--text2); font-size: 15px; line-height: 1.6; margin-top: 10px; }
 .project-desc.empty { color: var(--muted); font-style: italic; }
 .project-count { color: var(--muted); font-size: 13px; margin-top: 10px; }
+.header .project-fresh { margin-top: 8px; }
 .meta-actions { display: flex; gap: 10px; margin: 8px 0 28px; }
 .meta-actions form { flex: 1; margin: 0; }
 .btn-ghost { display: block; width: 100%; padding: 12px 10px; background: transparent; border: 1px solid var(--border); border-radius: 12px; color: var(--muted); font-size: 13px; cursor: pointer; transition: all 0.15s; }
@@ -1034,6 +1181,10 @@ body {
 
 /* Menu */
 .menu-btn { display: flex; align-items: center; gap: 14px; width: 100%; padding: 18px 20px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; text-decoration: none; transition: all 0.2s; position: relative; overflow: hidden; }
+form.refresh-now { margin: 0; }
+button.menu-btn { font: inherit; cursor: pointer; text-align: left; }
+button.menu-btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+button.menu-btn:disabled:hover { transform: none; box-shadow: none; border-color: var(--border); }
 .menu-btn::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(135deg, var(--accent), var(--accent2)); opacity: 0; transition: opacity 0.2s; }
 .menu-btn:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 24px var(--glow); }
 .menu-btn:hover::before { opacity: 0.08; }
@@ -1627,7 +1778,7 @@ document.addEventListener('keydown', function(e) {
 })();
 
 (function() {
-    if (document.querySelector('.status-dot.indexed, .status-dot.linking')) {
+    if (document.querySelector('.status-dot.indexed, .status-dot.linking, .status-dot.refreshing')) {
         setTimeout(function() { location.reload(); }, 3000);
     }
 })();
@@ -1742,6 +1893,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
                 <h3><span>{escape(name)}</span>{badge}</h3>
                 {desc_html}
                 <p>{n} сущности(ей) в графе</p>
+                {data_freshness_html(p)}
                 {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
         </div>
@@ -1955,6 +2107,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             </div>
             <div class="readonly-banner">Этот граф только для навигации и поиска. Новые данные добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
             <div class="msg-box">Сейчас объединено {n} сущности(ей) из {len(scope["graph_ids"])} проектов.</div>
+            {data_freshness_html(scope)}
             <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
             <a href="/contour" class="menu-btn"><span class="icon">🧩</span><span>Совместный поиск по выбранным проектам</span></a>
             <a href="/p/{COMMON_SLUG}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть общий граф</span></a>
@@ -1985,6 +2138,19 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         if n > 0
         else f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» будет удалён.'
     )
+    ingest_busy = scope.get("ingest_status") in {"indexed", "linking", "refreshing"}
+    watch_n = 0
+    try:
+        watch_n = len(list_watch_sources(watch_only=True, project_slug=slug))
+    except Exception:
+        watch_n = 0
+    refresh_disabled = " disabled" if ingest_busy else ""
+    if ingest_busy:
+        wait_hint = '<p class="project-count">Новые сущности появятся в графе и поиске, когда статус станет зелёным.</p>'
+    elif watch_n:
+        wait_hint = f'<p class="project-count">Отслеживается источников: {watch_n}. Ночью в 02:00 (Москва) граф обновится сам — или нажмите кнопку ниже.</p>'
+    else:
+        wait_hint = '<p class="project-count">Чтобы граф обновлялся сам, при загрузке папки или Confluence включите «Отслеживать изменения».</p>'
     body = f"""
     <div class="container">
         {project_nav(scope)}
@@ -1997,10 +2163,14 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             </div>
             {desc_html}
             <p class="project-count">📚 {n} сущности(ей) в проекте</p>
+            {data_freshness_html(scope)}
             <p class="project-count">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}</p>
-            {('<p class="project-count">Новые сущности появятся в графе и поиске, когда статус станет зелёным.</p>' if scope.get("ingest_status") in {"indexed", "linking"} else "")}
+            {wait_hint}
         </div>
         <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Загрузить новые данные</span></a>
+        <form class="refresh-now" action="/p/{escape(slug)}/refresh" method="post">
+            <button type="submit" class="menu-btn"{refresh_disabled}><span class="icon">🔄</span><span>Обновить граф сейчас</span></button>
+        </form>
         <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск фрагментов по запросу</span></a>
         <a href="/p/{escape(slug)}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
         <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить данные</span></a>
@@ -2047,12 +2217,51 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     js = """
     const openEdit = document.getElementById('openEditModal');
     if (openEdit) openEdit.addEventListener('click', function() { openModal('editModal'); });
+    const refreshForm = document.querySelector('form.refresh-now');
+    if (refreshForm) refreshForm.addEventListener('submit', function() { showLoading('Обновление графа', 'Сверяем отслеживаемые источники'); });
     function confirmDestroy() {
         showLoading('Удаление проекта');
         document.getElementById('destroyForm').submit();
     }
     """
     return HTMLResponse(html_page(scope["name"], body, js))
+
+
+@app.post("/p/{slug}/refresh")
+async def refresh_graph_now(slug: str):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    try:
+        sources = list_watch_sources(watch_only=True, project_slug=slug)
+    except Exception as e:
+        return RedirectResponse(
+            f"/p/{slug}?msg={escape('Не удалось прочитать источники автообновления: ' + str(e))}&st=err",
+            status_code=303,
+        )
+    if not sources:
+        return RedirectResponse(
+            f"/p/{slug}?msg=Нет источников с отслеживанием изменений. Включите флажок при загрузке папки или Confluence.&st=err",
+            status_code=303,
+        )
+    with _state_lock:
+        if _ingest_jobs.get(slug, 0) > 0:
+            return RedirectResponse(f"/p/{slug}?msg=Проект уже обрабатывается&st=err", status_code=303)
+    begin_ingest(slug, "refreshing")
+
+    def work():
+        try:
+            from auto_refresh.update_changes import refresh_project
+            result = refresh_project(slug, manage_status=False)
+            ok = bool(result.get("ok"))
+            end_ingest(slug, ok=ok, message="" if ok else (result.get("message") or "Ошибка автообновления"))
+            print(f"[web_app_v2] refresh {slug}: {result.get('message')}")
+        except Exception as e:
+            print(f"[web_app_v2] refresh error: {e}")
+            end_ingest(slug, ok=False, message=str(e))
+
+    _ingest_pool.submit(work)
+    return RedirectResponse(f"/p/{slug}?msg=Запущено обновление графа&st=ok", status_code=303)
 
 
 @app.post("/p/{slug}/edit")
@@ -2596,10 +2805,12 @@ async def add_folder(
         ok_n = 0
         fail_n = 0
         total = len(files)
+        hashes = {}
         for i, path in enumerate(files, 1):
             name = Path(path).name
             fmt = _file_format_label(path)
             q.put({"type": "file_start", "name": name, "index": i, "total": total})
+            abs_path = os.path.abspath(path)
             try:
                 on_stage("read", f"Чтение {fmt}", f"«{name}»")
                 text = extract_file_text(path)
@@ -2610,11 +2821,13 @@ async def add_folder(
                         slug,
                         uid,
                         text,
-                        os.path.abspath(path),
+                        abs_path,
                         "folder",
                         f"[{name}]",
                         on_stage=on_stage,
                     )
+                    if ok:
+                        hashes[abs_path] = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
             except FileTooLargeError as e:
                 ok, ans = False, str(e)
             except Exception as e:
@@ -2625,6 +2838,11 @@ async def add_folder(
                 fail_n += 1
                 log_event(slug, f"[{name}]", "folder", ans)
             q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
+        if watch and hashes:
+            try:
+                mark_watch_synced_path(uid, "folder", abs_folder, content_hash=json.dumps(hashes, ensure_ascii=False))
+            except Exception as e:
+                print(f"[web_app_v2] folder watch hash save warning: {e}")
         q.put({"type": "done", "ok": ok_n, "fail": fail_n})
 
     return await _stream_queue_job(run)
@@ -2673,7 +2891,18 @@ async def add_confluence(
         _save_watch_source(scope, "confluence", page_url, watch)
         if on_stage:
             on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
-        return run_ingest(slug, scope["graph_id"], text, page_url, "confluence", page_url, on_stage=on_stage)
+        ok, ans = run_ingest(slug, scope["graph_id"], text, page_url, "confluence", page_url, on_stage=on_stage)
+        if ok and watch:
+            try:
+                mark_watch_synced_path(
+                    scope["graph_id"],
+                    "confluence",
+                    page_url,
+                    content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                )
+            except Exception as e:
+                print(f"[web_app_v2] confluence watch hash save warning: {e}")
+        return ok, ans
 
     if not _wants_sse(request):
         _ingest_pool.submit(work, None)
@@ -3393,4 +3622,4 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8009, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8008, reload=False)

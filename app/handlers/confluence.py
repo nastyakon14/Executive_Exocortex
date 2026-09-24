@@ -57,6 +57,28 @@ def extract_page_info_from_url(url):
         "Не удалось распознать формат ссылки Confluence. Проверьте URL."
     )
 
+def get_confluence_page_version_when(url):
+    """Дата последней правки страницы Confluence (UTC) или None."""
+    from datetime import datetime, timezone
+
+    info = extract_page_info_from_url(url)
+    if info["type"] == "id":
+        page = get_confluence().get_page_by_id(info["value"], expand="version")
+    else:
+        page = get_confluence().get_page_by_title(
+            space=info["space"], title=info["title"], expand="version"
+        )
+    if not page:
+        raise RuntimeError("Страница Confluence не найдена")
+    when = ((page.get("version") or {}).get("when") or "").strip()
+    if not when:
+        raise RuntimeError("У страницы нет даты версии")
+    dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def get_confluence_page_content(url):
     """Получает содержимое страницы по ссылке и очищает от HTML-тегов"""
     try:

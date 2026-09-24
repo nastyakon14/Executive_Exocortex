@@ -80,6 +80,9 @@ def create_tables():
                 CREATE UNIQUE INDEX IF NOT EXISTS watch_sources_uniq
                 ON watch_sources (graph_id, source_kind, source_path)
             ''')
+            cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP')
+            cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS content_hash TEXT')
+            cursor.execute('ALTER TABLE watch_sources ADD COLUMN IF NOT EXISTS last_error TEXT')
             conn.commit()
             print('Таблицы history_messages и watch_sources готовы.')
 
@@ -114,21 +117,103 @@ def upsert_watch_source(
             conn.commit()
 
 
-def list_watch_sources(watch_only: bool = True) -> list[dict]:
-    """Список источников для будущего auto-refresh."""
+def list_watch_sources(
+    watch_only: bool = True,
+    graph_id: str | None = None,
+    project_slug: str | None = None,
+) -> list[dict]:
+    """Список источников для auto-refresh."""
     with get_connection() as conn:
         with conn.cursor() as cursor:
             sql = '''
                 SELECT id, graph_id, project_slug, source_kind, source_path,
-                       watch, extract_child, created_at, updated_at
+                       watch, extract_child, created_at, updated_at,
+                       last_synced_at, content_hash, last_error
                 FROM watch_sources
+                WHERE 1=1
             '''
+            params: list = []
             if watch_only:
-                sql += ' WHERE watch = TRUE'
+                sql += ' AND watch = TRUE'
+            if graph_id:
+                sql += ' AND graph_id = %s'
+                params.append(graph_id)
+            if project_slug:
+                sql += ' AND project_slug = %s'
+                params.append(project_slug)
             sql += ' ORDER BY updated_at DESC'
-            cursor.execute(sql)
+            cursor.execute(sql, params)
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def mark_watch_synced(
+    watch_id: int,
+    content_hash: str | None = None,
+    error: str = "",
+    synced: bool = True,
+) -> None:
+    """Пишет метку успешного синка или ошибку ночного прогона."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            if synced:
+                cursor.execute(
+                    '''
+                    UPDATE watch_sources
+                    SET last_synced_at = NOW(),
+                        content_hash = COALESCE(%s, content_hash),
+                        last_error = '',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    ''',
+                    (content_hash, watch_id),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    UPDATE watch_sources
+                    SET last_error = %s, updated_at = NOW()
+                    WHERE id = %s
+                    ''',
+                    (error or "Ошибка автообновления", watch_id),
+                )
+            conn.commit()
+
+
+def mark_watch_synced_path(
+    graph_id: str,
+    source_kind: str,
+    source_path: str,
+    content_hash: str | None = None,
+    error: str = "",
+    synced: bool = True,
+) -> None:
+    """Пишет метку синка по уникальному ключу источника."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            if synced:
+                cursor.execute(
+                    '''
+                    UPDATE watch_sources
+                    SET last_synced_at = NOW(),
+                        content_hash = COALESCE(%s, content_hash),
+                        last_error = '',
+                        updated_at = NOW()
+                    WHERE graph_id = %s AND source_kind = %s AND source_path = %s
+                    ''',
+                    (content_hash, graph_id, source_kind, source_path),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    UPDATE watch_sources
+                    SET last_error = %s, updated_at = NOW()
+                    WHERE graph_id = %s AND source_kind = %s AND source_path = %s
+                    ''',
+                    (error or "Ошибка автообновления", graph_id, source_kind, source_path),
+                )
+            conn.commit()
+
 
 def update_history_messages(user_id, message_id, message_text, message_date, message_type, bot_answer):
     """Сохраняет пару «сообщение пользователя — ответ бота» в postgres."""
