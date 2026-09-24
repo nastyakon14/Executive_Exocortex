@@ -406,6 +406,11 @@ function setHot(idx) {
   const start = adjOff[idx], end = adjOff[idx + 1];
   for (let p = start; p < end; p++) hot[adjTo[p]] = 1;
 }
+function setHotMany(ids) {
+  if (!ids || !ids.length) { hot = null; return; }
+  hot = new Uint8Array(N);
+  for (let k = 0; k < ids.length; k++) hot[ids[k]] = 2;
+}
 
 function buildIndex() {
   const cnt = new Uint32Array(N);
@@ -434,7 +439,10 @@ function buildIndex() {
     bucket.push(i);
   }
   hay = new Array(N);
-  for (let i = 0; i < N; i++) hay[i] = (META[i] && META[i][7]) || '';
+  for (let i = 0; i < N; i++) {
+    const m = META[i] || [];
+    hay[i] = ((m[7] || '') + ' ' + (L[i] || '') + ' ' + (m[2] || '') + ' ' + (m[4] || '') + ' ' + (m[5] || '')).toLowerCase();
+  }
 }
 
 function reindexNode(i, oldX, oldY) {
@@ -755,17 +763,58 @@ window.addEventListener('mousemove', function(e) {
   }
   requestDraw();
 });
-wrap.addEventListener('wheel', function(e) {
-  e.preventDefault();
-  const rect = wrap.getBoundingClientRect();
-  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+const isWin = /Windows/i.test(navigator.userAgent || '');
+let lastWheelAt = 0;
+function wheelDelta(e) {
+  let x = e.deltaX, y = e.deltaY;
+  if (e.deltaMode === 1) { x *= 16; y *= 16; }
+  if (e.deltaMode === 2) { x *= W; y *= H; }
+  return { x: x, y: y };
+}
+function applyZoomAt(mx, my, factor) {
   const beforeX = wx(mx), beforeY = wy(my);
-  const factor = e.deltaY > 0 ? 0.9 : 1.11;
   zoom = Math.max(0.03, Math.min(3.5, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
   camY = beforeY - (my - H / 2) / zoom;
   requestDraw();
+}
+function zoomByWheel(e, mx, my) {
+  const y = wheelDelta(e).y;
+  const factor = Math.max(0.86, Math.min(1.16, Math.exp(-y * 0.002)));
+  applyZoomAt(mx, my, factor);
+}
+wrap.addEventListener('wheel', function(e) {
+  e.preventDefault();
+  const rect = wrap.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const pinch = e.ctrlKey || e.metaKey;
+  if (pinch) {
+    zoomByWheel(e, mx, my);
+    return;
+  }
+  const { x, y } = wheelDelta(e);
+  const now = performance.now();
+  const gap = now - lastWheelAt;
+  lastWheelAt = now;
+  const mouseLike = e.deltaMode !== 0 || (Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 80 && gap > 35);
+  if (!isWin || mouseLike) {
+    zoomByWheel(e, mx, my);
+    return;
+  }
+  camX += x / zoom;
+  camY += y / zoom;
+  requestDraw();
 }, { passive: false });
+wrap.addEventListener('gesturestart', function(e) { e.preventDefault(); }, { passive: false });
+wrap.addEventListener('gesturechange', function(e) {
+  e.preventDefault();
+  const rect = wrap.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const factor = Math.max(0.86, Math.min(1.16, e.scale > 0 ? e.scale / (wrap._gScale || e.scale) : 1));
+  wrap._gScale = e.scale;
+  applyZoomAt(mx, my, factor);
+}, { passive: false });
+wrap.addEventListener('gestureend', function() { wrap._gScale = 0; });
 wrap.addEventListener('dblclick', function(e) {
   const rect = wrap.getBoundingClientRect();
   const i = hit(e.clientX - rect.left, e.clientY - rect.top);
@@ -775,19 +824,38 @@ wrap.addEventListener('dblclick', function(e) {
 let searchTimer = 0;
 function applySearch(raw) {
   const q = (raw || '').toLowerCase().trim();
-  if (!q) { visMask = null; requestDraw(); return; }
+  if (!q) {
+    visMask = null;
+    if (selected >= 0) setHot(selected);
+    else setHot(-1);
+    requestDraw();
+    return;
+  }
   visMask = new Uint8Array(N);
   const matched = [];
+  let tagHit = false;
   for (let i = 0; i < N; i++) {
     if (hay[i].indexOf(q) !== -1) {
       visMask[i] = 1;
       matched.push(i);
+      if (G[i] === 1) tagHit = true;
     }
   }
+  hot = matched.length ? new Uint8Array(N) : null;
   for (let m = 0; m < matched.length; m++) {
     const i = matched[m];
-    const start = adjOff[i], end = Math.min(adjOff[i + 1], start + 12);
-    for (let p = start; p < end; p++) visMask[adjTo[p]] = 1;
+    hot[i] = 2;
+    const start = adjOff[i], end = adjOff[i + 1];
+    for (let p = start; p < end; p++) {
+      const ni = adjTo[p];
+      visMask[ni] = 1;
+      if (hot[ni] !== 2) hot[ni] = 1;
+    }
+  }
+  if (tagHit && !tagsOn) {
+    tagsOn = true;
+    const b = document.getElementById('btn-tags');
+    if (b) b.classList.add('active');
   }
   if (matched.length === 1) {
     camX = X[matched[0]]; camY = Y[matched[0]];
@@ -890,9 +958,18 @@ def _build_html(
     graph_data: Optional[Dict[str, Any]] = None,
     user_label: str = "",
     data_url: Optional[str] = None,
+    back_url: str = "",
+    back_label: str = "← В проект",
 ) -> str:
     heading = html_escape((user_label or "").strip() or "Цифровой экзокортекс")
     data_url_js = json.dumps(data_url or "")
+    back_href = html_escape((back_url or "").strip())
+    back_text = html_escape((back_label or "← В проект").strip())
+    back_html = (
+        f'<a id="graph-back" href="{back_href}">{back_text}</a>'
+        if back_href
+        else ""
+    )
     data_b64 = ""
     total_z = total_e = total_r = 0
     if not data_url and graph_data:
@@ -914,6 +991,11 @@ def _build_html(
     padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
     border-bottom: 1px solid #334155; z-index: 10; position: relative;
   }}
+  #header-left {{ display: flex; align-items: center; gap: 14px; min-width: 0; flex: 1; }}
+  #graph-back {{
+    color: #93c5fd; text-decoration: none; font-size: 14px; white-space: nowrap; flex-shrink: 0;
+  }}
+  #graph-back:hover {{ text-decoration: underline; }}
   #header h1 {{ font-size: 20px; color: #e2e8f0; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px; }}
   #header-right {{ display: flex; align-items: center; gap: 12px; }}
   #stats {{ font-size: 13px; color: #94a3b8; display: flex; gap: 18px; }}
@@ -969,6 +1051,7 @@ def _build_html(
   body.light-theme {{ background: #f8fafc; color: #1f2937; }}
   body.light-theme #header {{ background: #ffffff; border-bottom: 1px solid #e5e7eb; }}
   body.light-theme #header h1 {{ color: #1f2937; }}
+  body.light-theme #graph-back {{ color: #2563eb; }}
   body.light-theme #stats {{ color: #6b7280; }}
   body.light-theme #stats span {{ color: #374151; }}
   body.light-theme #theme-toggle, body.light-theme #graph-controls button {{
@@ -987,18 +1070,21 @@ def _build_html(
 </head>
 <body class="light-theme">
 <div id="header">
-  <h1>{heading}</h1>
+  <div id="header-left">
+    {back_html}
+    <h1>{heading}</h1>
+  </div>
   <div id="header-right">
-    <div id="stats">Сущности: <span id="stat-z">{total_z}</span> &nbsp;|&nbsp; Теги: <span id="stat-e">{total_e}</span> &nbsp;|&nbsp; Связи: <span id="stat-r">{total_r}</span></div>
+    <div id="stats">Карточки: <span id="stat-z">{total_z}</span> &nbsp;|&nbsp; Теги: <span id="stat-e">{total_e}</span> &nbsp;|&nbsp; Связи: <span id="stat-r">{total_r}</span></div>
     <button id="theme-toggle" type="button">Темная тема</button>
   </div>
 </div>
 <div id="search-box">
-  <input type="text" id="searchInput" placeholder="🔍 Найти сущность или тег..."/>
+  <input type="text" id="searchInput" placeholder="🔍 Найти карточку или тег..."/>
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
   </div>
-  <div id="graph-hint">Зум регулируется мышкой или тачпадом. Узел можно перетащить. На большом графе теги лучше включать после приближения.</div>
+  <div id="graph-hint">Зум: колесо мыши или щипок на тачпаде. Два пальца на Windows сдвигают граф. Узел можно перетащить. На большом графе теги лучше включать после приближения.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
@@ -1007,7 +1093,7 @@ def _build_html(
 <div id="legend">
   <h3>Легенда</h3>
   <div class="leg-item"><div class="leg-dot leg-dot-thought"></div> Мысль</div>
-  <div class="leg-item"><div class="leg-dot leg-dot-entity"></div> Тег / Сущность</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-entity"></div> Тег</div>
 </div>
 <div id="detail-panel">
   <span class="close-btn" onclick="closeDetail()">&times;</span>
@@ -1022,9 +1108,17 @@ def render_graph_html(
     graph_data: Optional[Dict[str, Any]] = None,
     user_label: str = "",
     data_url: Optional[str] = None,
+    back_url: str = "",
+    back_label: str = "← В проект",
 ) -> str:
     """Собирает HTML-граф. data_url — отдельная подгрузка payload без вставки в страницу."""
-    return _build_html(graph_data, user_label=user_label, data_url=data_url)
+    return _build_html(
+        graph_data,
+        user_label=user_label,
+        data_url=data_url,
+        back_url=back_url,
+        back_label=back_label,
+    )
 
 
 def generate_graph_html(user_id: str, output_path: str | None = None) -> str:

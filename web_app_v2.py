@@ -199,7 +199,7 @@ INGEST_STATUS_LABELS = {
     "error": "Ошибка обработки",
 }
 INGEST_ACCEPTED_MSG = (
-    "Материал принят. Сущности разбиваются в фонеовом режиме "
+    "Материал принят. Карточки разбиваются в фоновом режиме. "
     "На проекте загорится зелёный статус, когда граф будет готов."
 )
 
@@ -753,15 +753,15 @@ def save_user_note(
         detail = (
             f"Фрагмент {index} из {total}"
             if total > 1
-            else "Атомизатор разбивает текст на сущности"
+            else "Атомизатор разбивает текст на карточки"
         )
-        stage("atomize", "Извлечение атомарных сущностей", detail)
+        stage("atomize", "Извлечение атомарных карточек", detail)
 
     stage("mask", "Обезличивание данных", "Конфиденциальные данные скрываются перед моделью")
     entity_map = EntityMap()
     masked_text = pii_anonymizer.mask(text, entity_map)
 
-    stage("atomize", "Извлечение атомарных сущностей", "Атомизатор разбивает текст на фрагменты")
+    stage("atomize", "Извлечение атомарных карточек", "Атомизатор разбивает текст на фрагменты")
     raw_cards = atomizer.atomize(
         text=masked_text,
         current_db_max_root_id=linker.repository.get_max_root_id(user_id),
@@ -1109,7 +1109,7 @@ body {
 .status-row.status-error { color: #ef4444; align-items: flex-start; }
 .status-row.status-error span { line-height: 1.35; }
 .project-card .status-row { margin-top: 8px; }
-.project-fresh { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.project-fresh { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .icon-edit { position: absolute; top: 12px; right: 10px; z-index: 2; width: 30px; height: 30px; border: none; background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.35; transition: opacity 0.15s, background 0.15s, color 0.15s; }
 .project-card:hover .icon-edit, .icon-edit:focus { opacity: 1; }
 .icon-edit:hover { background: var(--card2); color: var(--accent); }
@@ -1817,7 +1817,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         </div>
         <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
-        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоновом режиме. На проекте загорится зелёный кружок, когда граф будет готов.</div>
+        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоновом режиме. На проекте загорится зелёный статус, когда граф будет готов.</div>
     </div>
 </div>
 <div id="sourceModal" class="modal-overlay">
@@ -1892,7 +1892,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
             <a class="project-card-link" href="/p/{escape(slug)}">
                 <h3><span>{escape(name)}</span>{badge}</h3>
                 {desc_html}
-                <p>{n} сущности(ей) в графе</p>
+                <p>{n} карточек в графе</p>
                 {data_freshness_html(p)}
                 {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
@@ -1927,7 +1927,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
             <a class="common-card" href="/p/{COMMON_SLUG}">
                 <h2>Общий граф</h2>
                 <p>Единый слой по всем активным проектам. Здесь можно искать и смотреть связи, но нельзя добавлять или удалять данные.</p>
-                <div class="common-meta">{active_count} проектов · {total_all} сущности(ей)</div>
+                <div class="common-meta">{active_count} проектов · {total_all} карточек</div>
             </a>
             <a class="common-card contour-card" href="/contour">
                 <h2>Совместный поиск</h2>
@@ -2106,7 +2106,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
                 <p>Сводный слой знаний по активным проектам</p>
             </div>
             <div class="readonly-banner">Этот граф только для навигации и поиска. Новые данные добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
-            <div class="msg-box">Сейчас объединено {n} сущности(ей) из {len(scope["graph_ids"])} проектов.</div>
+            <div class="msg-box">Сейчас объединено {n} карточек из {len(scope["graph_ids"])} проектов.</div>
             {data_freshness_html(scope)}
             <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
             <a href="/contour" class="menu-btn"><span class="icon">🧩</span><span>Совместный поиск по выбранным проектам</span></a>
@@ -2134,7 +2134,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         else '<p class="project-desc empty">Нет описания — нажмите карандаш, чтобы добавить.</p>'
     )
     destroy_copy = (
-        f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» и все связанные сущности будут удалены.'
+        f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» и все связанные карточки будут удалены.'
         if n > 0
         else f'Это действие нельзя отменить. Проект «{escape(scope["name"])}» будет удалён.'
     )
@@ -2146,9 +2146,9 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
         watch_n = 0
     refresh_disabled = " disabled" if ingest_busy else ""
     if ingest_busy:
-        wait_hint = '<p class="project-count">Новые сущности появятся в графе и поиске, когда статус станет зелёным.</p>'
+        wait_hint = '<p class="project-count">Новые карточки появятся в графе и поиске, когда статус станет зелёным.</p>'
     elif watch_n:
-        wait_hint = f'<p class="project-count">Отслеживается источников: {watch_n}. Ночью в 02:00 (Москва) граф обновится сам — или нажмите кнопку ниже.</p>'
+        wait_hint = f'<p class="project-count">Отслеживается источников: {watch_n}. Ночью в 02:00 (Москва) граф обновится сам — или кнопкой внизу страницы.</p>'
     else:
         wait_hint = '<p class="project-count">Чтобы граф обновлялся сам, при загрузке папки или Confluence включите «Отслеживать изменения».</p>'
     body = f"""
@@ -2162,18 +2162,18 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
                 <button type="button" class="icon-edit inline" id="openEditModal" title="Редактировать" aria-label="Редактировать проект">{EDIT_ICON}</button>
             </div>
             {desc_html}
-            <p class="project-count">📚 {n} сущности(ей) в проекте</p>
+            <p class="project-count">📚 {n} карточек в проекте</p>
             {data_freshness_html(scope)}
             <p class="project-count">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}</p>
             {wait_hint}
         </div>
         <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Загрузить новые данные</span></a>
-        <form class="refresh-now" action="/p/{escape(slug)}/refresh" method="post">
-            <button type="submit" class="menu-btn"{refresh_disabled}><span class="icon">🔄</span><span>Обновить граф сейчас</span></button>
-        </form>
         <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск фрагментов по запросу</span></a>
         <a href="/p/{escape(slug)}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
         <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить данные</span></a>
+        <form class="refresh-now" action="/p/{escape(slug)}/refresh" method="post">
+            <button type="submit" class="menu-btn"{refresh_disabled}><span class="icon">🔄</span><span>Обновить граф сейчас</span></button>
+        </form>
         <div class="meta-actions">
             <form action="/p/{escape(slug)}/archive" method="post">
                 <input type="hidden" name="archived" value="{archive_action}">
@@ -2354,7 +2354,7 @@ async def project_destroy(slug: str):
         print(f"[web_app_v2] delete graph warning: {e}")
         return RedirectResponse(f"/p/{slug}?msg=Не удалось удалить граф проекта&st=err", status_code=303)
     remove_project(slug)
-    label = "пустой проект" if n == 0 else "проект и все его сущности"
+    label = "пустой проект" if n == 0 else "проект и все его карточки"
     return RedirectResponse(f"/?msg=Удалён {label}: {escape(scope['name'])}&st=ok", status_code=303)
 
 
@@ -2451,27 +2451,27 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
         text: [
             {key: 'prepare', label: 'Подготовка данных'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
+            {key: 'atomize', label: 'Извлечение атомарных карточек'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         file: [
             {key: 'read', label: 'Чтение файла'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
+            {key: 'atomize', label: 'Извлечение атомарных карточек'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         confluence: [
             {key: 'fetch', label: 'Загрузка страницы Confluence'},
             {key: 'read', label: 'Разбор содержимого'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
+            {key: 'atomize', label: 'Извлечение атомарных карточек'},
             {key: 'link', label: 'Связывание в граф'}
         ],
         folder: [
             {key: 'scan', label: 'Поиск файлов в директории'},
             {key: 'read', label: 'Чтение файла'},
             {key: 'mask', label: 'Обезличивание данных'},
-            {key: 'atomize', label: 'Извлечение атомарных сущностей'},
+            {key: 'atomize', label: 'Извлечение атомарных карточек'},
             {key: 'link', label: 'Связывание в граф'}
         ]
     };
@@ -2505,9 +2505,12 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
         showLoading(title, subtext, stages);
         if (stages && stages[0]) activateLoadingStage(stages[0].key, stages[0].label, subtext || '');
         try {
+            const fd = new FormData(form);
+            const watch = form.querySelector('input[name="watch_changes"]');
+            if (watch && watch.checked) fd.set('watch_changes', '1');
             const resp = await fetch(form.action, {
                 method: 'POST',
-                body: new FormData(form),
+                body: fd,
                 headers: { 'Accept': 'text/event-stream' }
             });
             const ct = (resp.headers.get('content-type') || '');
@@ -2576,9 +2579,12 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
         let batchTotal = 0;
         let batchIndex = 0;
         try {
+            const fd = new FormData(form);
+            const watch = form.querySelector('input[name="watch_changes"]');
+            if (watch && watch.checked) fd.set('watch_changes', '1');
             const resp = await fetch(form.action, {
                 method: 'POST',
-                body: new FormData(form),
+                body: fd,
                 headers: { 'Accept': 'text/event-stream' }
             });
             if (!resp.ok || !resp.body) {
@@ -2788,6 +2794,10 @@ async def add_folder(
     child = _form_flag(extract_child_content)
     watch = _form_flag(watch_changes)
     uid = scope["graph_id"]
+    abs_folder = os.path.abspath(os.path.expanduser((folder_path or "").strip()))
+    if abs_folder and os.path.isdir(abs_folder):
+        _save_watch_source(scope, "folder", abs_folder, watch, extract_child=child)
+        print(f"[web_app_v2] watch folder slug={slug} watch={watch} path={abs_folder}")
 
     def run(q):
         on_stage = _stage_put(q)
@@ -2880,6 +2890,9 @@ async def add_confluence(
             status_code=303,
         )
 
+    _save_watch_source(scope, "confluence", page_url, watch)
+    print(f"[web_app_v2] watch confluence slug={slug} watch={watch} url={page_url}")
+
     def work(on_stage):
         if on_stage:
             on_stage("fetch", "Загрузка страницы Confluence", "Запрашиваем содержимое")
@@ -2946,7 +2959,7 @@ async def contour_page(request: Request):
             <span class="contour-check"></span>
             <h3>{escape(item['name'])}</h3>
             <div class="desc">{desc}</div>
-            <div class="meta">{item['count']} сущности(ей)</div>
+            <div class="meta">{item['count']} карточек</div>
         </button>
         """
     if not catalog:
@@ -3216,7 +3229,7 @@ async def search_page(slug: str):
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
 
     hint = (
-        "Задайте вопрос по всем активным проектам сразу. У каждой найденной сущности будет подпись, из какого проекта она пришла."
+        "Задайте вопрос по всем активным проектам сразу. У каждой найденной карточки будет подпись, из какого проекта она пришла."
         if scope["readonly"]
         else "Задайте вопрос, и я найду релевантную информацию из графа этого проекта."
     )
@@ -3381,9 +3394,9 @@ async def api_search(slug: str, request: Request):
 
 # ========== VIEW ==========
 
-def _graph_page(request: Request, user_label: str, data_url: str):
+def _graph_page(request: Request, user_label: str, data_url: str, back_url: str = ""):
     body, headers = encode_graph_html(
-        render_graph_html(None, user_label=user_label, data_url=data_url),
+        render_graph_html(None, user_label=user_label, data_url=data_url, back_url=back_url),
         request.headers.get("accept-encoding", ""),
     )
     return Response(content=body, headers=headers)
@@ -3404,11 +3417,11 @@ async def view_page(slug: str, request: Request):
                 {project_nav(scope)}
                 <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
                 <div class="page-header"><h2>💡 Общий граф</h2></div>
-                <div class="alert alert-error">📭 Пока нет сущностей ни в одном проекте.</div>
+                <div class="alert alert-error">📭 Пока нет карточек ни в одном проекте.</div>
             </div>
             """
             return HTMLResponse(html_page("Общий граф", body))
-        return _graph_page(request, scope["name"], f"/p/{slug}/api/graph")
+        return _graph_page(request, scope["name"], f"/p/{slug}/api/graph", back_url=f"/p/{slug}")
 
     stats = linker.get_user_stats(scope["graph_id"])
     if stats["total_cards"] == 0:
@@ -3423,7 +3436,7 @@ async def view_page(slug: str, request: Request):
         """
         return HTMLResponse(html_page("База знаний", body))
 
-    return _graph_page(request, scope["name"], f"/p/{slug}/api/graph")
+    return _graph_page(request, scope["name"], f"/p/{slug}/api/graph", back_url=f"/p/{slug}")
 
 
 @app.get("/p/{slug}/api/graph")
@@ -3541,11 +3554,11 @@ async def delete_search(slug: str, q: str = Form("")):
         
         <div id="deleteModal" class="modal-overlay">
             <div class="modal-box">
-                <h3>🗑 Удалить эту сущность?</h3>
+                <h3>🗑 Удалить эту карточку?</h3>
                 <div class="card-id" id="modalCardId"></div>
                 <div class="modal-topic" id="modalTopic" style="font-weight:600;color:var(--accent);margin:8px 0;font-size:15px"></div>
                 <div class="quote" id="modalQuote"></div>
-                <p>Это действие нельзя отменить. Сущность и все связанные данные будут удалены.</p>
+                <p>Это действие нельзя отменить. Карточка и все связанные данные будут удалены.</p>
                 <div class="modal-btns">
                     <button type="button" class="cancel" onclick="hideDeleteModal()">Отмена</button>
                     <button type="button" class="confirm" onclick="confirmDelete()">Удалить</button>
@@ -3582,7 +3595,7 @@ async def delete_search(slug: str, q: str = Form("")):
     function confirmDelete() {
         if (pendingDeleteIdx !== null) {
             document.getElementById('deleteIdx').value = pendingDeleteIdx + 1;
-            showLoading('Удаление', 'Удаляем сущность из базы знаний');
+            showLoading('Удаление', 'Удаляем карточку из базы знаний');
             document.getElementById('deleteForm').submit();
         }
     }
@@ -3616,10 +3629,10 @@ async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
         return RedirectResponse(f"/p/{slug}/delete?msg=Не удалось удалить&st=err", status_code=303)
 
     stats = linker.get_user_stats(uid)
-    msg = f"🗑 Удалено [{res['luhmann_id']}]\nУдалено: {res['deleted_count']} сущности(ей)\n📚 Осталось: {stats['total_cards']}"
+    msg = f"🗑 Удалено [{res['luhmann_id']}]\nУдалено: {res['deleted_count']} карточек\n📚 Осталось: {stats['total_cards']}"
     log_event(slug, f"Удаление: {sel['content'][:50]}", "delete_query", msg)
     return RedirectResponse(f"/p/{slug}/delete?msg={escape(msg)}&st=ok", status_code=303)
 
 
 if __name__ == "__main__":
-    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8008, reload=False)
+    uvicorn.run("web_app_v2:app", host="0.0.0.0", port=8007, reload=False)

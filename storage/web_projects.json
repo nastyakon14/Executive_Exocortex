@@ -8,7 +8,9 @@
       "archived": false,
       "created_at": "2026-09-07T14:03:24.733547+00:00",
       "ingest_status": "ready",
-      "ingest_error": ""
+      "ingest_error": "",
+      "data_updated_at": "2026-09-15T14:13:58.496902+00:00",
+      "data_updated_kind": "upload"
     },
     {
       "slug": "legacy_demo",
@@ -18,7 +20,9 @@
       "archived": false,
       "created_at": "2026-09-07T14:03:24.733560+00:00",
       "ingest_status": "error",
-      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей (atomizer.atomize) --> <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>"
+      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей (atomizer.atomize) --> <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>",
+      "data_updated_at": "2026-09-10T12:53:30.193785+00:00",
+      "data_updated_kind": "upload"
     },
     {
       "slug": "test_project",
@@ -28,7 +32,9 @@
       "archived": true,
       "created_at": "2026-09-07T14:41:26.895253+00:00",
       "ingest_status": "ready",
-      "ingest_error": ""
+      "ingest_error": "",
+      "data_updated_at": "",
+      "data_updated_kind": ""
     },
     {
       "slug": "b2b_аудит",
@@ -38,7 +44,9 @@
       "archived": false,
       "created_at": "2026-09-07T14:42:05.424621+00:00",
       "ingest_status": "error",
-      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей: <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>"
+      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей: <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>",
+      "data_updated_at": "2026-09-10T13:24:39.795773+00:00",
+      "data_updated_kind": "upload"
     },
     {
       "slug": "news",
@@ -48,7 +56,9 @@
       "archived": false,
       "created_at": "2026-09-08T07:44:57.091415+00:00",
       "ingest_status": "ready",
-      "ingest_error": ""
+      "ingest_error": "",
+      "data_updated_at": "2026-09-08T07:45:15.086177+00:00",
+      "data_updated_kind": "upload"
     },
     {
       "slug": "auto-refresh",
@@ -58,7 +68,9 @@
       "archived": false,
       "ingest_status": "error",
       "created_at": "2026-09-24T09:31:34.573937+00:00",
-      "ingest_error": "Ошибка: Ошибка при извлечении атомарных мыслей: <html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>"
+      "ingest_error": "ошибок: 1",
+      "data_updated_at": "",
+      "data_updated_kind": ""
     }
   ]
 }
