@@ -1,3 +1,4 @@
+from __future__ import annotations
 def read_txt(file_path: str) -> str:
     """Читает текстовый файл, перебирая обычные кодировки."""
     last_error = None

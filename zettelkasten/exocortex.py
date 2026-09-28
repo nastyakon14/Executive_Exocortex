@@ -8,6 +8,7 @@ exocortex.py — демонстрация пайплайна zettelkasten (neo4j
 3. graphrag: вопрос → ответ из графа пользователя
 """
 
+from __future__ import annotations
 import sys
 from pathlib import Path
 

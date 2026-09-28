@@ -1,5 +1,6 @@
 """Форматирование ответов LLM для Telegram parse_mode=HTML."""
 
+from __future__ import annotations
 import re
 from html import escape
 

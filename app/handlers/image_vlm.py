@@ -1,4 +1,5 @@
 """Общая VLM-часть разбора картинок — одинакова на Windows и macOS."""
+from __future__ import annotations
 import logging
 import os
 

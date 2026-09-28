@@ -1,6 +1,7 @@
 # storage/neo4j/client.py
 # подключение к neo4j и базовые операции с cypher
 
+from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional, Any, Dict, List

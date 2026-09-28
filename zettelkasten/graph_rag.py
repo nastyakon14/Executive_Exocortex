@@ -1,6 +1,7 @@
 # graphrag — поиск и генерация ответов по графу знаний
 # изоляция по user_id: каждый пользователь ищет только в своём графе
 
+from __future__ import annotations
 import os
 import re
 import sys

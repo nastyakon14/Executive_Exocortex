@@ -1,4 +1,5 @@
 # сверка файлов в отслеживаемых директориях
+from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
@@ -71,7 +72,7 @@ def check_folder_changes(source: dict) -> dict:
     prefix = folder if folder.endswith(os.sep) else folder + os.sep
     stale = []
     try:
-        from web_app_v2 import linker
+        from web_app import linker
         stored = linker.repository.list_source_inputs(source["graph_id"], prefix=prefix)
         current = set(files)
         for src in stored:

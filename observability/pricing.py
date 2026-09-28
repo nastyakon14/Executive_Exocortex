@@ -1,5 +1,6 @@
 """USD за 1M токенов. Подправьте под фактический прайс LiteLLM/провайдера."""
 
+from __future__ import annotations
 # model -> (input_usd_per_1m, output_usd_per_1m)
 MODEL_PRICES_USD_PER_1M: dict[str, tuple[float, float]] = {
     "google/gemini-2.5-flash": (0.30, 2.50),

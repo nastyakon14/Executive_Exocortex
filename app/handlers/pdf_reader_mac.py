@@ -1,4 +1,5 @@
 """PDF на macOS: встроенный текст, иначе системный tesseract (Homebrew)."""
+from __future__ import annotations
 import os
 import re
 import shutil

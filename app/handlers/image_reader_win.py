@@ -1,4 +1,5 @@
 """Картинки на Windows: tesseract.exe с корпоративного пути, затем тот же VLM."""
+from __future__ import annotations
 import os
 import re
 import subprocess

@@ -1,6 +1,7 @@
 # repository для работы с zettel-графом в neo4j
 # изоляция по user_id: каждый пользователь видит только свой граф
 
+from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone

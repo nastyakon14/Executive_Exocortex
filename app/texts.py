@@ -1,3 +1,4 @@
+from __future__ import annotations
 main_screen_text = """
 <b>Добро пожаловать в @ExoCortexAssistant_bot</b> — цифровой экзокортекс топ-менеджера.
 

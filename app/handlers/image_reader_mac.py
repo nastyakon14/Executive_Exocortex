@@ -1,4 +1,5 @@
 """Картинки на macOS: системный tesseract, затем тот же VLM, что на Windows."""
+from __future__ import annotations
 import logging
 import os
 import re

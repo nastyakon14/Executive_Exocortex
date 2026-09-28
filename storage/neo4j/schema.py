@@ -1,6 +1,7 @@
 # схема графа: constraints, indexes, vector index
 # индексы по user_id обеспечивают изоляцию данных между пользователями
 
+from __future__ import annotations
 from storage.neo4j.client import Neo4jClient
 
 

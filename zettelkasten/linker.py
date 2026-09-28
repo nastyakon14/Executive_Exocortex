@@ -1,6 +1,7 @@
 # линкер — встраивает новые zettel-карточки в граф знаний (neo4j)
 # изоляция по user_id: у каждого пользователя свой граф
 
+from __future__ import annotations
 import os
 import sys
 import time

@@ -1,4 +1,5 @@
 """PDF на Windows: встроенный текст, иначе tesseract.exe с корпоративного пути."""
+from __future__ import annotations
 import os
 import re
 import subprocess

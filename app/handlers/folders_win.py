@@ -1,23 +1,26 @@
 """Обход папки и извлечение текста на Windows."""
+from __future__ import annotations
 import gc
 import os
 from pathlib import Path
 
 try:
     from app.handlers.txt_reader import read_txt
-    from app.handlers.pdf_reader_win import read_pdf
+    from app.handlers.pdf_reader import read_pdf
     from app.handlers.size_checker import check_size
+    from app.handlers.pptx_reader import pptx_to_pdf
+    from app.handlers.word_reader import read_word
+    from app.handlers.image_reader import process_image
+    from app.handlers.excel_reader import read_excel
 except ImportError:
     from txt_reader import read_txt
-    from pdf_reader_win import read_pdf
+    from pdf_reader import read_pdf
     from size_checker import check_size
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, **kwargs):
-        return iterable
-
+    from pptx_reader import pptx_to_pdf
+    from word_reader import read_word
+    from image_reader import process_image
+    from excel_reader import read_excel
+from tqdm import tqdm
 
 EXTRACTABLE_EXTENSIONS = (
     ".txt",
@@ -44,7 +47,8 @@ MEMORY_ERROR_MESSAGE = (
     "Не хватило памяти на обработку файла. "
     "Загрузите папку частями или возьмите меньшие файлы."
 )
-
+# пропускаем папки с названием аналитика
+EXCLUDED_FOLDER_NAMES = {"аналитика", "analytics"}
 
 class FileTooLargeError(ValueError):
     def __init__(self, message: str = TOO_LARGE_MESSAGE):
@@ -57,6 +61,7 @@ def extract_paths(root_path):
     subfolders = []
 
     for dirpath, dirs, filenames in os.walk(root_path):
+        dirs[:] = [d for d in dirs if d.lower() not in EXCLUDED_FOLDER_NAMES]
         for filename in filenames:
             full_path = os.path.abspath(os.path.join(dirpath, filename))
             all_files.append(full_path)
@@ -122,28 +127,12 @@ def extract_file_text(file_path: str) -> str:
         if ext == ".txt":
             return read_txt(file_path) or ""
         if ext in {".pptx", ".ppt"}:
-            try:
-                from app.handlers.pptx_reader_win import pptx_to_pdf
-            except ImportError:
-                from pptx_reader_win import pptx_to_pdf
             return _pdf_text(pptx_to_pdf(file_path))
         if ext in {".doc", ".docx"}:
-            try:
-                from app.handlers.word_reader_win import read_word
-            except ImportError:
-                from word_reader_win import read_word
             return _pdf_text(read_word(file_path))
         if ext in {".png", ".jpg", ".jpeg"}:
-            try:
-                from app.handlers.image_reader_win import process_image
-            except ImportError:
-                from image_reader_win import process_image
             return process_image(file_path) or ""
         if ext in EXCEL_EXTENSIONS:
-            try:
-                from app.handlers.excel_reader import read_excel
-            except ImportError:
-                from excel_reader import read_excel
             return read_excel(file_path) or ""
     except FileTooLargeError:
         raise

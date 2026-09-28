@@ -3,6 +3,7 @@
 Рисуется только видимая область — одинаково для 10 и для десятков тысяч узлов.
 """
 
+from __future__ import annotations
 import gzip
 import json
 import math

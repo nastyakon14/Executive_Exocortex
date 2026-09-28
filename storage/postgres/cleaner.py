@@ -1,3 +1,4 @@
+from __future__ import annotations
 import psycopg2
 from db_connect import get_connection, DB_CONFIG
 

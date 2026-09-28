@@ -1,3 +1,4 @@
+from __future__ import annotations
 import speech_recognition as sr
 
 def recognize_audio(file_path: str) -> str:

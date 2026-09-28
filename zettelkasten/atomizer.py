@@ -1,6 +1,7 @@
 # декомпозиция заметки на атомарные мысли (zettel-карточки)
 # метод zettelkasten: одна мысль = одна карточка
 
+from __future__ import annotations
 import os
 import uuid
 import re

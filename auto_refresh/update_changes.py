@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.handlers.confluence import get_confluence_page_content
+from app.handlers.confluence import get_confluence_page_content, is_confluence_fetch_error, page_plain_text
 from app.handlers.folders_mac import FileTooLargeError, extract_file_text
 from storage.postgres.db_connect import (
     delete_ingest_digest,
@@ -49,7 +49,7 @@ def _same_source_text(graph_id: str, source_input: str, digest: str, stored_hash
 
 
 def _drop_source(graph_id: str, source_input: str) -> None:
-    from web_app_v2 import linker
+    from web_app import linker
 
     linker.repository.delete_by_source_input(graph_id, source_input)
     try:
@@ -59,7 +59,7 @@ def _drop_source(graph_id: str, source_input: str) -> None:
 
 
 def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_text: str) -> tuple[bool, str]:
-    from web_app_v2 import _ingest_run_lock, ingest_replacing, log_event, set_ingest_phase
+    from web_app import _ingest_run_lock, ingest_replacing, log_event, set_ingest_phase
 
     with _ingest_run_lock:
         set_ingest_phase(slug, "refreshing")
@@ -83,7 +83,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     updated = skipped = failed = 0
     last_err = ""
 
-    from web_app_v2 import _ingest_run_lock
+    from web_app import _ingest_run_lock
 
     for stale in probe.get("stale") or []:
         try:
@@ -143,10 +143,87 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     return updated, skipped, failed, last_err
 
 
+def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[int, int, int, str]:
+    """Каждая дочерняя страница сверяется и встраивается отдельно, как файл в папке."""
+    graph_id = source["graph_id"]
+    hashes = folder_hashes(source.get("content_hash"))
+    raw_hash = (source.get("content_hash") or "").strip()
+    if not hashes and raw_hash and not raw_hash.startswith("{"):
+        hashes = {(source.get("source_path") or ""): raw_hash}
+
+    updated = skipped = failed = 0
+    last_err = ""
+    from web_app import _ingest_run_lock
+
+    for stale in probe.get("stale") or []:
+        try:
+            with _ingest_run_lock:
+                _drop_source(graph_id, stale)
+            hashes.pop(stale, None)
+            updated += 1
+        except Exception as e:
+            failed += 1
+            last_err = str(e)
+
+    for page in probe.get("pages") or []:
+        source_input = page.get("source_input") or ""
+        if page.get("error"):
+            hashes.pop(source_input, None)
+            failed += 1
+            last_err = page["error"]
+            continue
+        try:
+            text = page_plain_text(page["page_id"])
+            if is_confluence_fetch_error(text):
+                hashes.pop(source_input, None)
+                failed += 1
+                last_err = text.strip()
+                continue
+            digest = _text_hash(text)
+            if _same_source_text(graph_id, source_input, digest, hashes.get(source_input) or ""):
+                hashes[source_input] = digest
+                skipped += 1
+                print(f"[auto_refresh] confluence skip unchanged {source_input}")
+                continue
+            if not (text or "").strip():
+                with _ingest_run_lock:
+                    _drop_source(graph_id, source_input)
+                hashes[source_input] = digest
+                updated += 1
+                continue
+            print(f"[auto_refresh] confluence ingest {source_input}")
+            ok, ans = _ingest_source(slug, graph_id, text, source_input, f"[auto] {source_input}")
+            if ok:
+                hashes[source_input] = digest
+                updated += 1
+            else:
+                hashes.pop(source_input, None)
+                failed += 1
+                last_err = ans
+        except Exception as e:
+            hashes.pop(source_input, None)
+            failed += 1
+            last_err = str(e)
+
+    payload = json.dumps(hashes, ensure_ascii=False)
+    if failed and updated == 0 and skipped == 0:
+        mark_watch_synced(source["id"], error=last_err, synced=False)
+    else:
+        mark_watch_synced(
+            source["id"],
+            content_hash=payload,
+            error=last_err if failed else "",
+            synced=True,
+        )
+    return updated, skipped, failed, last_err
+
+
 def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, int, str]:
     if probe.get("error"):
         mark_watch_synced(source["id"], error=probe["error"], synced=False)
         return 0, 0, 1, probe["error"]
+    if probe.get("extract_child"):
+        return _apply_confluence_children(source, slug, probe)
     if not probe.get("changed"):
         mark_watch_synced(source["id"], content_hash=source.get("content_hash") or None, synced=True)
         return 0, 1, 0, ""
@@ -185,7 +262,7 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
 
 def _archived_slugs() -> set[str]:
     try:
-        from web_app_v2 import _load_projects_unlocked
+        from web_app import _load_projects_unlocked
         return {p["slug"] for p in _load_projects_unlocked() if p.get("archived") and p.get("slug")}
     except Exception:
         return set()
@@ -193,7 +270,7 @@ def _archived_slugs() -> set[str]:
 
 def refresh_project(slug: str, manage_status: bool = True) -> dict:
     """Обновляет все watch-источники одного проекта: сначала параллельная сверка, затем ingest."""
-    from web_app_v2 import begin_ingest, end_ingest
+    from web_app import begin_ingest, end_ingest
 
     sources = list_watch_sources(watch_only=True, project_slug=slug)
     if not sources:
@@ -254,7 +331,7 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
         "message": message,
     }
     if result["ok"]:
-        from web_app_v2 import touch_project_data
+        from web_app import touch_project_data
         touch_project_data(slug, "refresh")
     return result
 
