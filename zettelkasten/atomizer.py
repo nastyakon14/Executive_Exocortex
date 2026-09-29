@@ -224,6 +224,8 @@ class NoteAtomizer:
             cards = self._build_cards(all_thoughts, current_db_max_root_id)
             return self._validate_and_fix(cards)
         except Exception as e:
+            if type(e).__name__ == "IngestCancelled":
+                raise
             return (f"Ошибка при извлечении атомарных мыслей: {e}")
 
     @staticmethod

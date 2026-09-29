@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import contextvars
 import gc
 import hashlib
 import json
@@ -206,6 +207,8 @@ INGEST_STATUS_LABELS = {
     "linking": "Встраивание в граф",
     "checking": "Проверка источников",
     "refreshing": "Автообновление графа",
+    "paused": "Обработка приостановлена",
+    "pausing": "Останавливаем обработку",
     "ready": "Готов",
     "error": "Ошибка обработки",
 }
@@ -214,6 +217,255 @@ INGEST_ACCEPTED_MSG = (
     "На проекте загорится зелёный статус, когда граф будет готов."
 )
 INGEST_SKIP_MSG = "Этот материал уже есть в графе — повторная обработка не нужна."
+INGEST_CANCEL_MSG = (
+    "Загрузка отменена. Уже записанные данные сохранены, оставшиеся материалы не обрабатываются."
+)
+_active_ingest_slug: contextvars.ContextVar[str] = contextvars.ContextVar("active_ingest_slug", default="")
+_ingest_ctrl: dict[str, dict] = {}
+PROGRESS_STAGES = {
+    "text": (
+        ("prepare", "Подготовка данных"),
+        ("mask", "Обезличивание данных"),
+        ("atomize", "Извлечение атомарных карточек"),
+        ("link", "Связывание в граф"),
+    ),
+    "file": (
+        ("read", "Чтение файла"),
+        ("mask", "Обезличивание данных"),
+        ("atomize", "Извлечение атомарных карточек"),
+        ("link", "Связывание в граф"),
+    ),
+    "folder": (
+        ("scan", "Поиск файлов в директории"),
+        ("read", "Чтение файла"),
+        ("mask", "Обезличивание данных"),
+        ("atomize", "Извлечение атомарных карточек"),
+        ("link", "Связывание в граф"),
+    ),
+    "confluence": (
+        ("fetch", "Загрузка страницы Confluence"),
+        ("read", "Разбор содержимого"),
+        ("mask", "Обезличивание данных"),
+        ("atomize", "Извлечение атомарных карточек"),
+        ("link", "Связывание в граф"),
+    ),
+    "refresh": (
+        ("checking", "Проверка источников"),
+        ("refreshing", "Обновление графа"),
+    ),
+}
+_BUSY_STATUSES = {"indexed", "linking", "checking", "refreshing", "paused", "pausing"}
+
+
+class IngestCancelled(Exception):
+    """Пользователь остановил загрузку и отказался продолжать."""
+
+
+def _enter_job(slug: str, pipeline: str, title: str, *, own_job: bool = True) -> None:
+    _active_ingest_slug.set(slug)
+    open_live_progress(slug, pipeline, title, own_job=own_job)
+
+
+def _leave_job(slug: str, ok: bool, message: str = "", *, cancelled: bool = False) -> None:
+    finish_live_progress(slug, ok=ok, message=message, cancelled=cancelled)
+
+
+def open_live_progress(slug: str, pipeline: str, title: str, *, own_job: bool = True) -> None:
+    phase = "checking" if pipeline == "refresh" else "indexed"
+    if own_job:
+        begin_ingest(slug, phase)
+    run = threading.Event()
+    run.set()
+    with _state_lock:
+        _ingest_ctrl[slug] = {
+            "active": True,
+            "own_job": own_job,
+            "state": "running",
+            "pipeline": pipeline,
+            "view": pipeline,
+            "title": title,
+            "sub": "",
+            "stage_key": PROGRESS_STAGES.get(pipeline, PROGRESS_STAGES["file"])[0][0],
+            "stage_title": title,
+            "stage_sub": "",
+            "phase": phase,
+            "batch": None,
+            "message": "",
+            "run": run,
+            "cancel": threading.Event(),
+            "owner": threading.get_ident(),
+        }
+
+
+def finish_live_progress(slug: str, ok: bool, message: str = "", *, cancelled: bool = False) -> None:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        own_job = bool(ctrl and ctrl.get("own_job"))
+        if ctrl:
+            ctrl["active"] = False
+            ctrl["run"].set()
+            if cancelled:
+                ctrl["state"] = "cancelled"
+                ctrl["message"] = message or INGEST_CANCEL_MSG
+            elif ok:
+                ctrl["state"] = "done"
+                ctrl["message"] = message or "Готово"
+            else:
+                ctrl["state"] = "error"
+                ctrl["message"] = message or "Ошибка обработки"
+    if own_job:
+        end_ingest(slug, ok=ok or cancelled, message="" if (ok or cancelled) else (message or "Не удалось встроить материал в граф"))
+
+
+def note_live(slug: str, key: str, title: str, sub: str = "", batch: dict | None = None) -> None:
+    if not slug:
+        return
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl or not ctrl.get("active"):
+            return
+        pipeline = ctrl.get("pipeline") or "file"
+        if pipeline == "folder" and key in {"read", "mask", "atomize", "link"}:
+            ctrl["view"] = "file"
+        else:
+            ctrl["view"] = pipeline
+        ctrl["stage_key"] = key
+        ctrl["stage_title"] = title
+        ctrl["stage_sub"] = sub or ""
+        if ctrl.get("state") == "running":
+            ctrl["sub"] = sub or title
+        if batch is not None:
+            ctrl["batch"] = batch
+
+
+def note_batch(slug: str, index: int, total: int, name: str, completed: int | None = None) -> None:
+    done = completed if completed is not None else max(0, index - 1)
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl:
+            return
+        ctrl["batch"] = {"index": index, "total": total, "name": name, "completed": done}
+
+
+def ingest_checkpoint(slug: str | None = None) -> None:
+    """Ждёт, если загрузку поставили на паузу. При отмене прерывает оставшуюся работу."""
+    slug = slug or _active_ingest_slug.get()
+    if not slug:
+        return
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl or not ctrl.get("active"):
+            return
+        owner = ctrl.get("owner")
+        if owner is not None and owner != threading.get_ident():
+            return
+        if ctrl["cancel"].is_set():
+            raise IngestCancelled()
+        if ctrl["run"].is_set():
+            return
+        ctrl["state"] = "paused"
+        phase_back = ctrl.get("phase") or _ingest_phase.get(slug) or "linking"
+        ctrl["phase_back"] = phase_back
+    set_ingest_phase(slug, "paused")
+    while not ctrl["run"].wait(0.4):
+        if ctrl["cancel"].is_set():
+            raise IngestCancelled()
+    if ctrl["cancel"].is_set():
+        raise IngestCancelled()
+    with _state_lock:
+        if not ctrl.get("active"):
+            return
+        ctrl["state"] = "running"
+        back = ctrl.get("phase_back") or "linking"
+        if back in {"paused", "pausing"}:
+            back = "linking"
+        ctrl["phase"] = back
+    set_ingest_phase(slug, back)
+
+
+def request_pause(slug: str) -> bool:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl or not ctrl.get("active"):
+            return False
+        if ctrl.get("state") in {"paused", "pausing", "cancelled", "cancelling", "done", "error"}:
+            return ctrl.get("state") in {"paused", "pausing"}
+        ctrl["run"].clear()
+        ctrl["state"] = "pausing"
+        return True
+
+
+def request_resume(slug: str) -> bool:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl or not ctrl.get("active"):
+            return False
+        ctrl["run"].set()
+        if ctrl.get("state") in {"paused", "pausing"}:
+            ctrl["state"] = "running"
+        return True
+
+
+def request_cancel(slug: str) -> bool:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl or not ctrl.get("active"):
+            return False
+        ctrl["cancel"].set()
+        ctrl["run"].set()
+        ctrl["state"] = "cancelling"
+        return True
+
+
+def progress_payload(slug: str) -> dict:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl:
+            return {
+                "active": False,
+                "state": "idle",
+                "title": "Сейчас ничего не обрабатывается",
+                "sub": "",
+                "message": "",
+                "stages": [],
+                "batch": None,
+            }
+        view = ctrl.get("view") or ctrl.get("pipeline") or "file"
+        spec = PROGRESS_STAGES.get(view) or PROGRESS_STAGES["file"]
+        keys = [key for key, _label in spec]
+        current = ctrl.get("stage_key") or ""
+        idx = keys.index(current) if current in keys else -1
+        stages = []
+        for i, (key, label) in enumerate(spec):
+            if idx < 0:
+                status = "pending"
+            elif i < idx:
+                status = "done"
+            elif i == idx:
+                status = "current"
+            else:
+                status = "pending"
+            detail = ctrl.get("stage_sub") or "" if status == "current" else ""
+            shown = ctrl.get("stage_title") or label if status == "current" else label
+            stages.append({"key": key, "label": shown, "status": status, "detail": detail})
+        return {
+            "active": bool(ctrl.get("active")),
+            "state": ctrl.get("state") or "idle",
+            "title": ctrl.get("title") or "Обработка",
+            "sub": ctrl.get("stage_sub") or ctrl.get("sub") or "",
+            "message": ctrl.get("message") or "",
+            "stages": stages,
+            "batch": ctrl.get("batch"),
+        }
+
+
+def progress_link_html(slug: str, status: str) -> str:
+    if status not in _BUSY_STATUSES:
+        return ""
+    return (
+        f'<a class="status-open" href="/p/{escape(slug)}/progress">'
+        "Посмотреть текущий статус</a>"
+    )
 
 
 def _normalize_project(item: dict) -> dict:
@@ -496,7 +748,15 @@ def with_live_ingest(item: dict) -> dict:
     row = dict(item)
     slug = row.get("slug")
     with _state_lock:
-        if slug and _ingest_jobs.get(slug, 0) > 0:
+        ctrl = _ingest_ctrl.get(slug) if slug else None
+        if ctrl and ctrl.get("active"):
+            state = ctrl.get("state") or "running"
+            if state in {"paused", "pausing"}:
+                status, error = state, ""
+            else:
+                status = _ingest_phase.get(slug) or ctrl.get("phase") or "linking"
+                error = ""
+        elif slug and _ingest_jobs.get(slug, 0) > 0:
             status = _ingest_phase.get(slug) or "linking"
             error = ""
         elif slug and slug in _ingest_snapshot:
@@ -504,7 +764,7 @@ def with_live_ingest(item: dict) -> dict:
         else:
             status = row.get("ingest_status") or "ready"
             error = row.get("ingest_error") or ""
-            if status in {"indexed", "linking", "checking", "refreshing"}:
+            if status in {"indexed", "linking", "checking", "refreshing", "paused", "pausing"}:
                 status, error = "error", "Обработка прервана. Загрузите материал снова."
     if status not in INGEST_STATUS_LABELS:
         status = "ready"
@@ -548,8 +808,12 @@ def begin_ingest(slug: str, phase: str = "indexed") -> None:
 
 def set_ingest_phase(slug: str, phase: str) -> None:
     with _state_lock:
-        if _ingest_jobs.get(slug, 0) <= 0:
+        if _ingest_jobs.get(slug, 0) <= 0 and phase not in {"paused", "pausing"}:
             return
+        if phase in {"paused", "pausing"} and _ingest_jobs.get(slug, 0) <= 0:
+            ctrl = _ingest_ctrl.get(slug)
+            if not ctrl or not ctrl.get("active"):
+                return
         _ingest_phase[slug] = phase
         _set_ingest_snapshot(slug, phase)
         _patch_ingest_project(slug, phase)
@@ -589,7 +853,7 @@ def reset_stale_ingest_status() -> None:
                 continue
             if _ingest_jobs.get(slug, 0) > 0:
                 continue
-            if item.get("ingest_status") in {"indexed", "linking", "checking", "refreshing"}:
+            if item.get("ingest_status") in {"indexed", "linking", "checking", "refreshing", "paused", "pausing"}:
                 item["ingest_status"] = "error"
                 item["ingest_error"] = "Обработка прервана. Загрузите материал снова."
                 _set_ingest_snapshot(slug, "error", item["ingest_error"])
@@ -616,6 +880,7 @@ def run_ingest(
     log_type: str,
     log_text: str,
     on_stage=None,
+    manage_status: bool = True,
 ) -> tuple[bool, str]:
     digest = _content_digest(text) if (text or "").strip() else ""
     if digest:
@@ -635,7 +900,8 @@ def run_ingest(
         except Exception as e:
             print(f"web_app ingest digest check warning: {e}")
 
-    begin_ingest(slug, "indexed")
+    if manage_status:
+        begin_ingest(slug, "indexed")
     ok = False
     ans = ""
     try:
@@ -651,6 +917,8 @@ def run_ingest(
         log_event(slug, log_text, log_type, ans)
         print(f"web_app ingest done slug={slug} ok={ok}")
         return ok, ans
+    except IngestCancelled:
+        raise
     except Exception as e:
         ok = False
         ans = str(e)
@@ -660,7 +928,8 @@ def run_ingest(
     finally:
         if ok:
             touch_project_data(slug, "upload")
-        end_ingest(slug, ok=ok, message="" if ok else (ans or "Не удалось встроить материал в граф"))
+        if manage_status:
+            end_ingest(slug, ok=ok, message="" if ok else (ans or "Не удалось встроить материал в граф"))
 
 
 def _queue_ingest(slug: str, graph_id: str, text: str, source_input: str, log_type: str, log_text: str) -> None:
@@ -798,6 +1067,7 @@ def save_user_note(
     exclude_zettel_ids: set | None = None,
 ) -> tuple[bool, str]:
     def stage(key: str, title: str, sub: str = "") -> None:
+        ingest_checkpoint()
         if on_stage:
             on_stage(key, title, sub)
 
@@ -1191,13 +1461,27 @@ body {
 .status-dot.indexed { background: #f97316; }
 .status-dot.linking { background: #eab308; }
 .status-dot.checking, .status-dot.refreshing { background: #38bdf8; }
+.status-dot.paused, .status-dot.pausing { background: #a855f7; }
 .status-dot.error { background: #ef4444; }
-.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing { animation: status-pulse 1.2s ease-in-out infinite; }
+.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing, .status-dot.pausing { animation: status-pulse 1.2s ease-in-out infinite; }
 @keyframes status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .status-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .status-row.status-error { color: #ef4444; align-items: flex-start; }
 .status-row.status-error span { line-height: 1.35; }
 .project-card .status-row { margin-top: 8px; }
+.status-with-action { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
+.status-open { color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; }
+.status-open:hover { text-decoration: underline; }
+.project-card .status-open { display: inline-block; margin: 0 18px 14px; }
+.progress-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px 16px 16px; }
+.progress-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+.progress-note { color: var(--muted); font-size: 13px; line-height: 1.45; margin-top: 12px; }
+.loading-actions { display: none; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
+.loading-overlay.active .loading-actions { display: flex; }
+.loading-actions button { border-radius: 10px; padding: 10px 14px; font: inherit; font-size: 13px; cursor: pointer; }
+.loading-actions .pause, .progress-actions .pause { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.loading-actions .resume, .progress-actions .resume { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; font-weight: 600; }
+.loading-actions .cancel, .progress-actions .cancel { background: transparent; border: 1px solid rgba(239,68,68,0.4); color: var(--error); }
 .project-fresh { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .icon-edit { position: absolute; top: 12px; right: 10px; z-index: 2; width: 30px; height: 30px; border: none; background: transparent; color: var(--muted); border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.35; transition: opacity 0.15s, background 0.15s, color 0.15s; }
 .project-card:hover .icon-edit, .icon-edit:focus { opacity: 1; }
@@ -1417,6 +1701,7 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .loading-stages { display: none; text-align: left; margin: 18px 0 0; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
 .loading-stages.active { display: block; }
 .loading-hint { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 14px; }
+.loading-control-note { color: var(--muted); font-size: 12px; margin-top: 8px; min-height: 1em; }
 .loading-stage { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; font-size: 13px; color: var(--muted); line-height: 1.35; }
 .loading-stage + .loading-stage { border-top: 1px solid var(--border); }
 .loading-stage.current { color: var(--text); font-weight: 500; }
@@ -1665,7 +1950,66 @@ function showLoading(text, subtext, stages) {
     const sub = document.getElementById('loadingSubtext');
     if (sub) sub.textContent = subtext || '';
     renderLoadingStages(stages || []);
+    applyIngestControls('running');
     document.getElementById('loadingOverlay').classList.add('active');
+    watchIngestControls();
+}
+function ingestSlug() {
+    const m = location.pathname.match(/^\\/p\\/([^/]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+}
+function applyIngestControls(state) {
+    const pausing = state === 'pausing';
+    const paused = state === 'paused';
+    const cancelling = state === 'cancelling';
+    const busy = state === 'running' || pausing || cancelling;
+    [['loadingPause', 'loadingResume', 'loadingCancel', 'loadingControlNote'],
+     ['progressPause', 'progressResume', 'progressCancel', 'progressControlNote']].forEach(function(ids) {
+        const pause = document.getElementById(ids[0]);
+        const resume = document.getElementById(ids[1]);
+        const cancel = document.getElementById(ids[2]);
+        const note = document.getElementById(ids[3]);
+        if (pause) {
+            pause.style.display = busy ? '' : 'none';
+            pause.disabled = pausing || cancelling;
+            pause.textContent = cancelling ? 'Отменяем…' : (pausing ? 'Останавливаем…' : 'Прервать загрузку');
+        }
+        if (resume) resume.style.display = paused ? '' : 'none';
+        if (cancel) cancel.style.display = paused ? '' : 'none';
+        if (note) {
+            note.textContent = pausing
+                ? 'Текущий шаг завершится, затем обработка встанет на паузу.'
+                : (cancelling ? 'Останавливаем оставшуюся обработку.' : '');
+        }
+    });
+}
+async function postIngestControl(action) {
+    const slug = ingestSlug();
+    if (!slug) return null;
+    const resp = await fetch('/p/' + encodeURIComponent(slug) + '/progress/' + action, {method: 'POST'});
+    if (!resp.ok) return null;
+    return resp.json();
+}
+function pauseIngest() { postIngestControl('pause').then(function(data) { if (data) applyIngestControls(data.state); }); }
+function resumeIngest() { postIngestControl('resume').then(function(data) { if (data) applyIngestControls(data.state); }); }
+function cancelIngest() { postIngestControl('cancel').then(function(data) { if (data) applyIngestControls(data.state); }); }
+function watchIngestControls() {
+    if (window.__ingestWatch) return;
+    window.__ingestWatch = setInterval(async function() {
+        const overlay = document.getElementById('loadingOverlay');
+        const panel = document.getElementById('progressPanel');
+        const overlayOn = overlay && overlay.classList.contains('active');
+        if (!overlayOn && !panel) return;
+        const slug = ingestSlug();
+        if (!slug) return;
+        try {
+            const resp = await fetch('/p/' + encodeURIComponent(slug) + '/progress.json');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            applyIngestControls(data.state || 'idle');
+            if (panel && window.renderProgress) window.renderProgress(data);
+        } catch (err) {}
+    }, 1000);
 }
 function hideLoading() {
     document.getElementById('loadingOverlay').classList.remove('active');
@@ -1867,7 +2211,7 @@ document.addEventListener('keydown', function(e) {
 })();
 
 (function() {
-    if (document.querySelector('.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing')) {
+    if (document.querySelector('.status-dot.indexed, .status-dot.linking, .status-dot.checking, .status-dot.refreshing, .status-dot.paused, .status-dot.pausing')) {
         setTimeout(function() { location.reload(); }, 3000);
     }
 })();
@@ -1906,7 +2250,13 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
         </div>
         <div class="loading-stages" id="loadingStages"></div>
         <div class="loading-progress"><div class="loading-progress-bar"></div></div>
-        <div class="loading-hint" id="loadingHint">Можно закрыть страницу — обработка продолжится в фоновом режиме. На проекте загорится зелёный статус, когда граф будет готов.</div>
+        <div class="loading-actions" id="loadingActions">
+            <button type="button" class="pause" id="loadingPause" onclick="pauseIngest()">Прервать загрузку</button>
+            <button type="button" class="resume" id="loadingResume" style="display:none" onclick="resumeIngest()">Продолжить загрузку</button>
+            <button type="button" class="cancel" id="loadingCancel" style="display:none" onclick="cancelIngest()">Отменить загрузку</button>
+        </div>
+        <div class="loading-control-note" id="loadingControlNote"></div>
+        <div class="loading-hint" id="loadingHint">Страницу можно закрыть и открыть снова: в проекте, рядом со статусом, есть кнопка «Посмотреть текущий статус».</div>
     </div>
 </div>
 <div id="sourceModal" class="modal-overlay">
@@ -1985,6 +2335,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
                 {data_freshness_html(p)}
                 {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
+            {progress_link_html(slug, p.get("ingest_status") or "ready")}
         </div>
         """
     cards += """
@@ -2253,7 +2604,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             {desc_html}
             <p class="project-count">📚 {n} карточек в проекте</p>
             {data_freshness_html(scope)}
-            <p class="project-count">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}</p>
+            <p class="project-count status-with-action">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}{progress_link_html(slug, scope.get("ingest_status") or "ready")}</p>
             {wait_hint}
         </div>
         <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Загрузить новые данные</span></a>
@@ -2316,6 +2667,113 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     return HTMLResponse(html_page(scope["name"], body, js))
 
 
+@app.get("/p/{slug}/progress.json")
+async def progress_json(slug: str):
+    if not get_project(slug):
+        return JSONResponse({"active": False, "state": "idle"}, status_code=404)
+    return JSONResponse(progress_payload(slug))
+
+
+@app.post("/p/{slug}/progress/{action}")
+async def progress_control(slug: str, action: str):
+    _scope, err = _writable_scope(slug)
+    if err:
+        return JSONResponse({"ok": False, "state": "idle"}, status_code=404)
+    if action == "pause":
+        request_pause(slug)
+    elif action == "resume":
+        request_resume(slug)
+    elif action == "cancel":
+        request_cancel(slug)
+    else:
+        return JSONResponse({"ok": False}, status_code=404)
+    return JSONResponse(progress_payload(slug))
+
+
+@app.get("/p/{slug}/progress", response_class=HTMLResponse)
+async def progress_page(slug: str):
+    scope = resolve_scope(slug)
+    if not scope or scope.get("readonly"):
+        return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
+    body = f"""
+    <div class="container">
+        {project_nav(scope)}
+        <a href="/p/{escape(slug)}" class="back-link">← Закрыть и вернуться в проект</a>
+        <div class="page-header"><h2>Текущий статус</h2></div>
+        <div class="progress-panel" id="progressPanel">
+            <div class="loading-text" id="progressTitle">Загрузка статуса</div>
+            <div class="loading-subtext" id="progressSub"></div>
+            <div class="loading-file-progress active" id="progressBatch" style="display:none">
+                <div class="loading-file-meta">
+                    <span class="loading-file-count" id="progressCount"></span>
+                    <span id="progressPct"></span>
+                </div>
+                <div class="loading-file-bar"><div class="loading-file-bar-fill" id="progressFill"></div></div>
+                <div class="loading-file-name" id="progressName"></div>
+            </div>
+            <div class="loading-stages active" id="progressStages"></div>
+            <p class="progress-note" id="progressMessage"></p>
+            <div class="progress-actions">
+                <button type="button" class="pause" id="progressPause" style="display:none" onclick="pauseIngest()">Прервать загрузку</button>
+                <button type="button" class="resume" id="progressResume" style="display:none" onclick="resumeIngest()">Продолжить загрузку</button>
+                <button type="button" class="cancel" id="progressCancel" style="display:none" onclick="cancelIngest()">Отменить загрузку</button>
+            </div>
+            <p class="loading-control-note" id="progressControlNote"></p>
+        </div>
+    </div>
+    """
+    js = """
+    function esc(text) {
+        return String(text || '').replace(/[&<>"']/g, function(ch) {
+            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];
+        });
+    }
+    window.renderProgress = function(data) {
+        data = data || {};
+        const title = document.getElementById('progressTitle');
+        const sub = document.getElementById('progressSub');
+        const msg = document.getElementById('progressMessage');
+        if (title) title.textContent = data.title || 'Сейчас ничего не обрабатывается';
+        if (sub) sub.textContent = data.sub || '';
+        if (msg) msg.textContent = data.message || '';
+        const stages = document.getElementById('progressStages');
+        if (stages) {
+            const rows = data.stages || [];
+            stages.innerHTML = rows.map(function(s) {
+                return '<div class="loading-stage ' + esc(s.status || 'pending') + '">'
+                    + '<span class="loading-stage-mark"></span>'
+                    + '<span class="loading-stage-copy"><span class="loading-stage-label">' + esc(s.label) + '</span>'
+                    + '<span class="loading-stage-detail">' + esc(s.detail || '') + '</span></span></div>';
+            }).join('');
+            stages.classList.toggle('active', rows.length > 0);
+        }
+        const batch = data.batch;
+        const wrap = document.getElementById('progressBatch');
+        if (wrap) {
+            if (!batch || !batch.total) {
+                wrap.style.display = 'none';
+            } else {
+                wrap.style.display = '';
+                const done = batch.completed || 0;
+                const percent = Math.max(0, Math.min(100, Math.round((done / batch.total) * 100)));
+                const count = document.getElementById('progressCount');
+                const pct = document.getElementById('progressPct');
+                const fill = document.getElementById('progressFill');
+                const name = document.getElementById('progressName');
+                if (count) count.textContent = (batch.index ? ('Файл ' + batch.index + ' из ' + batch.total) : ('0 из ' + batch.total));
+                if (pct) pct.textContent = percent + '%';
+                if (fill) fill.style.width = percent + '%';
+                if (name) name.textContent = batch.name ? ('«' + batch.name + '»') : '';
+            }
+        }
+        applyIngestControls(data.state || 'idle');
+    };
+    watchIngestControls();
+    fetch('/p/' + encodeURIComponent(ingestSlug()) + '/progress.json').then(function(r) { return r.json(); }).then(window.renderProgress);
+    """
+    return HTMLResponse(html_page("Текущий статус", body, js))
+
+
 @app.post("/p/{slug}/refresh")
 async def refresh_graph_now(slug: str):
     scope, err = _writable_scope(slug)
@@ -2339,15 +2797,23 @@ async def refresh_graph_now(slug: str):
     begin_ingest(slug, "checking")
 
     def work():
+        _active_ingest_slug.set(slug)
+        open_live_progress(slug, "refresh", "Обновление графа", own_job=False)
         try:
             from auto_refresh.update_changes import refresh_project
             result = refresh_project(slug, manage_status=False)
             ok = bool(result.get("ok"))
-            end_ingest(slug, ok=ok, message="" if ok else (result.get("message") or "Ошибка автообновления"))
-            print(f"web_app refresh {slug}: {result.get('message')}")
+            message = result.get("message") or ""
+            end_ingest(slug, ok=ok, message="" if ok else (message or "Ошибка автообновления"))
+            _leave_job(slug, ok, message)
+            print(f"web_app refresh {slug}: {message}")
+        except IngestCancelled:
+            end_ingest(slug, ok=True)
+            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
         except Exception as e:
             print(f"web_app refresh error: {e}")
             end_ingest(slug, ok=False, message=str(e))
+            _leave_job(slug, False, str(e))
 
     _ingest_pool.submit(work)
     return RedirectResponse(f"/p/{slug}?msg=Запущено обновление графа&st=ok", status_code=303)
@@ -2717,8 +3183,12 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
                 } else if (data.type === 'error') {
                     appendFolderLog(data.message || 'Ошибка', 'log-err');
                 } else if (data.type === 'done') {
-                    if (batchTotal) setBatchProgress(batchTotal, batchTotal, '', batchTotal);
-                    appendFolderLog('Готово. Успешно: ' + data.ok + ', с ошибкой: ' + data.fail, data.fail ? 'log-info' : 'log-ok');
+                    if (data.cancelled) {
+                        appendFolderLog(data.message || 'Загрузка отменена', 'log-info');
+                    } else {
+                        if (batchTotal) setBatchProgress(batchTotal, batchTotal, '', batchTotal);
+                        appendFolderLog('Готово. Успешно: ' + data.ok + ', с ошибкой: ' + data.fail, data.fail ? 'log-info' : 'log-ok');
+                    }
                 }
             });
         } catch (err) {
@@ -2785,9 +3255,13 @@ async def _stream_queue_job(run_sync):
     return _sse_response(generate())
 
 
-def _stage_put(q: queue.Queue):
+def _stage_put(q: queue.Queue | None, slug: str | None = None):
     def on_stage(key: str, title: str, sub: str = "") -> None:
-        q.put({"type": "stage", "key": key, "title": title, "sub": sub})
+        if slug:
+            ingest_checkpoint(slug)
+            note_live(slug, key, title, sub)
+        if q is not None:
+            q.put({"type": "stage", "key": key, "title": title, "sub": sub})
 
     return on_stage
 
@@ -2802,17 +3276,37 @@ async def add_text(slug: str, request: Request, note_text: str = Form("")):
         return RedirectResponse(f"/p/{slug}/add?msg=Введите текст&st=err", status_code=303)
 
     def work(on_stage):
+        _enter_job(slug, "text", "Добавление новых данных")
         if on_stage:
             on_stage("prepare", "Подготовка данных", "Проверяем текст")
-        return run_ingest(slug, scope["graph_id"], text, "text", "text_artifact", text, on_stage=on_stage)
+        return run_ingest(
+            slug, scope["graph_id"], text, "text", "text_artifact", text,
+            on_stage=on_stage, manage_status=False,
+        )
 
     if not _wants_sse(request):
-        _queue_ingest(slug, scope["graph_id"], text, "text", "text_artifact", text)
+        def bg():
+            try:
+                ok, ans = work(_stage_put(None, slug))
+                _leave_job(slug, bool(ok), ans)
+            except IngestCancelled:
+                _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            except Exception as e:
+                _leave_job(slug, False, str(e))
+        _ingest_pool.submit(bg)
         return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
-        ok, ans = work(_stage_put(q))
-        q.put({"type": "result", "ok": bool(ok), "message": ans})
+        try:
+            ok, ans = work(_stage_put(q, slug))
+            _leave_job(slug, bool(ok), ans)
+            q.put({"type": "result", "ok": bool(ok), "message": ans})
+        except IngestCancelled:
+            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            q.put({"type": "result", "ok": False, "message": INGEST_CANCEL_MSG, "cancelled": True})
+        except Exception as e:
+            _leave_job(slug, False, str(e))
+            q.put({"type": "error", "message": str(e)})
 
     return await _stream_queue_job(run)
 
@@ -2840,6 +3334,7 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
         shutil.copyfileobj(file.file, f)
 
     def work(on_stage):
+        _enter_job(slug, "file", "Обработка файла")
         try:
             if on_stage:
                 on_stage("read", f"Чтение {fmt}", f"«{filename}»")
@@ -2854,7 +3349,10 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
                 ext[1:].upper(),
                 f"[{filename}]",
                 on_stage=on_stage,
+                manage_status=False,
             )
+        except IngestCancelled:
+            raise
         except FileTooLargeError as e:
             log_event(slug, f"[{filename}]", ext[1:].upper(), str(e))
             return False, str(e)
@@ -2866,12 +3364,28 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
             tmp.unlink(missing_ok=True)
 
     if not _wants_sse(request):
-        _ingest_pool.submit(work, None)
+        def bg():
+            try:
+                ok, ans = work(_stage_put(None, slug))
+                _leave_job(slug, bool(ok), ans)
+            except IngestCancelled:
+                _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            except Exception as e:
+                _leave_job(slug, False, str(e))
+        _ingest_pool.submit(bg)
         return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
-        ok, ans = work(_stage_put(q))
-        q.put({"type": "result", "ok": bool(ok), "message": ans})
+        try:
+            ok, ans = work(_stage_put(q, slug))
+            _leave_job(slug, bool(ok), ans)
+            q.put({"type": "result", "ok": bool(ok), "message": ans})
+        except IngestCancelled:
+            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            q.put({"type": "result", "ok": False, "message": INGEST_CANCEL_MSG, "cancelled": True})
+        except Exception as e:
+            _leave_job(slug, False, str(e))
+            q.put({"type": "error", "message": str(e)})
 
     return await _stream_queue_job(run)
 
@@ -2896,10 +3410,12 @@ async def add_folder(
         print(f"web_app watch folder slug={slug} watch={watch} path={abs_folder}")
 
     def run(q):
-        on_stage = _stage_put(q)
+        _enter_job(slug, "folder", "Обработка директории")
+        on_stage = _stage_put(q, slug)
         on_stage("scan", "Поиск файлов в директории", "Смотрим содержимое папки")
         files, error = list_folder_files(folder_path, extract_child_content=child)
         if error:
+            _leave_job(slug, False, error)
             q.put({"type": "error", "message": error})
             q.put({"type": "done", "ok": 0, "fail": 0})
             return
@@ -2908,53 +3424,66 @@ async def add_folder(
         _save_watch_source(scope, "folder", abs_folder, watch, extract_child=child)
 
         q.put({"type": "start", "total": len(files)})
+        note_batch(slug, 0, len(files), "", 0)
         ok_n = 0
         fail_n = 0
         total = len(files)
         hashes = {}
-        for i, path in enumerate(files, 1):
-            name = Path(path).name
-            fmt = _file_format_label(path)
-            q.put({"type": "file_start", "name": name, "index": i, "total": total})
-            abs_path = os.path.abspath(path)
-            try:
-                on_stage("read", f"Чтение {fmt}", f"«{name}»")
-                text = extract_file_text(path)
-                if not (text or "").strip():
-                    ok, ans = False, "Текст не извлечен"
-                else:
-                    ok, ans = run_ingest(
-                        slug,
-                        uid,
-                        text,
-                        abs_path,
-                        "folder",
-                        f"[{name}]",
-                        on_stage=on_stage,
-                    )
+        try:
+            for i, path in enumerate(files, 1):
+                ingest_checkpoint(slug)
+                name = Path(path).name
+                fmt = _file_format_label(path)
+                note_batch(slug, i, total, name, i - 1)
+                q.put({"type": "file_start", "name": name, "index": i, "total": total})
+                abs_path = os.path.abspath(path)
+                try:
+                    on_stage("read", f"Чтение {fmt}", f"«{name}»")
+                    text = extract_file_text(path)
+                    if not (text or "").strip():
+                        ok, ans = False, "Текст не извлечен"
+                    else:
+                        ok, ans = run_ingest(
+                            slug,
+                            uid,
+                            text,
+                            abs_path,
+                            "folder",
+                            f"[{name}]",
+                            on_stage=on_stage,
+                            manage_status=False,
+                        )
                     if ok:
                         hashes[abs_path] = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-            except FileTooLargeError as e:
-                ok, ans = False, str(e)
-            except MemoryError:
-                gc.collect()
-                ok, ans = False, "Не хватило памяти на обработку файла. Загрузите папку частями."
-            except Exception as e:
-                ok, ans = False, str(e)
-            finally:
-                gc.collect()
-            if ok:
-                ok_n += 1
-            else:
-                fail_n += 1
-                log_event(slug, f"[{name}]", "folder", ans)
-            q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
-        if watch and hashes:
-            try:
-                mark_watch_synced_path(uid, "folder", abs_folder, content_hash=json.dumps(hashes, ensure_ascii=False))
-            except Exception as e:
-                print(f"web_app folder watch hash save warning: {e}")
-        q.put({"type": "done", "ok": ok_n, "fail": fail_n})
+                except IngestCancelled:
+                    raise
+                except FileTooLargeError as e:
+                    ok, ans = False, str(e)
+                except MemoryError:
+                    gc.collect()
+                    ok, ans = False, "Не хватило памяти на обработку файла. Загрузите папку частями."
+                except Exception as e:
+                    ok, ans = False, str(e)
+                finally:
+                    gc.collect()
+                if ok:
+                    ok_n += 1
+                else:
+                    fail_n += 1
+                    log_event(slug, f"[{name}]", "folder", ans)
+                note_batch(slug, i, total, name, i)
+                q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
+            if watch and hashes:
+                try:
+                    mark_watch_synced_path(uid, "folder", abs_folder, content_hash=json.dumps(hashes, ensure_ascii=False))
+                except Exception as e:
+                    print(f"web_app folder watch hash save warning: {e}")
+            message = f"Готово. Успешно: {ok_n}, с ошибкой: {fail_n}"
+            _leave_job(slug, fail_n == 0, message)
+            q.put({"type": "done", "ok": ok_n, "fail": fail_n})
+        except IngestCancelled:
+            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            q.put({"type": "done", "ok": ok_n, "fail": fail_n, "cancelled": True, "message": INGEST_CANCEL_MSG})
 
     return await _stream_queue_job(run)
 
@@ -2991,6 +3520,7 @@ async def add_confluence(
     print(f"web_app watch confluence slug={slug} watch={watch} child={child} url={page_url}")
 
     def work(on_stage):
+        _enter_job(slug, "confluence", "Загрузка Confluence")
         if not child:
             if on_stage:
                 on_stage("fetch", "Загрузка страницы Confluence", "Запрашиваем содержимое")
@@ -3002,7 +3532,10 @@ async def add_confluence(
             _save_watch_source(scope, "confluence", page_url, watch, extract_child=False)
             if on_stage:
                 on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
-            ok, ans = run_ingest(slug, scope["graph_id"], text, page_url, "confluence", page_url, on_stage=on_stage)
+            ok, ans = run_ingest(
+                slug, scope["graph_id"], text, page_url, "confluence", page_url,
+                on_stage=on_stage, manage_status=False,
+            )
             if ok and watch:
                 try:
                     mark_watch_synced_path(
@@ -3027,6 +3560,8 @@ async def add_confluence(
         total = len(pages)
         last_err = ""
         for index, page in enumerate(pages, 1):
+            ingest_checkpoint(slug)
+            note_batch(slug, index, total, page.get("title") or page["source_input"], index - 1)
             source_input = page["source_input"]
             label = "основная страница" if page.get("is_parent") else f"дочерняя страница {index - 1}"
             if on_stage:
@@ -3045,6 +3580,7 @@ async def add_confluence(
                 "confluence",
                 source_input,
                 on_stage=on_stage,
+                manage_status=False,
             )
             if ok:
                 ok_n += 1
@@ -3070,12 +3606,28 @@ async def add_confluence(
         return fail_n == 0, message
 
     if not _wants_sse(request):
-        _ingest_pool.submit(work, None)
+        def bg():
+            try:
+                ok, ans = work(_stage_put(None, slug))
+                _leave_job(slug, bool(ok), ans)
+            except IngestCancelled:
+                _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            except Exception as e:
+                _leave_job(slug, False, str(e))
+        _ingest_pool.submit(bg)
         return RedirectResponse(f"/p/{slug}/add?msg={escape(INGEST_ACCEPTED_MSG)}&st=ok", status_code=303)
 
     def run(q):
-        ok, ans = work(_stage_put(q))
-        q.put({"type": "result", "ok": bool(ok), "message": ans})
+        try:
+            ok, ans = work(_stage_put(q, slug))
+            _leave_job(slug, bool(ok), ans)
+            q.put({"type": "result", "ok": bool(ok), "message": ans})
+        except IngestCancelled:
+            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+            q.put({"type": "result", "ok": False, "message": INGEST_CANCEL_MSG, "cancelled": True})
+        except Exception as e:
+            _leave_job(slug, False, str(e))
+            q.put({"type": "error", "message": str(e)})
 
     return await _stream_queue_job(run)
 

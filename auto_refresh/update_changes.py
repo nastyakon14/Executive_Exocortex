@@ -73,6 +73,13 @@ def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_t
     return ok, ans
 
 
+def _guard_ingest(slug: str, detail: str = "") -> None:
+    from web_app import ingest_checkpoint, note_live
+    ingest_checkpoint(slug)
+    if detail:
+        note_live(slug, "refreshing", "Автообновление графа", detail)
+
+
 def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, str]:
     if probe.get("error"):
         mark_watch_synced(source["id"], error=probe["error"], synced=False)
@@ -98,6 +105,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 
     for path in probe.get("files") or []:
         try:
+            _guard_ingest(slug, os.path.basename(path))
             text = extract_file_text(path)
             digest = _text_hash(text)
             if _same_source_text(graph_id, path, digest, hashes.get(path) or ""):
@@ -126,6 +134,8 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             failed += 1
             last_err = str(e)
         except Exception as e:
+            if type(e).__name__ == "IngestCancelled":
+                raise
             hashes.pop(path, None)
             failed += 1
             last_err = str(e)
@@ -166,6 +176,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
             last_err = str(e)
 
     for page in probe.get("pages") or []:
+        _guard_ingest(slug, str(page.get("title") or page.get("id") or ""))
         source_input = page.get("source_input") or ""
         if page.get("error"):
             hashes.pop(source_input, None)
@@ -201,6 +212,8 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
                 failed += 1
                 last_err = ans
         except Exception as e:
+            if type(e).__name__ == "IngestCancelled":
+                raise
             hashes.pop(source_input, None)
             failed += 1
             last_err = str(e)
@@ -298,6 +311,7 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                     probes[src["id"]] = (kind, src, {"error": str(e), "changed": False, "files": [], "stale": []})
 
         for kind, src, probe in probes.values():
+            _guard_ingest(slug, src.get("source_path") or src.get("source_kind") or "")
             if kind == "folder":
                 u, s, f, err = _apply_folder(src, slug, probe)
             else:
@@ -308,6 +322,8 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
             if err:
                 errors.append(err)
     except Exception as e:
+        if type(e).__name__ == "IngestCancelled":
+            raise
         failed += 1
         errors.append(str(e))
     finally:
