@@ -2,7 +2,6 @@
 Интерактивный граф знаний: Canvas 2D, без vis.js.
 Рисуется только видимая область — одинаково для 10 и для десятков тысяч узлов.
 """
-
 from __future__ import annotations
 import gzip
 import json
@@ -165,11 +164,11 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     return pos
 
 
-def _short_text(content: str, max_len: int) -> str:
-    text = " ".join((content or "").split())
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1] + "…"
+    def _short_text(content: str, max_len: int) -> str:
+        text = " ".join((content or "").split())
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1] + "…"
 
 
 def _node_label(text: str) -> str:
@@ -185,15 +184,15 @@ def _node_label(text: str) -> str:
 
 
 def _thought_size(depth: int) -> int:
-    if depth <= 0:
-        return 62
-    if depth == 1:
-        return 48
-    if depth == 2:
-        return 34
-    if depth == 3:
-        return 28
-    return 24
+        if depth <= 0:
+            return 62
+        if depth == 1:
+            return 48
+        if depth == 2:
+            return 34
+        if depth == 3:
+            return 28
+        return 24
 
 
 def _label_len(depth: int) -> int:

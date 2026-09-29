@@ -35,6 +35,37 @@ def invoke_structured(structured_llm, messages):
     return structured_llm.invoke(messages)
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _shield_uuids(text: str) -> tuple[str, dict[str, str]]:
+    """Прячет UUID до анонимайзера: тот режет группы цифр внутри id как номер карты."""
+    order: list[str] = []
+
+    def repl(match: re.Match) -> str:
+        raw = match.group(0)
+        if raw not in order:
+            order.append(raw)
+        return f"[ZETTEL_{order.index(raw) + 1}]"
+
+    shielded = _UUID_RE.sub(repl, text)
+    return shielded, {f"[ZETTEL_{i + 1}]": raw for i, raw in enumerate(order)}
+
+
+def _restore_zettel_id(value: Optional[str], mapping: dict[str, str]) -> Optional[str]:
+    if not value:
+        return value
+    token = value.strip().strip("\"'")
+    if token in mapping:
+        return mapping[token]
+    wrapped = token if token.startswith("[") else f"[{token}]"
+    if not wrapped.endswith("]"):
+        wrapped = f"{wrapped}]"
+    return mapping.get(wrapped, token)
+
+
 def make_chat_openai(model_name, temperature):
     return ChatOpenAI(
         model=model_name,
@@ -367,6 +398,16 @@ class GraphLinker:
             return self._apply_new_root(
                 user_id, card, embedding, "Старая версия этого источника не используется как цель", len(candidates)
             )
+        known_ids = {ctx.candidate.zettel_id for ctx in contexts}
+        if decision.action in (LinkAction.CHILD_OF, LinkAction.UPDATE_OF):
+            if not decision.target_zettel_id or decision.target_zettel_id not in known_ids:
+                return self._apply_new_root(
+                    user_id,
+                    card,
+                    embedding,
+                    "Модель указала карточку, которой нет среди кандидатов",
+                    len(candidates),
+                )
         if decision.action == LinkAction.NEW_ROOT:
             return self._apply_new_root(user_id, card, embedding, decision.reasoning, len(candidates))
         elif decision.action == LinkAction.CHILD_OF:
@@ -402,6 +443,7 @@ class GraphLinker:
             content=card.content,
             candidates_text=candidates_text,
         )
+        user_prompt, id_map = _shield_uuids(user_prompt)
         if self._privacy_anonymizer:
             from zettelkasten.anonymizer import EntityMap
             user_prompt = self._privacy_anonymizer.mask(user_prompt, EntityMap())
@@ -410,7 +452,9 @@ class GraphLinker:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
         ]
-        return invoke_structured(self.structured_llm, messages)
+        decision = invoke_structured(self.structured_llm, messages)
+        decision.target_zettel_id = _restore_zettel_id(decision.target_zettel_id, id_map)
+        return decision
     
     def _apply_new_root(
         self,
@@ -518,22 +562,15 @@ class GraphLinker:
         )
         
         if not updated_node:
-            return LinkResult(
-                card=ZettelNode(
-                    zettel_id="",
-                    luhmann_id="",
-                    topic=card.topic,
-                    content=card.content,
-                    thought_type=str(card.thought_type),
-                    tags=card.tags,
-                    is_root_topic=False,
-                    source_input=card.source_input or "text",
-                    source_quote=getattr(card, "source_quote", "") or "",
-                ),
-                action=LinkAction.UPDATE_OF,
-                reasoning=f"Ошибка: карточка {decision.target_zettel_id} не найдена",
-                candidates_found=candidates_found,
-                target_zettel_id=decision.target_zettel_id,
+            print(
+                f"  [Linker] Карточки {decision.target_zettel_id} уже нет в графе, сохраняю мысль отдельным корнем"
+            )
+            return self._apply_new_root(
+                user_id,
+                card,
+                embedding,
+                "Карточка для обновления уже удалена из графа",
+                candidates_found,
             )
         
         # print(f"   ✅ UPDATE_OF [{updated_node.luhmann_id}]")
