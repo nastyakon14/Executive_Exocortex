@@ -24,7 +24,7 @@ from storage.postgres.db_connect import (
 )
 
 from auto_refresh.confluence_checker import check_confluence_change
-from auto_refresh.folder_checker import check_folder_changes, folder_hashes
+from auto_refresh.folder_checker import as_utc, check_folder_changes, file_mtime_utc, folder_hashes
 
 
 _scheduler_started = False
@@ -87,6 +87,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 
     graph_id = source["graph_id"]
     hashes = folder_hashes(source.get("content_hash"))
+    synced = as_utc(source.get("last_synced_at"))
     updated = skipped = failed = 0
     last_err = ""
 
@@ -105,6 +106,14 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 
     for path in probe.get("files") or []:
         try:
+            if synced is not None:
+                try:
+                    if file_mtime_utc(path) <= synced:
+                        skipped += 1
+                        print(f"[auto_refresh] folder skip by date {os.path.basename(path)}")
+                        continue
+                except OSError:
+                    continue
             _guard_ingest(slug, os.path.basename(path))
             text = extract_file_text(path)
             digest = _text_hash(text)
