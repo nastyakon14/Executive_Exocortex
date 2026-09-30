@@ -58,6 +58,35 @@ def folder_hashes(raw) -> dict:
     return parse_watch_state(raw)["files"]
 
 
+def file_meta(raw) -> tuple[str, datetime | None]:
+    """Хэш и mtime прошлой успешной сверки. Старый формат — просто строка хэша."""
+    if isinstance(raw, dict):
+        digest = str(raw.get("hash") or "")
+        stamp = raw.get("mtime")
+        if isinstance(stamp, (int, float)):
+            return digest, datetime.fromtimestamp(float(stamp), tz=timezone.utc)
+        return digest, None
+    if isinstance(raw, str):
+        return raw, None
+    return "", None
+
+
+def file_needs_extract(path: str, synced: datetime | None, pending: bool, raw_record, mtime: datetime | None = None) -> bool:
+    """
+    Файл открываем только если он новее последней сверки.
+    Уже прочитанный и не изменённый не открывается, даже если путь ещё в очереди догрузки.
+    Догрузка без хэша (файл так и не был прочитан) по-прежнему нужна.
+    """
+    if mtime is None:
+        mtime = file_mtime_utc(path)
+    digest, stored_mtime = file_meta(raw_record)
+    if stored_mtime is not None:
+        return mtime > stored_mtime
+    if synced is not None and mtime <= synced:
+        return bool(pending and not digest)
+    return True
+
+
 def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], str | None]:
     files, err = list_folder_files(folder_path, extract_child_content=bool(extract_child))
     if err and "нет поддерживаемых" in (err or ""):
@@ -69,23 +98,27 @@ def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], 
 
 def check_folder_changes(source: dict) -> dict:
     """
-    Возвращает {files, stale, error}.
-    В files попадают пути новее last_synced_at и пути из очереди догрузки.
+    Возвращает {files, unchanged, stale, error}.
+    В files только пути новее даты последней сверки.
+    Если дата обновления позже даты изменения, файл не открывается.
     Отменённые пути не попадают никогда.
-    Если даты обновления ещё нет, берётся вся папка, кроме отменённых.
+    unchanged — без изменений, их не надо читать.
     stale — source_input в графе, которых уже нет на диске.
     """
     folder = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
     extract_child = bool(source.get("extract_child"))
     files, err = list_watch_files(folder, extract_child)
     if err:
-        return {"files": [], "stale": [], "error": err}
+        return {"files": [], "unchanged": [], "stale": [], "error": err}
 
     synced = as_utc(source.get("last_synced_at"))
     state = parse_watch_state(source.get("content_hash"))
     pending = set(state["pending"])
     excluded = set(state["excluded"])
+    records = state["files"]
     changed = []
+    unchanged = []
+    synced_label = synced.isoformat() if synced else "none"
     for path in files:
         if path in excluded:
             continue
@@ -93,8 +126,13 @@ def check_folder_changes(source: dict) -> dict:
             mtime = file_mtime_utc(path)
         except OSError:
             continue
-        if path in pending or synced is None or mtime > synced:
+        name = os.path.basename(path)
+        if file_needs_extract(path, synced, path in pending, records.get(path), mtime):
             changed.append(path)
+            print(f"[auto_refresh] folder changed {name} mtime={mtime.isoformat()} synced={synced_label}")
+        else:
+            unchanged.append(path)
+            print(f"[auto_refresh] folder skip by date {name} mtime={mtime.isoformat()} synced={synced_label}")
 
     prefix = folder if folder.endswith(os.sep) else folder + os.sep
     stale = []
@@ -110,4 +148,4 @@ def check_folder_changes(source: dict) -> dict:
     except Exception as e:
         print(f"[auto_refresh] stale scan warning: {e}")
 
-    return {"files": changed, "stale": stale, "error": None}
+    return {"files": changed, "unchanged": unchanged, "stale": stale, "error": None}

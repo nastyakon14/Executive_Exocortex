@@ -28,7 +28,9 @@ from auto_refresh.folder_checker import (
     as_utc,
     check_folder_changes,
     dump_watch_state,
+    file_meta,
     file_mtime_utc,
+    file_needs_extract,
     parse_watch_state,
 )
 
@@ -113,23 +115,34 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             failed += 1
             last_err = str(e)
 
+    for path in probe.get("unchanged") or []:
+        pending.discard(path)
+        prev, _stored = file_meta(hashes.get(path))
+        if prev:
+            try:
+                hashes[path] = {"hash": prev, "mtime": os.path.getmtime(path)}
+            except OSError:
+                pass
+        skipped += 1
+
     for path in probe.get("files") or []:
         try:
             if path in excluded:
                 continue
-            if path not in pending and synced is not None:
-                try:
-                    if file_mtime_utc(path) <= synced:
-                        skipped += 1
-                        print(f"[auto_refresh] folder skip by date {os.path.basename(path)}")
-                        continue
-                except OSError:
-                    continue
+            try:
+                mtime = file_mtime_utc(path)
+            except OSError:
+                continue
+            if not file_needs_extract(path, synced, path in pending, hashes.get(path), mtime):
+                pending.discard(path)
+                skipped += 1
+                print(f"[auto_refresh] folder skip by date {os.path.basename(path)}")
+                continue
             _guard_ingest(slug, os.path.basename(path))
             text = extract_file_text(path)
             digest = _text_hash(text)
-            if _same_source_text(graph_id, path, digest, hashes.get(path) or ""):
-                hashes[path] = digest
+            if _same_source_text(graph_id, path, digest, file_meta(hashes.get(path))[0]):
+                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 skipped += 1
                 print(f"[auto_refresh] folder skip unchanged {os.path.basename(path)}")
@@ -138,14 +151,14 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 print(f"[auto_refresh] folder drop empty {os.path.basename(path)}")
                 with _ingest_run_lock:
                     _drop_source(graph_id, path)
-                hashes[path] = digest
+                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 updated += 1
                 continue
             print(f"[auto_refresh] folder ingest {os.path.basename(path)}")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
             if ok:
-                hashes[path] = digest
+                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 updated += 1
             else:
