@@ -291,6 +291,7 @@ def open_live_progress(slug: str, pipeline: str, title: str, *, own_job: bool = 
             "phase": phase,
             "batch": None,
             "message": "",
+            "notice": "",
             "run": run,
             "cancel": threading.Event(),
             "owner": threading.get_ident(),
@@ -347,6 +348,151 @@ def note_batch(slug: str, index: int, total: int, name: str, completed: int | No
         ctrl["batch"] = {"index": index, "total": total, "name": name, "completed": done}
 
 
+def _bind_manifest(slug: str, kind: str, root: str, graph_id: str, watch: bool, items: list) -> None:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl:
+            return
+        ctrl["manifest"] = {
+            "kind": kind,
+            "root": root,
+            "graph_id": graph_id,
+            "watch": bool(watch),
+            "items": [str(item) for item in items],
+            "done": {},
+        }
+
+
+def _mark_manifest_done(slug: str, key: str, digest: str) -> None:
+    if not key or not digest:
+        return
+    with _state_lock:
+        man = (_ingest_ctrl.get(slug) or {}).get("manifest")
+        if man is not None:
+            man["done"][str(key)] = digest
+
+
+def _interrupt_notice(kind: str, cancelled: bool, watch: bool) -> str:
+    noun = "файлы" if kind == "folder" else "страницы"
+    ready = "файлы" if kind == "folder" else "страницы"
+    if not watch:
+        if cancelled:
+            return f"Загрузка отменена. В графе остаются только те {ready}, которые уже успели обработаться."
+        return f"Обработка на паузе. Остальные {noun} не догрузятся сами: нажмите «Продолжить загрузку»."
+    if cancelled:
+        return (
+            f"Отменённые {noun} больше не будут отслеживаться и не попадут в автообновление. "
+            f"Обновляться будут только те, что уже успели обработаться."
+        )
+    return (
+        f"Оставшиеся {noun} догрузятся при ночном обновлении. "
+        f"Уже обработанные будут проверены на изменения. "
+        f"Если догружать оставшиеся не нужно, нажмите «Отменить загрузку»."
+    )
+
+
+def _remember_interrupt(slug: str, cancelled: bool) -> None:
+    """Пауза оставляет хвост в очереди догрузки. Отмена исключает его из автообновления."""
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        man = (ctrl or {}).get("manifest")
+        if not man:
+            return
+        snapshot = {
+            "kind": man.get("kind") or "folder",
+            "root": man.get("root") or "",
+            "graph_id": man.get("graph_id") or "",
+            "watch": bool(man.get("watch")),
+            "items": list(man.get("items") or []),
+            "done": dict(man.get("done") or {}),
+        }
+    notice = _interrupt_notice(snapshot["kind"], cancelled, snapshot["watch"])
+    with _state_lock:
+        live = _ingest_ctrl.get(slug)
+        if live is not None:
+            live["notice"] = notice
+    if not snapshot["watch"] or not snapshot["graph_id"] or not snapshot["root"]:
+        return
+    try:
+        from auto_refresh.folder_checker import dump_watch_state, parse_watch_state
+        sources = list_watch_sources(watch_only=False, graph_id=snapshot["graph_id"])
+        current = next(
+            (
+                row for row in sources
+                if row.get("source_kind") == snapshot["kind"] and row.get("source_path") == snapshot["root"]
+            ),
+            None,
+        )
+        state = parse_watch_state(current.get("content_hash") if current else "")
+        done = snapshot["done"]
+        batch = set(snapshot["items"])
+        rest = [item for item in snapshot["items"] if item not in done]
+        files = dict(state["files"])
+        files.update(done)
+        if cancelled:
+            excluded = [item for item in state["excluded"] if item not in done and item not in batch]
+            excluded = list(dict.fromkeys([*excluded, *rest]))
+            pending = [item for item in state["pending"] if item not in batch and item not in set(excluded)]
+        else:
+            excluded = [item for item in state["excluded"] if item not in batch]
+            pending = [item for item in state["pending"] if item not in batch and item not in set(excluded)]
+            pending = list(dict.fromkeys([*pending, *rest]))
+        mark_watch_synced_path(
+            snapshot["graph_id"],
+            snapshot["kind"],
+            snapshot["root"],
+            content_hash=dump_watch_state(files, pending, excluded),
+        )
+    except Exception as e:
+        print(f"web_app interrupt save warning: {e}")
+
+
+def _save_manifest_finished(slug: str) -> None:
+    """Успешный конец прохода снимает эти пути с очереди догрузки."""
+    with _state_lock:
+        man = (_ingest_ctrl.get(slug) or {}).get("manifest")
+        if not man or not man.get("watch"):
+            return
+        snapshot = {
+            "kind": man.get("kind") or "folder",
+            "root": man.get("root") or "",
+            "graph_id": man.get("graph_id") or "",
+            "items": list(man.get("items") or []),
+            "done": dict(man.get("done") or {}),
+        }
+    if not snapshot["graph_id"] or not snapshot["root"]:
+        return
+    try:
+        from auto_refresh.folder_checker import dump_watch_state, parse_watch_state
+        sources = list_watch_sources(watch_only=False, graph_id=snapshot["graph_id"])
+        current = next(
+            (
+                row for row in sources
+                if row.get("source_kind") == snapshot["kind"] and row.get("source_path") == snapshot["root"]
+            ),
+            None,
+        )
+        state = parse_watch_state(current.get("content_hash") if current else "")
+        files = dict(state["files"])
+        files.update(snapshot["done"])
+        item_set = set(snapshot["items"])
+        pending = [item for item in state["pending"] if item not in item_set]
+        excluded = [item for item in state["excluded"] if item not in item_set]
+        mark_watch_synced_path(
+            snapshot["graph_id"],
+            snapshot["kind"],
+            snapshot["root"],
+            content_hash=dump_watch_state(files, pending, excluded),
+        )
+    except Exception as e:
+        print(f"web_app manifest save warning: {e}")
+
+
+def _ctrl_notice(slug: str) -> str:
+    with _state_lock:
+        return str((_ingest_ctrl.get(slug) or {}).get("notice") or "")
+
+
 def ingest_checkpoint(slug: str | None = None) -> None:
     """Ждёт, если загрузку поставили на паузу. При отмене прерывает оставшуюся работу."""
     slug = slug or _active_ingest_slug.get()
@@ -360,17 +506,27 @@ def ingest_checkpoint(slug: str | None = None) -> None:
         if owner is not None and owner != threading.get_ident():
             return
         if ctrl["cancel"].is_set():
-            raise IngestCancelled()
-        if ctrl["run"].is_set():
+            remember_cancel = True
+        else:
+            remember_cancel = False
+        if remember_cancel:
+            pass
+        elif ctrl["run"].is_set():
             return
-        ctrl["state"] = "paused"
-        phase_back = ctrl.get("phase") or _ingest_phase.get(slug) or "linking"
-        ctrl["phase_back"] = phase_back
+        else:
+            ctrl["state"] = "paused"
+            phase_back = ctrl.get("phase") or _ingest_phase.get(slug) or "linking"
+            ctrl["phase_back"] = phase_back
+    if remember_cancel:
+        _remember_interrupt(slug, True)
+        raise IngestCancelled()
+    _remember_interrupt(slug, False)
     set_ingest_phase(slug, "paused")
     while not ctrl["run"].wait(0.4):
         if ctrl["cancel"].is_set():
-            raise IngestCancelled()
+            break
     if ctrl["cancel"].is_set():
+        _remember_interrupt(slug, True)
         raise IngestCancelled()
     with _state_lock:
         if not ctrl.get("active"):
@@ -401,6 +557,7 @@ def request_resume(slug: str) -> bool:
         if not ctrl or not ctrl.get("active"):
             return False
         ctrl["run"].set()
+        ctrl["notice"] = ""
         if ctrl.get("state") in {"paused", "pausing"}:
             ctrl["state"] = "running"
         return True
@@ -427,6 +584,7 @@ def progress_payload(slug: str) -> dict:
                 "title": "Сейчас ничего не обрабатывается",
                 "sub": "",
                 "message": "",
+                "notice": "",
                 "stages": [],
                 "batch": None,
             }
@@ -453,7 +611,8 @@ def progress_payload(slug: str) -> dict:
             "state": ctrl.get("state") or "idle",
             "title": ctrl.get("title") or "Обработка",
             "sub": ctrl.get("stage_sub") or ctrl.get("sub") or "",
-            "message": ctrl.get("message") or "",
+            "message": ctrl.get("notice") or ctrl.get("message") or "",
+            "notice": ctrl.get("notice") or "",
             "stages": stages,
             "batch": ctrl.get("batch"),
         }
@@ -1701,7 +1860,7 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .loading-stages { display: none; text-align: left; margin: 18px 0 0; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
 .loading-stages.active { display: block; }
 .loading-hint { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 14px; }
-.loading-control-note { color: var(--muted); font-size: 12px; margin-top: 8px; min-height: 1em; }
+.loading-control-note { color: var(--text); font-size: 13px; line-height: 1.4; margin-top: 8px; min-height: 1em; }
 .loading-stage { display: flex; align-items: flex-start; gap: 10px; padding: 7px 0; font-size: 13px; color: var(--muted); line-height: 1.35; }
 .loading-stage + .loading-stage { border-top: 1px solid var(--border); }
 .loading-stage.current { color: var(--text); font-weight: 500; }
@@ -1958,7 +2117,7 @@ function ingestSlug() {
     const m = location.pathname.match(/^\\/p\\/([^/]+)/);
     return m ? decodeURIComponent(m[1]) : '';
 }
-function applyIngestControls(state) {
+function applyIngestControls(state, notice) {
     const pausing = state === 'pausing';
     const paused = state === 'paused';
     const cancelling = state === 'cancelling';
@@ -1977,9 +2136,10 @@ function applyIngestControls(state) {
         if (resume) resume.style.display = paused ? '' : 'none';
         if (cancel) cancel.style.display = paused ? '' : 'none';
         if (note) {
-            note.textContent = pausing
-                ? 'Текущий шаг завершится, затем обработка встанет на паузу.'
-                : (cancelling ? 'Останавливаем оставшуюся обработку.' : '');
+            if (notice && (paused || state === 'cancelled')) note.textContent = notice;
+            else if (pausing) note.textContent = 'Текущий шаг завершится, затем обработка встанет на паузу.';
+            else if (cancelling) note.textContent = 'Останавливаем оставшуюся обработку.';
+            else if (!paused) note.textContent = '';
         }
     });
 }
@@ -1990,9 +2150,9 @@ async function postIngestControl(action) {
     if (!resp.ok) return null;
     return resp.json();
 }
-function pauseIngest() { postIngestControl('pause').then(function(data) { if (data) applyIngestControls(data.state); }); }
-function resumeIngest() { postIngestControl('resume').then(function(data) { if (data) applyIngestControls(data.state); }); }
-function cancelIngest() { postIngestControl('cancel').then(function(data) { if (data) applyIngestControls(data.state); }); }
+function pauseIngest() { postIngestControl('pause').then(function(data) { if (data) applyIngestControls(data.state, data.notice); }); }
+function resumeIngest() { postIngestControl('resume').then(function(data) { if (data) applyIngestControls(data.state, data.notice); }); }
+function cancelIngest() { postIngestControl('cancel').then(function(data) { if (data) applyIngestControls(data.state, data.notice); }); }
 function watchIngestControls() {
     if (window.__ingestWatch) return;
     window.__ingestWatch = setInterval(async function() {
@@ -2006,7 +2166,7 @@ function watchIngestControls() {
             const resp = await fetch('/p/' + encodeURIComponent(slug) + '/progress.json');
             if (!resp.ok) return;
             const data = await resp.json();
-            applyIngestControls(data.state || 'idle');
+            applyIngestControls(data.state || 'idle', data.notice || '');
             if (panel && window.renderProgress) window.renderProgress(data);
         } catch (err) {}
     }, 1000);
@@ -2766,7 +2926,8 @@ async def progress_page(slug: str):
                 if (name) name.textContent = batch.name ? ('«' + batch.name + '»') : '';
             }
         }
-        applyIngestControls(data.state || 'idle');
+        if (msg && data.notice) msg.textContent = data.notice;
+        applyIngestControls(data.state || 'idle', data.notice || '');
     };
     watchIngestControls();
     fetch('/p/' + encodeURIComponent(ingestSlug()) + '/progress.json').then(function(r) { return r.json(); }).then(window.renderProgress);
@@ -3428,7 +3589,14 @@ async def add_folder(
         ok_n = 0
         fail_n = 0
         total = len(files)
-        hashes = {}
+        _bind_manifest(
+            slug,
+            "folder",
+            abs_folder,
+            uid,
+            watch,
+            [os.path.abspath(path) for path in files],
+        )
         try:
             for i, path in enumerate(files, 1):
                 ingest_checkpoint(slug)
@@ -3454,7 +3622,8 @@ async def add_folder(
                             manage_status=False,
                         )
                     if ok:
-                        hashes[abs_path] = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+                        digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+                        _mark_manifest_done(slug, abs_path, digest)
                 except IngestCancelled:
                     raise
                 except FileTooLargeError as e:
@@ -3473,17 +3642,15 @@ async def add_folder(
                     log_event(slug, f"[{name}]", "folder", ans)
                 note_batch(slug, i, total, name, i)
                 q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
-            if watch and hashes:
-                try:
-                    mark_watch_synced_path(uid, "folder", abs_folder, content_hash=json.dumps(hashes, ensure_ascii=False))
-                except Exception as e:
-                    print(f"web_app folder watch hash save warning: {e}")
+            if watch:
+                _save_manifest_finished(slug)
             message = f"Готово. Успешно: {ok_n}, с ошибкой: {fail_n}"
             _leave_job(slug, fail_n == 0, message)
             q.put({"type": "done", "ok": ok_n, "fail": fail_n})
         except IngestCancelled:
-            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
-            q.put({"type": "done", "ok": ok_n, "fail": fail_n, "cancelled": True, "message": INGEST_CANCEL_MSG})
+            msg = _ctrl_notice(slug) or INGEST_CANCEL_MSG
+            _leave_job(slug, False, msg, cancelled=True)
+            q.put({"type": "done", "ok": ok_n, "fail": fail_n, "cancelled": True, "message": msg})
 
     return await _stream_queue_job(run)
 
@@ -3522,6 +3689,7 @@ async def add_confluence(
     def work(on_stage):
         _enter_job(slug, "confluence", "Загрузка Confluence")
         if not child:
+            _bind_manifest(slug, "confluence", page_url, scope["graph_id"], watch, [page_url])
             if on_stage:
                 on_stage("fetch", "Загрузка страницы Confluence", "Запрашиваем содержимое")
             text = get_confluence_page_content(page_url)
@@ -3536,16 +3704,10 @@ async def add_confluence(
                 slug, scope["graph_id"], text, page_url, "confluence", page_url,
                 on_stage=on_stage, manage_status=False,
             )
-            if ok and watch:
-                try:
-                    mark_watch_synced_path(
-                        scope["graph_id"],
-                        "confluence",
-                        page_url,
-                        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                    )
-                except Exception as e:
-                    print(f"web_app confluence watch hash save warning: {e}")
+            if ok:
+                _mark_manifest_done(slug, page_url, hashlib.sha256(text.encode("utf-8")).hexdigest())
+                if watch:
+                    _save_manifest_finished(slug)
             return ok, ans
 
         if on_stage:
@@ -3556,8 +3718,15 @@ async def add_confluence(
             return False, err_text
         _save_watch_source(scope, "confluence", page_url, watch, extract_child=True)
         ok_n = fail_n = 0
-        hashes = {}
         total = len(pages)
+        _bind_manifest(
+            slug,
+            "confluence",
+            page_url,
+            scope["graph_id"],
+            watch,
+            [page["source_input"] for page in pages],
+        )
         last_err = ""
         for index, page in enumerate(pages, 1):
             ingest_checkpoint(slug)
@@ -3584,20 +3753,13 @@ async def add_confluence(
             )
             if ok:
                 ok_n += 1
-                hashes[source_input] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                _mark_manifest_done(slug, source_input, digest)
             else:
                 fail_n += 1
                 last_err = ans
-        if watch and hashes:
-            try:
-                mark_watch_synced_path(
-                    scope["graph_id"],
-                    "confluence",
-                    page_url,
-                    content_hash=json.dumps(hashes, ensure_ascii=False),
-                )
-            except Exception as e:
-                print(f"web_app confluence watch hash save warning: {e}")
+        if watch:
+            _save_manifest_finished(slug)
         if ok_n == 0:
             return False, last_err or "Не удалось извлечь страницы Confluence"
         message = f"В граф добавлено страниц: {ok_n}"
@@ -3611,7 +3773,7 @@ async def add_confluence(
                 ok, ans = work(_stage_put(None, slug))
                 _leave_job(slug, bool(ok), ans)
             except IngestCancelled:
-                _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
+                _leave_job(slug, False, _ctrl_notice(slug) or INGEST_CANCEL_MSG, cancelled=True)
             except Exception as e:
                 _leave_job(slug, False, str(e))
         _ingest_pool.submit(bg)
@@ -3623,8 +3785,9 @@ async def add_confluence(
             _leave_job(slug, bool(ok), ans)
             q.put({"type": "result", "ok": bool(ok), "message": ans})
         except IngestCancelled:
-            _leave_job(slug, False, INGEST_CANCEL_MSG, cancelled=True)
-            q.put({"type": "result", "ok": False, "message": INGEST_CANCEL_MSG, "cancelled": True})
+            msg = _ctrl_notice(slug) or INGEST_CANCEL_MSG
+            _leave_job(slug, False, msg, cancelled=True)
+            q.put({"type": "result", "ok": False, "message": msg, "cancelled": True})
         except Exception as e:
             _leave_job(slug, False, str(e))
             q.put({"type": "error", "message": str(e)})

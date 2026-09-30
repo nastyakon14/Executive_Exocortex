@@ -8,7 +8,7 @@ from app.handlers.confluence import (
     list_confluence_pages,
 )
 
-from auto_refresh.folder_checker import as_utc, folder_hashes
+from auto_refresh.folder_checker import as_utc, folder_hashes, parse_watch_state
 
 
 def _utc(remote: datetime) -> datetime:
@@ -23,9 +23,17 @@ def _check_single_page(url: str, source: dict) -> dict:
     except Exception as e:
         return {"changed": False, "remote_mtime": None, "error": str(e), "extract_child": False}
 
+    state = parse_watch_state(source.get("content_hash"))
+    if url in set(state["excluded"]):
+        return {
+            "changed": False,
+            "remote_mtime": remote,
+            "error": None,
+            "extract_child": False,
+        }
     synced = as_utc(source.get("last_synced_at"))
-    has_hash = bool((source.get("content_hash") or "").strip())
-    if synced is None or not has_hash:
+    has_hash = bool(state["files"]) or bool((source.get("content_hash") or "").strip())
+    if url in set(state["pending"]) or synced is None or not has_hash:
         print(f"[auto_refresh] confluence needs body check {url}")
         return {
             "changed": True,
@@ -51,22 +59,27 @@ def _check_child_pages(url: str, source: dict) -> dict:
     if err:
         return {"changed": False, "error": err, "extract_child": True, "pages": [], "stale": []}
 
-    hashes = folder_hashes(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"))
+    hashes = state["files"]
     raw_hash = (source.get("content_hash") or "").strip()
     if not hashes and raw_hash and not raw_hash.startswith("{"):
         hashes = {url: raw_hash}
+    pending = set(state["pending"])
+    excluded = set(state["excluded"])
 
     synced = as_utc(source.get("last_synced_at"))
     changed_pages = []
     for page in pages:
         key = page["source_input"]
+        if key in excluded:
+            continue
         try:
             remote = _utc(get_page_version_when_by_id(page["page_id"]))
         except Exception as e:
             changed_pages.append({**page, "error": str(e)})
             continue
         newer = synced is not None and remote > synced
-        if synced is None or key not in hashes or newer:
+        if key in pending or synced is None or newer:
             changed_pages.append(page)
 
     current = {page["source_input"] for page in pages}

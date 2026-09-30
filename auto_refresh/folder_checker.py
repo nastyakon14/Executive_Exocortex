@@ -25,16 +25,37 @@ def file_mtime_utc(path: str) -> datetime:
     return datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
 
 
-def folder_hashes(raw) -> dict:
+def parse_watch_state(raw) -> dict:
+    """Хэши файлов плюс очереди: pending догружаются, excluded больше не отслеживаются."""
+    empty = {"files": {}, "pending": [], "excluded": []}
     if not raw:
-        return {}
+        return empty
     if isinstance(raw, dict):
-        return dict(raw)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+        data = raw
+    else:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return empty
+    if not isinstance(data, dict):
+        return empty
+    if any(key in data for key in ("files", "pending", "excluded")):
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        pending = [str(item) for item in (data.get("pending") or [])]
+        excluded = [str(item) for item in (data.get("excluded") or [])]
+        return {"files": dict(files), "pending": pending, "excluded": excluded}
+    return {"files": dict(data), "pending": [], "excluded": []}
+
+
+def dump_watch_state(files: dict, pending: list, excluded: list) -> str:
+    return json.dumps(
+        {"files": files, "pending": list(pending), "excluded": list(excluded)},
+        ensure_ascii=False,
+    )
+
+
+def folder_hashes(raw) -> dict:
+    return parse_watch_state(raw)["files"]
 
 
 def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], str | None]:
@@ -49,8 +70,9 @@ def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], 
 def check_folder_changes(source: dict) -> dict:
     """
     Возвращает {files, stale, error}.
-    files — только пути, изменённые позже last_synced_at.
-    Если даты обновления ещё нет, берётся вся папка: это первая сверка.
+    В files попадают пути новее last_synced_at и пути из очереди догрузки.
+    Отменённые пути не попадают никогда.
+    Если даты обновления ещё нет, берётся вся папка, кроме отменённых.
     stale — source_input в графе, которых уже нет на диске.
     """
     folder = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
@@ -60,13 +82,18 @@ def check_folder_changes(source: dict) -> dict:
         return {"files": [], "stale": [], "error": err}
 
     synced = as_utc(source.get("last_synced_at"))
+    state = parse_watch_state(source.get("content_hash"))
+    pending = set(state["pending"])
+    excluded = set(state["excluded"])
     changed = []
     for path in files:
+        if path in excluded:
+            continue
         try:
             mtime = file_mtime_utc(path)
         except OSError:
             continue
-        if synced is None or mtime > synced:
+        if path in pending or synced is None or mtime > synced:
             changed.append(path)
 
     prefix = folder if folder.endswith(os.sep) else folder + os.sep

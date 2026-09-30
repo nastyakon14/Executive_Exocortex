@@ -24,7 +24,13 @@ from storage.postgres.db_connect import (
 )
 
 from auto_refresh.confluence_checker import check_confluence_change
-from auto_refresh.folder_checker import as_utc, check_folder_changes, file_mtime_utc, folder_hashes
+from auto_refresh.folder_checker import (
+    as_utc,
+    check_folder_changes,
+    dump_watch_state,
+    file_mtime_utc,
+    parse_watch_state,
+)
 
 
 _scheduler_started = False
@@ -86,7 +92,10 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
         return 0, 0, 1, probe["error"]
 
     graph_id = source["graph_id"]
-    hashes = folder_hashes(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"))
+    hashes = dict(state["files"])
+    pending = set(state["pending"])
+    excluded = set(state["excluded"])
     synced = as_utc(source.get("last_synced_at"))
     updated = skipped = failed = 0
     last_err = ""
@@ -106,7 +115,9 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 
     for path in probe.get("files") or []:
         try:
-            if synced is not None:
+            if path in excluded:
+                continue
+            if path not in pending and synced is not None:
                 try:
                     if file_mtime_utc(path) <= synced:
                         skipped += 1
@@ -119,6 +130,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             digest = _text_hash(text)
             if _same_source_text(graph_id, path, digest, hashes.get(path) or ""):
                 hashes[path] = digest
+                pending.discard(path)
                 skipped += 1
                 print(f"[auto_refresh] folder skip unchanged {os.path.basename(path)}")
                 continue
@@ -127,12 +139,14 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 with _ingest_run_lock:
                     _drop_source(graph_id, path)
                 hashes[path] = digest
+                pending.discard(path)
                 updated += 1
                 continue
             print(f"[auto_refresh] folder ingest {os.path.basename(path)}")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
             if ok:
                 hashes[path] = digest
+                pending.discard(path)
                 updated += 1
             else:
                 hashes.pop(path, None)
@@ -149,7 +163,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             failed += 1
             last_err = str(e)
 
-    payload = json.dumps(hashes, ensure_ascii=False)
+    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded))
     if failed and updated == 0 and skipped == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
@@ -165,7 +179,10 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[int, int, int, str]:
     """Каждая дочерняя страница сверяется и встраивается отдельно, как файл в папке."""
     graph_id = source["graph_id"]
-    hashes = folder_hashes(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"))
+    hashes = dict(state["files"])
+    pending = set(state["pending"])
+    excluded = set(state["excluded"])
     raw_hash = (source.get("content_hash") or "").strip()
     if not hashes and raw_hash and not raw_hash.startswith("{"):
         hashes = {(source.get("source_path") or ""): raw_hash}
@@ -202,6 +219,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
             digest = _text_hash(text)
             if _same_source_text(graph_id, source_input, digest, hashes.get(source_input) or ""):
                 hashes[source_input] = digest
+                pending.discard(source_input)
                 skipped += 1
                 print(f"[auto_refresh] confluence skip unchanged {source_input}")
                 continue
@@ -209,12 +227,14 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
                 with _ingest_run_lock:
                     _drop_source(graph_id, source_input)
                 hashes[source_input] = digest
+                pending.discard(source_input)
                 updated += 1
                 continue
             print(f"[auto_refresh] confluence ingest {source_input}")
             ok, ans = _ingest_source(slug, graph_id, text, source_input, f"[auto] {source_input}")
             if ok:
                 hashes[source_input] = digest
+                pending.discard(source_input)
                 updated += 1
             else:
                 hashes.pop(source_input, None)
@@ -227,7 +247,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
             failed += 1
             last_err = str(e)
 
-    payload = json.dumps(hashes, ensure_ascii=False)
+    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded))
     if failed and updated == 0 and skipped == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
@@ -252,6 +272,11 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
 
     url = source["source_path"]
     graph_id = source["graph_id"]
+    state = parse_watch_state(source.get("content_hash"))
+    stored = state["files"].get(url) or ""
+    raw_hash = (source.get("content_hash") or "").strip()
+    if not stored and raw_hash and not raw_hash.startswith("{"):
+        stored = raw_hash
     text = get_confluence_page_content(url)
     if (
         not (text or "").strip()
@@ -264,9 +289,23 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         return 0, 0, 1, err
 
     digest = _text_hash(text)
-    if _same_source_text(graph_id, url, digest, source.get("content_hash") or ""):
+    files = dict(state["files"])
+    if stored and url not in files:
+        files[url] = stored
+    pending = [item for item in state["pending"] if item != url]
+    excluded = list(state["excluded"])
+
+    def _keep(page_digest: str) -> None:
+        files[url] = page_digest
+        mark_watch_synced(
+            source["id"],
+            content_hash=dump_watch_state(files, pending, [item for item in excluded if item != url]),
+            synced=True,
+        )
+
+    if _same_source_text(graph_id, url, digest, stored):
         print(f"[auto_refresh] confluence skip unchanged {url}")
-        mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        _keep(digest)
         try:
             upsert_ingest_digest(graph_id, url, digest)
         except Exception as e:
@@ -276,7 +315,7 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
     print(f"[auto_refresh] confluence ingest {url}")
     ok, ans = _ingest_source(slug, graph_id, text, url, f"[auto] {url}")
     if ok:
-        mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        _keep(digest)
         return 1, 0, 0, ""
     mark_watch_synced(source["id"], error=ans, synced=False)
     return 0, 0, 1, ans
