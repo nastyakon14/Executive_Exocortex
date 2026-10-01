@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.handlers.confluence import (
-    get_confluence_page_version_when,
-    get_page_version_when_by_id,
+    get_confluence_page_version_info,
+    get_page_version_info_by_id,
     list_confluence_pages,
 )
 
-from auto_refresh.folder_checker import as_utc, folder_hashes, parse_watch_state
+from auto_refresh.folder_checker import db_moment, format_stamp, log_date_check, parse_watch_state
 
 
 def _utc(remote: datetime) -> datetime:
@@ -19,74 +19,98 @@ def _utc(remote: datetime) -> datetime:
 
 def _check_single_page(url: str, source: dict) -> dict:
     try:
-        remote = _utc(get_confluence_page_version_when(url))
+        remote, title = get_confluence_page_version_info(url)
+        remote = _utc(remote)
     except Exception as e:
-        return {"changed": False, "remote_mtime": None, "error": str(e), "extract_child": False}
+        print(f"[auto_refresh] страница «{url}»: не удалось прочитать дату версии ({e}). пропуск.")
+        return {
+            "changed": False,
+            "remote_mtime": None,
+            "error": str(e),
+            "extract_child": False,
+            "watched": 0,
+            "title": url,
+        }
+    title = title or url
 
     state = parse_watch_state(source.get("content_hash"))
+    db_at, db_label = db_moment(source)
     if url in set(state["excluded"]):
+        print(f"[auto_refresh] страница «{title}»: отменена при загрузке. пропуск.")
         return {
             "changed": False,
             "remote_mtime": remote,
             "error": None,
             "extract_child": False,
+            "watched": 0,
+            "title": title,
         }
-    synced = as_utc(source.get("last_synced_at"))
-    has_hash = bool(state["files"]) or bool((source.get("content_hash") or "").strip())
-    if url in set(state["pending"]) or synced is None or not has_hash:
-        print(f"[auto_refresh] confluence needs body check {url}")
-        return {
-            "changed": True,
-            "remote_mtime": remote,
-            "error": None,
-            "extract_child": False,
-        }
-    changed = remote > synced
-    print(
-        f"[auto_refresh] confluence check changed={changed} "
-        f"remote={remote.isoformat()} synced={synced.isoformat()}"
-    )
+    need = db_at is None or remote > db_at
+    log_date_check("страница", title, remote, db_at, need, db_label)
     return {
-        "changed": changed,
+        "changed": need,
         "remote_mtime": remote,
         "error": None,
         "extract_child": False,
+        "watched": 1,
+        "title": title,
     }
 
 
 def _check_child_pages(url: str, source: dict) -> dict:
     pages, err = list_confluence_pages(url, extract_child=True)
     if err:
-        return {"changed": False, "error": err, "extract_child": True, "pages": [], "stale": []}
+        return {
+            "changed": False,
+            "error": err,
+            "extract_child": True,
+            "pages": [],
+            "stale": [],
+            "watched": 0,
+        }
 
     state = parse_watch_state(source.get("content_hash"))
     hashes = state["files"]
     raw_hash = (source.get("content_hash") or "").strip()
     if not hashes and raw_hash and not raw_hash.startswith("{"):
         hashes = {url: raw_hash}
-    pending = set(state["pending"])
     excluded = set(state["excluded"])
 
-    synced = as_utc(source.get("last_synced_at"))
+    db_at, db_label = db_moment(source)
+    print(
+        f"[auto_refresh] страницы Confluence «{url}»: страниц {len(pages)}, "
+        f"{db_label} {format_stamp(db_at)}"
+    )
     changed_pages = []
+    watched = 0
     for page in pages:
         key = page["source_input"]
+        title = page.get("title") or key
         if key in excluded:
+            print(f"[auto_refresh] страница «{title}»: отменена при загрузке. пропуск.")
             continue
+        watched += 1
         try:
-            remote = _utc(get_page_version_when_by_id(page["page_id"]))
+            remote, fetched = get_page_version_info_by_id(page["page_id"])
+            remote = _utc(remote)
+            if fetched:
+                title = fetched
+                page["title"] = fetched
         except Exception as e:
-            changed_pages.append({**page, "error": str(e)})
+            print(f"[auto_refresh] страница «{title}»: не удалось прочитать дату версии ({e}). пропуск.")
             continue
-        newer = synced is not None and remote > synced
-        if key in pending or synced is None or newer:
+        need = db_at is None or remote > db_at
+        log_date_check("страница", str(title), remote, db_at, need, db_label)
+        if need:
             changed_pages.append(page)
 
     current = {page["source_input"] for page in pages}
     stale = [key for key in hashes if key not in current]
+    for key in stale:
+        print(f"[auto_refresh] страница «{key}»: в Confluence больше нет. удаление из графа.")
     print(
-        f"[auto_refresh] confluence children url={url} "
-        f"pages={len(pages)} changed={len(changed_pages)} stale={len(stale)}"
+        f"[auto_refresh] страницы Confluence «{url}»: "
+        f"к обновлению {len(changed_pages)}, удалить из графа {len(stale)}"
     )
     return {
         "changed": bool(changed_pages or stale),
@@ -94,6 +118,7 @@ def _check_child_pages(url: str, source: dict) -> dict:
         "extract_child": True,
         "pages": changed_pages,
         "stale": stale,
+        "watched": watched,
     }
 
 

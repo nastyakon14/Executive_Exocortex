@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -23,6 +23,41 @@ def as_utc(value) -> datetime | None:
 
 def file_mtime_utc(path: str) -> datetime:
     return datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+
+
+def format_stamp(value: datetime | None) -> str:
+    """Дата для лога в московском времени, как её видит пользователь."""
+    if value is None:
+        return "нет"
+    moscow = timezone(timedelta(hours=3))
+    return value.astimezone(moscow).strftime("%d.%m.%Y %H:%M")
+
+
+def db_moment(source: dict) -> tuple[datetime | None, str]:
+    """Дата последней сверки в базе, а если сверки ещё не было — дата занесения источника."""
+    synced = as_utc(source.get("last_synced_at"))
+    if synced is not None:
+        return synced, "дата последнего обновления в базе"
+    return as_utc(source.get("created_at")), "дата занесения в базу"
+
+
+def log_date_check(
+    kind: str,
+    name: str,
+    changed_at: datetime | None,
+    db_at: datetime | None,
+    need: bool,
+    db_label: str = "дата последнего обновления в базе",
+) -> None:
+    decision = "обновление требуется" if need else "обновление не требуется"
+    action = "запуск обновления" if need else "пропуск"
+    change_label = "дата последнего изменения файла" if kind == "файл" else "дата последнего изменения страницы"
+    print(
+        f"[auto_refresh] {kind} «{name}»: "
+        f"{change_label} {format_stamp(changed_at)}, "
+        f"{db_label} {format_stamp(db_at)}. "
+        f"{decision}. {action}."
+    )
 
 
 def parse_watch_state(raw) -> dict:
@@ -71,20 +106,16 @@ def file_meta(raw) -> tuple[str, datetime | None]:
     return "", None
 
 
-def file_needs_extract(path: str, synced: datetime | None, pending: bool, raw_record, mtime: datetime | None = None) -> bool:
+def file_needs_extract(path: str, synced: datetime | None, mtime: datetime | None = None) -> bool:
+    """Открываем файл только если его дата изменения новее даты в базе.
+
+    В synced передаётся дата последней сверки, а если её ещё нет — дата занесения источника.
     """
-    Файл открываем только если он новее последней сверки.
-    Уже прочитанный и не изменённый не открывается, даже если путь ещё в очереди догрузки.
-    Догрузка без хэша (файл так и не был прочитан) по-прежнему нужна.
-    """
+    if synced is None:
+        return True
     if mtime is None:
         mtime = file_mtime_utc(path)
-    digest, stored_mtime = file_meta(raw_record)
-    if stored_mtime is not None:
-        return mtime > stored_mtime
-    if synced is not None and mtime <= synced:
-        return bool(pending and not digest)
-    return True
+    return mtime > synced
 
 
 def list_watch_files(folder_path: str, extract_child: bool) -> tuple[list[str], str | None]:
@@ -111,28 +142,39 @@ def check_folder_changes(source: dict) -> dict:
     if err:
         return {"files": [], "unchanged": [], "stale": [], "error": err}
 
-    synced = as_utc(source.get("last_synced_at"))
+    db_at, db_label = db_moment(source)
     state = parse_watch_state(source.get("content_hash"))
-    pending = set(state["pending"])
-    excluded = set(state["excluded"])
-    records = state["files"]
+    excluded = set()
+    for raw in state["excluded"]:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            excluded.add(os.path.abspath(os.path.expanduser(text)))
+        except Exception:
+            excluded.add(text)
     changed = []
     unchanged = []
-    synced_label = synced.isoformat() if synced else "none"
+    print(
+        f"[auto_refresh] папка «{folder}»: файлов {len(files)}, "
+        f"{db_label} {format_stamp(db_at)}"
+    )
     for path in files:
+        name = os.path.basename(path)
         if path in excluded:
+            print(f"[auto_refresh] файл «{name}»: отменён при загрузке. пропуск.")
             continue
         try:
             mtime = file_mtime_utc(path)
-        except OSError:
+        except OSError as e:
+            print(f"[auto_refresh] файл «{name}»: не удалось прочитать дату изменения ({e}). пропуск.")
             continue
-        name = os.path.basename(path)
-        if file_needs_extract(path, synced, path in pending, records.get(path), mtime):
+        need = file_needs_extract(path, db_at, mtime)
+        log_date_check("файл", name, mtime, db_at, need, db_label)
+        if need:
             changed.append(path)
-            print(f"[auto_refresh] folder changed {name} mtime={mtime.isoformat()} synced={synced_label}")
         else:
             unchanged.append(path)
-            print(f"[auto_refresh] folder skip by date {name} mtime={mtime.isoformat()} synced={synced_label}")
 
     prefix = folder if folder.endswith(os.sep) else folder + os.sep
     stale = []
@@ -145,7 +187,14 @@ def check_folder_changes(source: dict) -> dict:
             if abs_src not in current and (abs_src == folder or abs_src.startswith(prefix)):
                 if Path(abs_src).suffix.lower() in EXTRACTABLE_EXTENSIONS:
                     stale.append(abs_src)
+                    print(f"[auto_refresh] файл «{os.path.basename(abs_src)}»: на диске больше нет. удаление из графа.")
     except Exception as e:
         print(f"[auto_refresh] stale scan warning: {e}")
 
-    return {"files": changed, "unchanged": unchanged, "stale": stale, "error": None}
+    return {
+        "files": changed,
+        "unchanged": unchanged,
+        "stale": stale,
+        "error": None,
+        "watched": len(changed) + len(unchanged),
+    }

@@ -60,17 +60,9 @@ def extract_page_info_from_url(url):
     )
 
 
-def get_confluence_page_version_when(url):
-    """Дата последней правки страницы Confluence (UTC) или None."""
+def _version_stamp(page: dict) -> tuple:
     from datetime import datetime, timezone
 
-    info = extract_page_info_from_url(url)
-    if info["type"] == "id":
-        page = get_confluence().get_page_by_id(info["value"], expand="version")
-    else:
-        page = get_confluence().get_page_by_title(
-            space=info["space"], title=info["title"], expand="version"
-        )
     if not page:
         raise RuntimeError("Страница Confluence не найдена")
     when = ((page.get("version") or {}).get("when") or "").strip()
@@ -79,7 +71,25 @@ def get_confluence_page_version_when(url):
     dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    title = (page.get("title") or "").strip()
+    return dt.astimezone(timezone.utc), title
+
+
+def get_confluence_page_version_info(url: str) -> tuple:
+    """Дата последней правки и заголовок страницы."""
+    info = extract_page_info_from_url(url)
+    if info["type"] == "id":
+        page = get_confluence().get_page_by_id(info["value"], expand="version")
+    else:
+        page = get_confluence().get_page_by_title(
+            space=info["space"], title=info["title"], expand="version"
+        )
+    return _version_stamp(page)
+
+
+def get_confluence_page_version_when(url):
+    """Дата последней правки страницы Confluence (UTC) или None."""
+    return get_confluence_page_version_info(url)[0]
 
 
 def clean_text(text: str) -> str:
@@ -231,20 +241,15 @@ def resolve_page_id(url: str) -> str:
     return str(page.get("id") or "")
 
 
+def get_page_version_info_by_id(page_id: str) -> tuple:
+    """Дата последней правки и заголовок страницы по её id."""
+    page = get_confluence().get_page_by_id(str(page_id), expand="version")
+    return _version_stamp(page)
+
+
 def get_page_version_when_by_id(page_id: str):
     """Дата последней правки страницы по её id."""
-    from datetime import datetime, timezone
-
-    page = get_confluence().get_page_by_id(str(page_id), expand="version")
-    if not page:
-        raise RuntimeError("Страница Confluence не найдена")
-    when = ((page.get("version") or {}).get("when") or "").strip()
-    if not when:
-        raise RuntimeError("У страницы нет даты версии")
-    dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return get_page_version_info_by_id(page_id)[0]
 
 
 def page_plain_text(page_id: str) -> str:
@@ -319,6 +324,69 @@ def list_confluence_pages(url: str, extract_child: bool = False, max_depth: int 
                 "is_parent": False,
             })
     return pages, None
+
+
+def _direct_children(page_id: str, seen: set) -> list[dict]:
+    found = []
+    start = 0
+    limit = 50
+    while True:
+        raw = get_confluence().get_page_child_by_type(
+            page_id, type="page", start=start, limit=limit,
+        )
+        batch = _as_page_list(raw)
+        if not batch:
+            break
+        for child in batch:
+            child_id = str(child.get("id") or "")
+            if not child_id or child_id in seen:
+                continue
+            seen.add(child_id)
+            found.append({
+                "page_id": child_id,
+                "title": child.get("title") or child_id,
+            })
+        if len(batch) < limit:
+            break
+        start += limit
+    return found
+
+
+def confluence_page_tree(url: str, with_children: bool = False, max_depth: int = 5) -> tuple[dict | None, str | None]:
+    """Дерево страницы и вложений: заголовок и ссылка, без текста страницы."""
+    try:
+        page_id = resolve_page_id(url)
+        page = get_confluence().get_page_by_id(page_id, expand="version")
+    except Exception as e:
+        return None, str(e)
+    if not page_id:
+        return None, "Страница Confluence не найдена"
+    title = (page or {}).get("title") or url
+
+    def walk(parent_id: str, depth: int, seen: set) -> list[dict]:
+        if not with_children or depth >= max_depth:
+            return []
+        nodes = []
+        try:
+            kids = _direct_children(parent_id, seen)
+        except Exception as e:
+            print(f"confluence tree warning: {e}")
+            return nodes
+        for child in kids:
+            source = child_page_source(child["page_id"])
+            nodes.append({
+                "source_input": source,
+                "title": child["title"],
+                "children": walk(child["page_id"], depth + 1, seen),
+            })
+        nodes.sort(key=lambda item: (item.get("title") or "").lower())
+        return nodes
+
+    return {
+        "source_input": url.strip(),
+        "title": title,
+        "children": walk(page_id, 0, {page_id}),
+    }, None
 
 
 def get_confluence_page_content(

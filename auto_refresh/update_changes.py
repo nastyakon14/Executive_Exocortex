@@ -25,12 +25,13 @@ from storage.postgres.db_connect import (
 
 from auto_refresh.confluence_checker import check_confluence_change
 from auto_refresh.folder_checker import (
-    as_utc,
     check_folder_changes,
+    db_moment,
     dump_watch_state,
     file_meta,
     file_mtime_utc,
     file_needs_extract,
+    log_date_check,
     parse_watch_state,
 )
 
@@ -98,7 +99,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     hashes = dict(state["files"])
     pending = set(state["pending"])
     excluded = set(state["excluded"])
-    synced = as_utc(source.get("last_synced_at"))
+    db_at, _db_label = db_moment(source)
     updated = skipped = failed = 0
     last_err = ""
 
@@ -133,38 +134,42 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 mtime = file_mtime_utc(path)
             except OSError:
                 continue
-            if not file_needs_extract(path, synced, path in pending, hashes.get(path), mtime):
+            if not file_needs_extract(path, db_at, mtime):
                 pending.discard(path)
                 skipped += 1
-                print(f"[auto_refresh] folder skip by date {os.path.basename(path)}")
+                print(f"[auto_refresh] файл «{os.path.basename(path)}»: пропуск, чтение не запускается.")
                 continue
-            _guard_ingest(slug, os.path.basename(path))
+            name = os.path.basename(path)
+            print(f"[auto_refresh] файл «{name}»: запуск чтения.")
+            _guard_ingest(slug, name)
             text = extract_file_text(path)
             digest = _text_hash(text)
             if _same_source_text(graph_id, path, digest, file_meta(hashes.get(path))[0]):
                 hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 skipped += 1
-                print(f"[auto_refresh] folder skip unchanged {os.path.basename(path)}")
+                print(f"[auto_refresh] файл «{os.path.basename(path)}»: текст не изменился, запись в граф пропущена.")
                 continue
             if not (text or "").strip():
-                print(f"[auto_refresh] folder drop empty {os.path.basename(path)}")
+                print(f"[auto_refresh] файл «{os.path.basename(path)}»: текст пустой, старые карточки удаляются.")
                 with _ingest_run_lock:
                     _drop_source(graph_id, path)
                 hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 updated += 1
                 continue
-            print(f"[auto_refresh] folder ingest {os.path.basename(path)}")
+            print(f"[auto_refresh] файл «{os.path.basename(path)}»: запуск обновления графа.")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
             if ok:
                 hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
                 pending.discard(path)
                 updated += 1
+                print(f"[auto_refresh] файл «{os.path.basename(path)}»: обновление завершено.")
             else:
                 hashes.pop(path, None)
                 failed += 1
                 last_err = ans
+                print(f"[auto_refresh] файл «{os.path.basename(path)}»: обновление не удалось. {ans}")
         except FileTooLargeError as e:
             hashes.pop(path, None)
             failed += 1
@@ -176,8 +181,11 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             failed += 1
             last_err = str(e)
 
+    if updated == 0 and failed == 0:
+        print(f"[auto_refresh] папка: обновлять нечего, пропущено {skipped}.")
+        return updated, skipped, failed, last_err
     payload = dump_watch_state(hashes, sorted(pending), sorted(excluded))
-    if failed and updated == 0 and skipped == 0:
+    if failed and updated == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
         mark_watch_synced(
@@ -202,6 +210,9 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
 
     updated = skipped = failed = 0
     last_err = ""
+    if not (probe.get("pages") or probe.get("stale")):
+        print("[auto_refresh] страницы Confluence: обновлять нечего, пропуск.")
+        return 0, 1, 0, ""
     from web_app import _ingest_run_lock
 
     for stale in probe.get("stale") or []:
@@ -223,6 +234,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
             last_err = page["error"]
             continue
         try:
+            print(f"[auto_refresh] страница «{source_input}»: запуск загрузки текста.")
             text = page_plain_text(page["page_id"])
             if is_confluence_fetch_error(text):
                 hashes.pop(source_input, None)
@@ -234,7 +246,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
                 hashes[source_input] = digest
                 pending.discard(source_input)
                 skipped += 1
-                print(f"[auto_refresh] confluence skip unchanged {source_input}")
+                print(f"[auto_refresh] страница «{source_input}»: текст не изменился, запись в граф пропущена.")
                 continue
             if not (text or "").strip():
                 with _ingest_run_lock:
@@ -243,7 +255,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
                 pending.discard(source_input)
                 updated += 1
                 continue
-            print(f"[auto_refresh] confluence ingest {source_input}")
+            print(f"[auto_refresh] страница «{source_input}»: запуск обновления графа.")
             ok, ans = _ingest_source(slug, graph_id, text, source_input, f"[auto] {source_input}")
             if ok:
                 hashes[source_input] = digest
@@ -280,10 +292,11 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
     if probe.get("extract_child"):
         return _apply_confluence_children(source, slug, probe)
     if not probe.get("changed"):
-        mark_watch_synced(source["id"], content_hash=source.get("content_hash") or None, synced=True)
+        print(f"[auto_refresh] страница «{source['source_path']}»: пропуск, текст не загружается.")
         return 0, 1, 0, ""
 
     url = source["source_path"]
+    print(f"[auto_refresh] страница «{url}»: запуск загрузки текста.")
     graph_id = source["graph_id"]
     state = parse_watch_state(source.get("content_hash"))
     stored = state["files"].get(url) or ""
@@ -317,7 +330,7 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         )
 
     if _same_source_text(graph_id, url, digest, stored):
-        print(f"[auto_refresh] confluence skip unchanged {url}")
+        print(f"[auto_refresh] страница «{url}»: текст не изменился, запись в граф пропущена.")
         _keep(digest)
         try:
             upsert_ingest_digest(graph_id, url, digest)
@@ -325,12 +338,62 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
             print(f"[auto_refresh] digest save warning: {e}")
         return 0, 1, 0, ""
 
-    print(f"[auto_refresh] confluence ingest {url}")
+    print(f"[auto_refresh] страница «{url}»: запуск обновления графа.")
     ok, ans = _ingest_source(slug, graph_id, text, url, f"[auto] {url}")
     if ok:
         _keep(digest)
         return 1, 0, 0, ""
     mark_watch_synced(source["id"], error=ans, synced=False)
+    return 0, 0, 1, ans
+
+
+def _apply_file(source: dict, slug: str) -> tuple[int, int, int, str]:
+    """Один файл, отмеченный галочкой вне папки."""
+    path = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
+    name = os.path.basename(path) or path
+    if not os.path.isfile(path):
+        print(f"[auto_refresh] файл «{name}»: не найден. пропуск.")
+        return 0, 0, 1, f"Файл не найден: {name}"
+    db_at, db_label = db_moment(source)
+    try:
+        mtime = file_mtime_utc(path)
+    except OSError as e:
+        print(f"[auto_refresh] файл «{name}»: не удалось прочитать дату изменения ({e}). пропуск.")
+        return 0, 0, 1, str(e)
+    need = file_needs_extract(path, db_at, mtime)
+    log_date_check("файл", name, mtime, db_at, need, db_label)
+    if not need:
+        print(f"[auto_refresh] файл «{name}»: пропуск, чтение не запускается.")
+        return 0, 1, 0, ""
+    print(f"[auto_refresh] файл «{name}»: запуск чтения.")
+    graph_id = source["graph_id"]
+    try:
+        text = extract_file_text(path)
+    except Exception as e:
+        if type(e).__name__ == "IngestCancelled":
+            raise
+        mark_watch_synced(source["id"], error=str(e), synced=False)
+        return 0, 0, 1, str(e)
+    digest = _text_hash(text)
+    if _same_source_text(graph_id, path, digest, ""):
+        print(f"[auto_refresh] файл «{name}»: текст не изменился, запись в граф пропущена.")
+        mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        return 0, 1, 0, ""
+    if not (text or "").strip():
+        print(f"[auto_refresh] файл «{name}»: текст пустой, старые карточки удаляются.")
+        from web_app import _ingest_run_lock
+        with _ingest_run_lock:
+            _drop_source(graph_id, path)
+        mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        return 1, 0, 0, ""
+    print(f"[auto_refresh] файл «{name}»: запуск обновления графа.")
+    ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {name}")
+    if ok:
+        mark_watch_synced(source["id"], content_hash=digest, synced=True)
+        print(f"[auto_refresh] файл «{name}»: обновление завершено.")
+        return 1, 0, 0, ""
+    mark_watch_synced(source["id"], error=ans, synced=False)
+    print(f"[auto_refresh] файл «{name}»: обновление не удалось. {ans}")
     return 0, 0, 1, ans
 
 
@@ -340,6 +403,70 @@ def _archived_slugs() -> set[str]:
         return {p["slug"] for p in _load_projects_unlocked() if p.get("archived") and p.get("slug")}
     except Exception:
         return set()
+
+
+def _page_label(page: dict) -> str:
+    return str(page.get("title") or page.get("source_input") or "страница")
+
+
+def _lone_file_needs_update(source: dict) -> tuple[bool, str]:
+    path = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
+    name = os.path.basename(path) or path
+    if not os.path.isfile(path):
+        return False, name
+    try:
+        mtime = file_mtime_utc(path)
+    except OSError:
+        return False, name
+    db_at, _db_label = db_moment(source)
+    return file_needs_extract(path, db_at, mtime), name
+
+
+def _publish_refresh_plan(slug: str, probes: dict, lone_files: list[dict]) -> None:
+    file_names: list[str] = []
+    page_names: list[str] = []
+    files_tracked = 0
+    pages_tracked = 0
+    for kind, src, probe in probes.values():
+        if kind == "folder":
+            files_tracked += int(probe.get("watched") or 0)
+            for path in probe.get("files") or []:
+                file_names.append(os.path.basename(path) or path)
+            continue
+        pages_tracked += int(probe.get("watched") or 0)
+        if probe.get("extract_child"):
+            for page in probe.get("pages") or []:
+                page_names.append(_page_label(page))
+        elif probe.get("changed"):
+            page_names.append(str(probe.get("title") or src.get("source_path") or "страница"))
+    for src in lone_files:
+        path = os.path.abspath(os.path.expanduser(src.get("source_path") or ""))
+        if not os.path.isfile(path):
+            continue
+        files_tracked += 1
+        needs, name = _lone_file_needs_update(src)
+        if needs:
+            file_names.append(name)
+    summary = {
+        "files_tracked": files_tracked,
+        "files_update": len(file_names),
+        "files_names": file_names[:5],
+        "pages_tracked": pages_tracked,
+        "pages_update": len(page_names),
+        "pages_names": page_names[:5],
+    }
+    shown_files = ", ".join(summary["files_names"]) if summary["files_names"] else "нет"
+    shown_pages = ", ".join(summary["pages_names"]) if summary["pages_names"] else "нет"
+    print(
+        f"[auto_refresh] файлы: отслеживается {files_tracked}, "
+        f"нужно обновить {len(file_names)}. первые названия: {shown_files}"
+    )
+    print(
+        f"[auto_refresh] страницы Confluence: отслеживается {pages_tracked}, "
+        f"нужно обновить {len(page_names)}. первые названия: {shown_pages}"
+    )
+    from web_app import set_refresh_summary
+    set_refresh_summary(slug, summary)
 
 
 def refresh_project(slug: str, manage_status: bool = True) -> dict:
@@ -352,11 +479,14 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
 
     if manage_status:
         begin_ingest(slug, "checking")
+    from web_app import ensure_refresh_progress
+    ensure_refresh_progress(slug)
     updated = skipped = failed = 0
     errors: list[str] = []
     try:
         folders = [s for s in sources if s.get("source_kind") == "folder"]
         pages = [s for s in sources if s.get("source_kind") == "confluence"]
+        lone_files = [s for s in sources if s.get("source_kind") == "file"]
         probes: dict[int, tuple[str, dict, dict]] = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
             jobs = {}
@@ -371,12 +501,21 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                 except Exception as e:
                     probes[src["id"]] = (kind, src, {"error": str(e), "changed": False, "files": [], "stale": []})
 
+        _publish_refresh_plan(slug, probes, lone_files)
         for kind, src, probe in probes.values():
             _guard_ingest(slug, src.get("source_path") or src.get("source_kind") or "")
             if kind == "folder":
                 u, s, f, err = _apply_folder(src, slug, probe)
             else:
                 u, s, f, err = _apply_confluence(src, slug, probe)
+            updated += u
+            skipped += s
+            failed += f
+            if err:
+                errors.append(err)
+        for src in lone_files:
+            _guard_ingest(slug, src.get("source_path") or "file")
+            u, s, f, err = _apply_file(src, slug)
             updated += u
             skipped += s
             failed += f

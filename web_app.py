@@ -30,6 +30,7 @@ from storage.postgres.db_connect import (
     get_ingest_digest,
     list_watch_sources,
     mark_watch_synced_path,
+    set_watch_source_state,
     update_history_messages,
     upsert_ingest_digest,
     upsert_watch_source,
@@ -268,6 +269,22 @@ def _enter_job(slug: str, pipeline: str, title: str, *, own_job: bool = True) ->
 
 def _leave_job(slug: str, ok: bool, message: str = "", *, cancelled: bool = False) -> None:
     finish_live_progress(slug, ok=ok, message=message, cancelled=cancelled)
+
+
+def ensure_refresh_progress(slug: str) -> None:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if ctrl and ctrl.get("active"):
+            return
+    open_live_progress(slug, "refresh", "Автообновление графа", own_job=False)
+
+
+def set_refresh_summary(slug: str, summary: dict) -> None:
+    with _state_lock:
+        ctrl = _ingest_ctrl.get(slug)
+        if not ctrl:
+            return
+        ctrl["refresh_summary"] = summary
 
 
 def open_live_progress(slug: str, pipeline: str, title: str, *, own_job: bool = True) -> None:
@@ -587,6 +604,7 @@ def progress_payload(slug: str) -> dict:
                 "notice": "",
                 "stages": [],
                 "batch": None,
+                "refresh_summary": None,
             }
         view = ctrl.get("view") or ctrl.get("pipeline") or "file"
         spec = PROGRESS_STAGES.get(view) or PROGRESS_STAGES["file"]
@@ -615,6 +633,7 @@ def progress_payload(slug: str) -> dict:
             "notice": ctrl.get("notice") or "",
             "stages": stages,
             "batch": ctrl.get("batch"),
+            "refresh_summary": ctrl.get("refresh_summary"),
         }
 
 
@@ -1631,8 +1650,33 @@ body {
 .status-with-action { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
 .status-open { color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; }
 .status-open:hover { text-decoration: underline; }
-.project-card .status-open { display: inline-block; margin: 0 18px 14px; }
+.project-card .status-open { display: inline-block; margin: 0 18px 8px; }
+.project-card .sources-open { display: inline-flex; flex-direction: column; align-items: flex-start; margin: 0 18px 14px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card2); max-width: calc(100% - 36px); }
+.project-card .sources-open .menu-hint { max-width: 240px; }
+.src-board { margin-top: 4px; }
+.src-head { display: flex; justify-content: flex-end; margin: 0 0 8px; }
+.src-watch-title { width: 148px; text-align: center; font-size: 12px; line-height: 1.3; color: var(--muted); }
+.src-tree, .src-tree ul { list-style: none; margin: 0; padding: 0; }
+.tree-row { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+.tree-branch { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+.tree-branch-nest { border-left: 1px solid var(--border); padding-left: 8px; }
+.tree-caret, .tree-caret-spacer { width: 16px; height: 16px; flex-shrink: 0; border: none; background: transparent; padding: 0; cursor: pointer; }
+.tree-caret-spacer { cursor: default; }
+.tree-caret::before { content: ''; display: block; width: 0; height: 0; margin-left: 4px; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.15s; }
+.tree-caret[aria-expanded="true"]::before { transform: rotate(90deg); }
+.tree-name { font-size: 14px; color: var(--text); word-break: break-word; }
+.tree-path { color: var(--muted); font-size: 11px; word-break: break-all; }
+.tree-leaf { padding: 1px 0; }
+.tree-watch { flex: 0 0 148px; width: 148px; display: flex; align-items: center; justify-content: center; }
+.src-tree .tree-check { position: relative; margin: 0; flex: 0 0 18px; width: 18px; height: 18px; }
+button.tree-dir-name { border: none; background: transparent; padding: 0; cursor: pointer; text-align: left; font: inherit; color: var(--text); }
+.src-tree ul[hidden] { display: none; }
+.sources-warn { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+.tree-empty, .sources-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+.sources-note { color: var(--muted); font-size: 13px; line-height: 1.45; margin: 0 0 16px; }
+.src-section { font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
 .progress-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px 16px 16px; }
+.refresh-summary { white-space: pre-line; font-size: 14px; line-height: 1.5; color: var(--text); margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
 .progress-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .progress-note { color: var(--muted); font-size: 13px; line-height: 1.45; margin-top: 12px; }
 .loading-actions { display: none; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
@@ -1712,16 +1756,33 @@ body {
 .welcome p { color: var(--text2); font-size: 14px; line-height: 1.6; }
 
 /* Menu */
-.menu-btn { display: flex; align-items: center; gap: 14px; width: 100%; padding: 18px 20px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; text-decoration: none; transition: all 0.2s; position: relative; overflow: hidden; }
+.menu-slot { margin-bottom: 12px; }
+.menu-slot > .menu-btn { margin-bottom: 0; }
+.menu-btn { display: flex; align-items: center; gap: 14px; width: 100%; padding: 18px 20px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; color: var(--text); font-size: 15px; text-decoration: none; transition: border-color 0.2s, box-shadow 0.2s, background 0.2s; position: relative; overflow: hidden; }
 form.refresh-now { margin: 0; }
 button.menu-btn { font: inherit; cursor: pointer; text-align: left; }
-button.menu-btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
-button.menu-btn:disabled:hover { transform: none; box-shadow: none; border-color: var(--border); }
+button.menu-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .menu-btn::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(135deg, var(--accent), var(--accent2)); opacity: 0; transition: opacity 0.2s; }
-.menu-btn:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 24px var(--glow); }
+.menu-btn:hover { border-color: var(--accent); box-shadow: 0 8px 24px var(--glow); }
 .menu-btn:hover::before { opacity: 0.08; }
-.menu-btn .icon { font-size: 22px; width: 32px; text-align: center; position: relative; z-index: 1; }
+.menu-btn .icon { font-size: 22px; width: 32px; text-align: center; position: relative; z-index: 1; flex-shrink: 0; }
 .menu-btn span { position: relative; z-index: 1; }
+.menu-copy { display: flex; flex-direction: column; min-width: 0; flex: 1; position: relative; z-index: 1; }
+.menu-hint {
+    display: block; max-height: 0; opacity: 0; overflow: hidden; margin-top: 0;
+    font-size: 12px; font-weight: 400; line-height: 1.4; color: var(--muted);
+    transition: max-height 0.22s ease, opacity 0.22s ease, margin-top 0.22s ease;
+}
+.has-hint:hover .menu-hint,
+.has-hint:focus-within .menu-hint { max-height: 5.4em; opacity: 1; margin-top: 6px; }
+.has-hint:hover > .menu-btn,
+.has-hint:focus-within > .menu-btn,
+.has-hint:hover > form > .menu-btn,
+.has-hint:focus-within > form > .menu-btn { align-items: flex-start; }
+.has-hint:hover .menu-btn .icon,
+.has-hint:focus-within .menu-btn .icon { margin-top: 1px; }
+.meta-actions .btn-ghost { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.meta-actions .menu-hint { text-align: center; }
 
 /* Page */
 .page-header { display: flex; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
@@ -2496,6 +2557,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
                 {ingest_status_html(p.get("ingest_status") or "ready", error=p.get("ingest_error") or "")}
             </a>
             {progress_link_html(slug, p.get("ingest_status") or "ready")}
+            {_sources_link_html(slug)}
         </div>
         """
     cards += """
@@ -2708,9 +2770,9 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             <div class="readonly-banner">Этот граф только для навигации и поиска. Новые данные добавляйте в конкретный проект — они автоматически появятся здесь. Архивные проекты скрыты из общего слоя.</div>
             <div class="msg-box">Сейчас объединено {n} карточек из {len(scope["graph_ids"])} проектов.</div>
             {data_freshness_html(scope)}
-            <a href="/p/{COMMON_SLUG}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск по всем проектам</span></a>
-            <a href="/contour" class="menu-btn"><span class="icon">🧩</span><span>Совместный поиск по выбранным проектам</span></a>
-            <a href="/p/{COMMON_SLUG}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть общий граф</span></a>
+            {_menu_link(f"/p/{COMMON_SLUG}/search", "🔍", "Поиск по всем проектам", "Вопрос сразу по всем активным проектам. Архивные проекты в поиске не участвуют.")}
+            {_menu_link("/contour", "🧩", "Совместный поиск по выбранным проектам", "Соберите несколько проектов и задайте вопрос только по ним. Добавлять данные здесь нельзя.")}
+            {_menu_link(f"/p/{COMMON_SLUG}/view", "💡", "Посмотреть общий граф", "Карточки и связи всех активных проектов. Новые данные добавляйте в конкретный проект.")}
         </div>
         """
         return HTMLResponse(html_page("Общий граф", body))
@@ -2745,6 +2807,12 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     except Exception:
         watch_n = 0
     refresh_disabled = " disabled" if ingest_busy else ""
+    archive_hint = (
+        "Вернёт проект в общий граф и в совместный поиск."
+        if archived
+        else "Скроет проект из общего графа и совместного поиска. Карточки останутся."
+    )
+    destroy_hint = "Удалит проект и все его карточки. Вернуть их нельзя."
     if ingest_busy:
         wait_hint = '<p class="project-count">Новые карточки появятся в графе и поиске, когда статус станет зелёным.</p>'
     elif watch_n:
@@ -2767,20 +2835,22 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
             <p class="project-count status-with-action">{ingest_status_html(scope.get("ingest_status") or "ready", error=scope.get("ingest_error") or "")}{progress_link_html(slug, scope.get("ingest_status") or "ready")}</p>
             {wait_hint}
         </div>
-        <a href="/p/{escape(slug)}/add" class="menu-btn"><span class="icon">➕</span><span>Загрузить новые данные</span></a>
-        <a href="/p/{escape(slug)}/search" class="menu-btn"><span class="icon">🔍</span><span>Поиск фрагментов по запросу</span></a>
-        <a href="/p/{escape(slug)}/view" class="menu-btn"><span class="icon">💡</span><span>Посмотреть базу знаний</span></a>
-        <a href="/p/{escape(slug)}/delete" class="menu-btn"><span class="icon">🗑</span><span>Удалить данные</span></a>
+        {_menu_link(f"/p/{escape(slug)}/add", "➕", "Загрузить новые данные", "Файл, папка или страница Confluence. Для папки и страницы можно включить отслеживание изменений.")}
+        {_menu_link(f"/p/{escape(slug)}/search", "🔍", "Поиск информации по запросу", "Вопрос по карточкам этого проекта. В ответе будут источники, из которых он собран.")}
+        {_menu_link(f"/p/{escape(slug)}/view", "💡", "Посмотреть граф проекта", "Карточки и связи. На большом графе теги лучше включать после приближения.")}
+        {_menu_link(f"/p/{escape(slug)}/delete", "🗑", "Удалить карточки", "Найдите карточку по запросу и удалите её. Файл или страница при этом не удаляются.")}
+        <div class="menu-slot has-hint">
         <form class="refresh-now" action="/p/{escape(slug)}/refresh" method="post">
-            <button type="submit" class="menu-btn"{refresh_disabled}><span class="icon">🔄</span><span>Обновить граф сейчас</span></button>
+            <button type="submit" class="menu-btn"{refresh_disabled}><span class="icon">🔄</span><span class="menu-copy"><span class="menu-title">Обновить граф сейчас</span><span class="menu-hint">Можно обновить сейчас. Если есть источники для отслеживания и в них были изменения, граф сам обновится в 2:00 ночи.</span></span></button>
         </form>
+        </div>
         <div class="meta-actions">
-            <form action="/p/{escape(slug)}/archive" method="post">
+            <form class="has-hint" action="/p/{escape(slug)}/archive" method="post">
                 <input type="hidden" name="archived" value="{archive_action}">
-                <button type="submit" class="btn-ghost">{archive_label}</button>
+                <button type="submit" class="btn-ghost"><span class="menu-title">{archive_label}</span><span class="menu-hint">{archive_hint}</span></button>
             </form>
-            <form id="destroyForm" action="/p/{escape(slug)}/destroy" method="post">
-                <button type="button" class="btn-ghost danger" onclick="openModal('destroyModal')">{"Удалить проект" if n > 0 else "Удалить пустой проект"}</button>
+            <form class="has-hint" id="destroyForm" action="/p/{escape(slug)}/destroy" method="post">
+                <button type="button" class="btn-ghost danger" onclick="openModal('destroyModal')"><span class="menu-title">{"Удалить проект" if n > 0 else "Удалить пустой проект"}</span><span class="menu-hint">{destroy_hint}</span></button>
             </form>
         </div>
     </div>
@@ -2827,6 +2897,523 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     return HTMLResponse(html_page(scope["name"], body, js))
 
 
+_TICK_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" '
+    'stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>'
+)
+
+
+def _menu_link(href: str, icon: str, title: str, hint: str) -> str:
+    return (
+        '<div class="menu-slot has-hint">'
+        f'<a class="menu-btn" href="{href}">'
+        f'<span class="icon">{icon}</span>'
+        '<span class="menu-copy">'
+        f'<span class="menu-title">{escape(title)}</span>'
+        f'<span class="menu-hint">{escape(hint)}</span>'
+        "</span></a></div>"
+    )
+
+
+def _sources_link_html(slug: str) -> str:
+    return (
+        f'<a class="status-open sources-open has-hint" href="/p/{escape(slug)}/sources">'
+        '<span class="menu-title">Посмотреть источники</span>'
+        '<span class="menu-hint">Файлы, папки и страницы. Здесь включается отслеживание изменений.</span>'
+        "</a>"
+    )
+
+
+def _project_source_inputs(graph_id: str) -> list[str]:
+    try:
+        return [str(item) for item in linker.repository.list_source_inputs(graph_id) if item]
+    except Exception as e:
+        print(f"web_app sources list warning: {e}")
+        return []
+
+
+def _tree_toggle(expanded: bool) -> str:
+    state = "true" if expanded else "false"
+    return f'<button type="button" class="tree-caret" aria-expanded="{state}" aria-label="Развернуть" onclick="toggleTree(this)"></button>'
+
+
+def _source_name(title: str, icon: str, item: str) -> str:
+    return f'<span class="tree-name" title="{escape(item)}">{icon} {escape(title)}</span>'
+
+
+def _watch_box(kind: str, root: str, item: str, watched: bool) -> str:
+    checked = " checked" if watched else ""
+    return (
+        '<label class="tick-check tree-check">'
+        f'<input type="checkbox"{checked} data-kind="{escape(kind)}" '
+        f'data-root="{escape(root)}" data-item="{escape(item)}" '
+        f'onchange="toggleSourceWatch(this)">'
+        f'<span class="tick-box">{_TICK_SVG}</span>'
+        "</label>"
+    )
+
+
+def _tree_row(main: str, check: str, depth: int) -> str:
+    margin = depth * 18
+    nest = " tree-branch-nest" if margin else ""
+    style = f' style="margin-left:{margin}px"' if margin else ""
+    return f'<div class="tree-row"><div class="tree-branch{nest}"{style}>{main}</div><div class="tree-watch">{check}</div></div>'
+
+
+def _nest_files(root: str, paths: list[str]) -> dict:
+    tree: dict = {"dirs": {}, "files": []}
+    root_abs = os.path.abspath(root)
+    for path in paths:
+        abs_path = os.path.abspath(path)
+        rel = os.path.relpath(abs_path, root_abs)
+        parts = [part for part in rel.split(os.sep) if part and part != "."]
+        if not parts or parts[0] == "..":
+            continue
+        node = tree
+        for part in parts[:-1]:
+            node = node["dirs"].setdefault(part, {"dirs": {}, "files": []})
+        node["files"].append((parts[-1], abs_path))
+    return tree
+
+
+def _file_row(title: str, kind: str, root: str, path: str, watched: bool, icon: str = "📄", depth: int = 0) -> str:
+    main = '<span class="tree-caret-spacer"></span>' + _source_name(title, icon, path)
+    return '<li class="tree-leaf">' + _tree_row(main, _watch_box(kind, root, path, watched), depth) + "</li>"
+
+
+def _render_file_tree(node: dict, kind: str, root: str, excluded: set, parent_watch: bool, open_now: bool, title: str, depth: int = 0) -> str:
+    chunks = []
+    for dirname in sorted(node["dirs"], key=str.lower):
+        chunks.append(_render_file_tree(
+            node["dirs"][dirname], kind, root, excluded, parent_watch, False, dirname, depth + 1,
+        ))
+    for fname, path in sorted(node["files"], key=lambda item: item[0].lower()):
+        chunks.append(_file_row(fname, kind, root, path, parent_watch and path not in excluded, depth=depth + 1))
+    inner = "".join(chunks) or '<li class="tree-empty">В директории нет файлов</li>'
+    hidden = "" if open_now else " hidden"
+    path_bit = f'<span class="tree-path">{escape(root)}</span>' if open_now else ""
+    main = (
+        _tree_toggle(open_now)
+        + f'<button type="button" class="tree-name tree-dir-name" onclick="toggleTree(this.parentElement.querySelector(\'.tree-caret\'))">📁 {escape(title)}</button>'
+        + path_bit
+    )
+    return (
+        '<li class="tree-dir">'
+        + _tree_row(main, "", depth)
+        + f"<ul{hidden}>{inner}</ul></li>"
+    )
+
+
+def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, open_now: bool, depth: int = 0) -> str:
+    source = node.get("source_input") or ""
+    title = node.get("title") or _page_label(source)
+    children = node.get("children") or []
+    watched = parent_watch and source not in excluded
+    box = _watch_box("confluence", root, source, watched)
+    name = _source_name(title, "🌐", source)
+    if not children:
+        main = '<span class="tree-caret-spacer"></span>' + name
+        return '<li class="tree-leaf">' + _tree_row(main, box, depth) + "</li>"
+    hidden = "" if open_now else " hidden"
+    inner = "".join(
+        _render_page_tree(child, root, excluded, parent_watch, False, depth + 1)
+        for child in children
+    )
+    main = _tree_toggle(open_now) + name
+    return (
+        '<li class="tree-dir">'
+        + _tree_row(main, box, depth)
+        + f"<ul{hidden}>{inner}</ul></li>"
+    )
+
+
+def _page_label(url: str) -> str:
+    tail = (url or "").rstrip("/").split("/")[-1]
+    return tail or url
+
+
+def _is_url(value: str) -> bool:
+    return value.lower().startswith(("http://", "https://"))
+
+
+def _canon_item(kind: str, item: str) -> str:
+    text = (item or "").strip()
+    if not text or kind == "confluence" or _is_url(text):
+        return text
+    try:
+        return os.path.abspath(os.path.expanduser(text))
+    except Exception:
+        return text
+
+
+def _find_watch_row(rows: list[dict], kind: str, root: str) -> dict | None:
+    want = _canon_item(kind, root)
+    for src in rows:
+        if src.get("source_kind") != kind:
+            continue
+        if _canon_item(kind, src.get("source_path") or "") == want:
+            return src
+    return None
+
+
+def _excluded_items(row: dict | None, kind: str) -> set[str]:
+    if not row:
+        return set()
+    from auto_refresh.folder_checker import parse_watch_state
+    state = parse_watch_state(row.get("content_hash"))
+    return {item for raw in state["excluded"] if (item := _canon_item(kind, str(raw)))}
+
+
+def _under_root(path: str, root: str) -> bool:
+    abs_path = os.path.abspath(path)
+    abs_root = os.path.abspath(root)
+    prefix = abs_root if abs_root.endswith(os.sep) else abs_root + os.sep
+    return abs_path == abs_root or abs_path.startswith(prefix)
+
+
+def _folder_files(row: dict, ingested: list[str]) -> list[str]:
+    from auto_refresh.folder_checker import list_watch_files, parse_watch_state
+    root = row.get("source_path") or ""
+    found: list[str] = []
+    try:
+        files, err = list_watch_files(root, bool(row.get("extract_child")))
+        if not err:
+            found.extend(files)
+    except Exception as e:
+        print(f"web_app folder tree warning: {e}")
+    state = parse_watch_state(row.get("content_hash"))
+    for key in list(state["files"]) + ingested:
+        if key and not _is_url(str(key)) and _under_root(str(key), root):
+            found.append(os.path.abspath(str(key)))
+    return list(dict.fromkeys(found))
+
+
+def _confluence_pages(row: dict) -> list[str]:
+    from auto_refresh.folder_checker import parse_watch_state
+    root = (row.get("source_path") or "").strip()
+    state = parse_watch_state(row.get("content_hash"))
+    pages = [root] if root else []
+    for key in state["files"]:
+        if key and key != root:
+            pages.append(str(key))
+    return list(dict.fromkeys(pages))
+
+
+def _flatten_pages(node: dict) -> list[str]:
+    found = []
+    source = (node.get("source_input") or "").strip()
+    if source:
+        found.append(source)
+    for child in node.get("children") or []:
+        found.extend(_flatten_pages(child))
+    return found
+
+
+def _confluence_nodes(row: dict) -> tuple[dict, str | None]:
+    """Живое дерево страниц. Если Confluence недоступен — уже загруженные страницы."""
+    from app.handlers.confluence import confluence_page_tree
+    root = (row.get("source_path") or "").strip()
+    live = None
+    err = None
+    try:
+        live, err = confluence_page_tree(root, with_children=bool(row.get("extract_child")))
+    except Exception as e:
+        err = str(e)
+        print(f"web_app confluence tree warning: {e}")
+    known = [page for page in _confluence_pages(row) if page]
+    if not live:
+        children = [
+            {"source_input": page, "title": _page_label(page), "children": []}
+            for page in known
+            if page != root
+        ]
+        return {
+            "source_input": root,
+            "title": _page_label(root),
+            "children": children,
+        }, "Дерево Confluence сейчас недоступно. Показаны уже загруженные страницы."
+    seen: set[str] = set()
+
+    def mark(node: dict) -> None:
+        seen.add((node.get("source_input") or "").strip())
+        for child in node.get("children") or []:
+            mark(child)
+
+    mark(live)
+    for page in known:
+        if page not in seen:
+            live.setdefault("children", []).append({
+                "source_input": page,
+                "title": _page_label(page),
+                "children": [],
+            })
+    return live, None
+
+
+def _tracked(row: dict | None, item: str) -> bool:
+    if not row or not row.get("watch"):
+        return False
+    from auto_refresh.folder_checker import parse_watch_state
+    state = parse_watch_state(row.get("content_hash"))
+    return item not in set(state["excluded"])
+
+
+def _sources_tree_html(scope: dict) -> str:
+    graph_id = scope["graph_id"]
+    try:
+        rows = list_watch_sources(watch_only=False, graph_id=graph_id)
+    except Exception as e:
+        return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
+    ingested = _project_source_inputs(graph_id)
+    folders = [row for row in rows if row.get("source_kind") == "folder"]
+    pages = [row for row in rows if row.get("source_kind") == "confluence"]
+    lone = [row for row in rows if row.get("source_kind") == "file"]
+    folder_roots = [row.get("source_path") or "" for row in folders]
+    page_roots = {(row.get("source_path") or "").strip() for row in pages}
+    claimed_pages: set[str] = set()
+    for row in pages:
+        claimed_pages.update(_confluence_pages(row))
+
+    chunks: list[str] = []
+    if folders:
+        chunks.append('<div class="src-section">Директории</div><ul class="src-tree">')
+        for row in folders:
+            root = row.get("source_path") or ""
+            files = _folder_files(row, ingested)
+            excluded = _excluded_items(row, "folder")
+            tree = _nest_files(root, files)
+            title = os.path.basename(root.rstrip("\\/")) or root
+            chunks.append(_render_file_tree(tree, "folder", root, excluded, bool(row.get("watch")), True, title))
+        chunks.append("</ul>")
+
+    if pages:
+        chunks.append('<div class="src-section">Страницы Confluence</div>')
+        notes = []
+        trees = []
+        for row in pages:
+            root = (row.get("source_path") or "").strip()
+            node, note = _confluence_nodes(row)
+            if note and note not in notes:
+                notes.append(note)
+            excluded = _excluded_items(row, "confluence")
+            claimed_pages.update(_flatten_pages(node))
+            trees.append(_render_page_tree(node, root, excluded, bool(row.get("watch")), True))
+        if notes:
+            chunks.append('<p class="sources-warn">' + escape(notes[0]) + "</p>")
+        chunks.append('<ul class="src-tree">' + "".join(trees) + "</ul>")
+
+    loose_files = []
+    texts = []
+    for raw in ingested:
+        if raw in {"text", ""}:
+            texts.append(raw)
+            continue
+        if _is_url(raw):
+            if raw not in claimed_pages and raw not in page_roots:
+                loose_files.append(("confluence-orphan", raw))
+            continue
+        if any(_under_root(raw, root) for root in folder_roots if root):
+            continue
+        if any(os.path.abspath(raw) == os.path.abspath(row.get("source_path") or "") for row in lone):
+            continue
+        loose_files.append(("file", os.path.abspath(raw)))
+    for row in lone:
+        path = os.path.abspath(row.get("source_path") or "")
+        if path and ("file", path) not in loose_files:
+            loose_files.append(("saved", path))
+
+    if loose_files or lone:
+        chunks.append('<div class="src-section">Файлы</div><ul class="src-tree">')
+        seen = set()
+        for row in lone:
+            path = os.path.abspath(row.get("source_path") or "")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch"))))
+        for kind, path in loose_files:
+            if kind != "file" or path in seen:
+                continue
+            seen.add(path)
+            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False))
+        for kind, url in loose_files:
+            if kind != "confluence-orphan":
+                continue
+            chunks.append(_file_row(url, "confluence", url, url, False, "🌐"))
+        chunks.append("</ul>")
+
+    if texts:
+        chunks.append('<div class="src-section">Текст</div><ul class="src-tree">')
+        chunks.append('<li class="tree-leaf"><span class="tree-name">📝 Введённый текст</span></li>')
+        chunks.append("</ul>")
+
+    if not chunks:
+        return '<p class="sources-empty">В проекте пока нет загруженных файлов, директорий и страниц.</p>'
+    return (
+        '<div class="src-board">'
+        '<div class="src-head"><div class="src-watch-title">Отслеживать изменения</div></div>'
+        + "".join(chunks)
+        + "</div>"
+    )
+
+
+def _known_items(row: dict, ingested: list[str]) -> list[str]:
+    kind = row.get("source_kind")
+    if kind == "folder":
+        return _folder_files(row, ingested)
+    if kind == "confluence":
+        node, _note = _confluence_nodes(row)
+        return _flatten_pages(node)
+    path = os.path.abspath(row.get("source_path") or "")
+    return [path] if path else []
+
+
+def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool) -> dict[str, bool]:
+    from auto_refresh.folder_checker import dump_watch_state, parse_watch_state
+    graph_id = scope["graph_id"]
+    root_key = _canon_item(kind, root)
+    item_key = _canon_item(kind, item)
+    rows = list_watch_sources(watch_only=False, graph_id=graph_id)
+    row = _find_watch_row(rows, kind, root_key)
+    extract_child = bool(row.get("extract_child")) if row else False
+    stored_root = (row.get("source_path") if row else root) or root
+    whole = kind == "file" or (
+        kind == "confluence" and item_key == root_key and not extract_child
+    )
+    if whole:
+        upsert_watch_source(
+            graph_id=graph_id,
+            project_slug=scope["slug"],
+            source_kind=kind,
+            source_path=stored_root,
+            watch=watched,
+            extract_child=extract_child,
+        )
+        return {item: watched}
+
+    if row is None:
+        upsert_watch_source(
+            graph_id=graph_id,
+            project_slug=scope["slug"],
+            source_kind=kind,
+            source_path=root,
+            watch=False,
+            extract_child=kind == "confluence",
+        )
+        rows = list_watch_sources(watch_only=False, graph_id=graph_id)
+        row = _find_watch_row(rows, kind, root_key)
+    if row is None:
+        raise RuntimeError("Источник не найден")
+
+    ingested = _project_source_inputs(graph_id)
+    known = []
+    for path in _known_items(row, ingested):
+        key = _canon_item(kind, path)
+        if key and key not in known:
+            known.append(key)
+    if item_key not in known:
+        known.append(item_key)
+    state = parse_watch_state(row.get("content_hash"))
+    excluded = set()
+    for raw in state["excluded"]:
+        key = _canon_item(kind, str(raw))
+        if key:
+            excluded.add(key)
+    if watched:
+        if not row.get("watch"):
+            excluded = {path for path in known if path != item_key}
+        else:
+            excluded.discard(item_key)
+        parent_watch = True
+    else:
+        excluded.add(item_key)
+        parent_watch = any(path not in excluded for path in known)
+    set_watch_source_state(
+        row["id"],
+        parent_watch,
+        dump_watch_state(state["files"], state["pending"], sorted(excluded)),
+    )
+    return {path: parent_watch and path not in excluded for path in known}
+
+
+@app.get("/p/{slug}/sources", response_class=HTMLResponse)
+async def project_sources(slug: str):
+    scope, err = _writable_scope(slug)
+    if err:
+        return err
+    body = f"""
+    <div class="container">
+        {project_nav(scope)}
+        <div class="header">
+            <h1>Источники</h1>
+            <p>{escape(scope["name"])}</p>
+        </div>
+        <p class="sources-note">Директории и страницы с вложениями раскрываются, как в проводнике. Галочка включает отслеживание этого файла или страницы: ночное и ручное обновление смотрит только на отмеченные.</p>
+        {_sources_tree_html(scope)}
+    </div>
+    """
+    js = """
+    function toggleTree(button) {
+        const row = button.closest('li');
+        const list = row ? row.querySelector(':scope > ul') : null;
+        if (!list) return;
+        const open = button.getAttribute('aria-expanded') === 'true';
+        button.setAttribute('aria-expanded', open ? 'false' : 'true');
+        button.setAttribute('aria-label', open ? 'Развернуть' : 'Свернуть');
+        list.hidden = open;
+    }
+    async function toggleSourceWatch(input) {
+        const previous = !input.checked;
+        const body = new FormData();
+        body.set('kind', input.dataset.kind || '');
+        body.set('root', input.dataset.root || '');
+        body.set('item', input.dataset.item || '');
+        body.set('watched', input.checked ? '1' : '0');
+        try {
+            const resp = await fetch('/p/' + encodeURIComponent(%s) + '/sources/watch', {method: 'POST', body: body});
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) {
+                input.checked = previous;
+                return;
+            }
+            const flags = data.items || {};
+            document.querySelectorAll('.tree-check input').forEach(function(box) {
+                if (box.dataset.kind === input.dataset.kind && box.dataset.root === input.dataset.root && Object.prototype.hasOwnProperty.call(flags, box.dataset.item)) {
+                    box.checked = !!flags[box.dataset.item];
+                }
+            });
+        } catch (err) {
+            input.checked = previous;
+        }
+    }
+    """ % json.dumps(slug)
+    return HTMLResponse(html_page("Источники", body, js))
+
+
+@app.post("/p/{slug}/sources/watch")
+async def project_source_watch(
+    slug: str,
+    kind: str = Form(""),
+    root: str = Form(""),
+    item: str = Form(""),
+    watched: str = Form(""),
+):
+    scope, err = _writable_scope(slug)
+    if err:
+        return JSONResponse({"ok": False, "error": "Проект недоступен"}, status_code=403)
+    kind = (kind or "").strip()
+    root = (root or "").strip()
+    item = (item or "").strip()
+    if kind not in {"folder", "confluence", "file"} or not root or not item:
+        return JSONResponse({"ok": False, "error": "Не указан источник"}, status_code=400)
+    try:
+        flags = _set_item_watch(scope, kind, root, item, watched == "1")
+    except Exception as e:
+        print(f"web_app source watch warning: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True, "items": flags})
+
+
 @app.get("/p/{slug}/progress.json")
 async def progress_json(slug: str):
     if not get_project(slug):
@@ -2861,6 +3448,7 @@ async def progress_page(slug: str):
         <a href="/p/{escape(slug)}" class="back-link">← Закрыть и вернуться в проект</a>
         <div class="page-header"><h2>Текущий статус</h2></div>
         <div class="progress-panel" id="progressPanel">
+            <div class="refresh-summary" id="refreshSummary" style="display:none"></div>
             <div class="loading-text" id="progressTitle">Загрузка статуса</div>
             <div class="loading-subtext" id="progressSub"></div>
             <div class="loading-file-progress active" id="progressBatch" style="display:none">
@@ -2893,6 +3481,28 @@ async def progress_page(slug: str):
         const title = document.getElementById('progressTitle');
         const sub = document.getElementById('progressSub');
         const msg = document.getElementById('progressMessage');
+        const summary = document.getElementById('refreshSummary');
+        const plan = data.refresh_summary;
+        if (summary) {
+            if (!plan) {
+                summary.style.display = 'none';
+                summary.textContent = '';
+            } else {
+                const fileNames = plan.files_names || [];
+                const pageNames = plan.pages_names || [];
+                const lines = [
+                    'Файлы, за которыми следим: ' + (plan.files_tracked || 0),
+                    'Файлы новее последней сверки, их обновим: ' + (plan.files_update || 0)
+                ];
+                fileNames.forEach(function(name) { lines.push(name); });
+                lines.push('');
+                lines.push('Страницы Confluence, за которыми следим: ' + (plan.pages_tracked || 0));
+                lines.push('Страницы новее последней сверки, их обновим: ' + (plan.pages_update || 0));
+                pageNames.forEach(function(name) { lines.push(name); });
+                summary.style.display = '';
+                summary.textContent = lines.join('\\n');
+            }
+        }
         if (title) title.textContent = data.title || 'Сейчас ничего не обрабатывается';
         if (sub) sub.textContent = data.sub || '';
         if (msg) msg.textContent = data.message || '';
@@ -4104,7 +4714,7 @@ async def search_page(slug: str):
     <div class="container wide">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🔍 Поиск фрагментов</h2></div>
+        <div class="page-header"><h2>🔍 Поиск информации по запросу</h2></div>
         {"<div class='readonly-banner'>Поиск идёт по объединённому графу. Добавлять данные здесь нельзя.</div>" if scope["readonly"] else ""}
         
         <div class="chat-container">
@@ -4221,7 +4831,7 @@ async def search_page(slug: str):
         chatMessages.scrollTop = chatMessages.scrollHeight;
     }}
     """
-    return HTMLResponse(html_page("Поиск", body, js))
+    return HTMLResponse(html_page("Поиск информации", body, js))
 
 
 @app.post("/p/{slug}/api/search")
@@ -4296,12 +4906,12 @@ async def view_page(slug: str, request: Request):
         <div class="container">
             {project_nav(scope)}
             <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-            <div class="page-header"><h2>💡 База знаний</h2></div>
+            <div class="page-header"><h2>💡 Граф проекта</h2></div>
             <div class="alert alert-error">📭 Граф пуст. Загрузите первые данные!</div>
             <a href="/p/{escape(slug)}/add" class="btn" style="text-decoration:none;text-align:center;display:block;margin-top:16px">➕ Добавить данные</a>
         </div>
         """
-        return HTMLResponse(html_page("База знаний", body))
+        return HTMLResponse(html_page("Граф проекта", body))
 
     return _graph_page(request, scope["name"], f"/p/{slug}/api/graph", back_url=f"/p/{slug}")
 
@@ -4338,11 +4948,11 @@ async def delete_page(slug: str, msg: str = "", st: str = ""):
     <div class="container">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🗑 Удалить данные</h2></div>
+        <div class="page-header"><h2>🗑 Удалить карточки</h2></div>
         
         {alert}
         
-        <div class="msg-box">Опишите фрагмент, который хотите найти и удалить.</div>
+        <div class="msg-box">Опишите карточку, которую хотите найти и удалить.</div>
         
         <form action="/p/{escape(slug)}/delete/search" method="post" data-enter-submit="true" data-loading-text="Поиск" data-loading-subtext="Ищем похожие фрагменты" onsubmit="return submitWithLoading(this, 'Поиск заметок', 'Ищем похожие фрагменты в базе знаний')">
             <div class="form-group"><textarea name="q" placeholder="Что удалить..." required></textarea></div>
@@ -4350,7 +4960,7 @@ async def delete_page(slug: str, msg: str = "", st: str = ""):
         </form>
     </div>
     """
-    return HTMLResponse(html_page("Удалить", body))
+    return HTMLResponse(html_page("Удалить карточки", body))
 
 
 @app.post("/p/{slug}/delete/search", response_class=HTMLResponse)
@@ -4408,7 +5018,7 @@ async def delete_search(slug: str, q: str = Form("")):
     <div class="container">
         {project_nav(scope)}
         <a href="/p/{escape(slug)}" class="back-link">← В проект</a>
-        <div class="page-header"><h2>🗑 Удалить данные</h2></div>
+        <div class="page-header"><h2>🗑 Удалить карточки</h2></div>
         
         <div class="msg-box">Найдено {len(cached)} заметок. Нажмите на карточку, чтобы просмотреть и удалить.</div>
         
@@ -4475,7 +5085,7 @@ async def delete_search(slug: str, q: str = Form("")):
         if (e.key === 'Escape') hideDeleteModal();
     });
     """
-    return HTMLResponse(html_page("Найденные фрагменты", body, js))
+    return HTMLResponse(html_page("Найденные карточки", body, js))
 
 
 @app.post("/p/{slug}/delete/confirm")

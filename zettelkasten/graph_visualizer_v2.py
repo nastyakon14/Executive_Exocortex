@@ -540,10 +540,10 @@ function draw() {
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
   const vis = cellsInView(x0, y0, x1, y1);
   const showTags = tagsOn && zoom >= 0.32;
-  const showEdges = zoom >= 0.16;
+  const showEdges = zoom >= 0.06;
   const showLabels = zoom >= 0.42;
   const dim = hot ? 0.16 : 1;
-  const maxE = zoom < 0.25 ? 1800 : 7000;
+  const maxE = zoom < 0.14 ? 4500 : 9000;
   const maxN = zoom < 0.2 ? 2800 : 5500;
 
   if (showEdges) {
@@ -763,15 +763,8 @@ window.addEventListener('mousemove', function(e) {
   }
   requestDraw();
 });
-const isWin = /Windows/i.test(navigator.userAgent || '');
-let lastWheelAt = 0;
-function wheelDelta(e) {
-  let x = e.deltaX, y = e.deltaY;
-  if (e.deltaMode === 1) { x *= 16; y *= 16; }
-  if (e.deltaMode === 2) { x *= W; y *= H; }
-  return { x: x, y: y };
-}
 function applyZoomAt(mx, my, factor) {
+  if (!factor || factor === 1) return;
   const beforeX = wx(mx), beforeY = wy(my);
   zoom = Math.max(0.03, Math.min(3.5, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
@@ -779,42 +772,42 @@ function applyZoomAt(mx, my, factor) {
   requestDraw();
 }
 function zoomByWheel(e, mx, my) {
-  const y = wheelDelta(e).y;
-  const factor = Math.max(0.86, Math.min(1.16, Math.exp(-y * 0.002)));
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 16;
+  else if (e.deltaMode === 2) dy *= 400;
+  if (!dy) return;
+  const pinch = e.ctrlKey || e.metaKey;
+  const abs = Math.abs(dy);
+  const gain = pinch ? 0.012 : (abs < 50 ? 0.01 : 0.0016);
+  const factor = Math.max(0.82, Math.min(1.22, Math.exp(-dy * gain)));
   applyZoomAt(mx, my, factor);
 }
-wrap.addEventListener('wheel', function(e) {
+let pinchGesture = false;
+window.addEventListener('wheel', function(e) {
+  if (!wrap.contains(e.target)) return;
   e.preventDefault();
+  if (pinchGesture) return;
   const rect = wrap.getBoundingClientRect();
-  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-  const pinch = e.ctrlKey || e.metaKey;
-  if (pinch) {
-    zoomByWheel(e, mx, my);
-    return;
-  }
-  const { x, y } = wheelDelta(e);
-  const now = performance.now();
-  const gap = now - lastWheelAt;
-  lastWheelAt = now;
-  const mouseLike = e.deltaMode !== 0 || (Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 80 && gap > 35);
-  if (!isWin || mouseLike) {
-    zoomByWheel(e, mx, my);
-    return;
-  }
-  camX += x / zoom;
-  camY += y / zoom;
-  requestDraw();
+  zoomByWheel(e, e.clientX - rect.left, e.clientY - rect.top);
+}, { passive: false, capture: true });
+wrap.addEventListener('gesturestart', function(e) {
+  e.preventDefault();
+  pinchGesture = true;
+  wrap._gScale = e.scale || 1;
 }, { passive: false });
-wrap.addEventListener('gesturestart', function(e) { e.preventDefault(); }, { passive: false });
 wrap.addEventListener('gesturechange', function(e) {
   e.preventDefault();
+  const prev = wrap._gScale || 1;
+  const next = e.scale || prev;
+  wrap._gScale = next;
+  if (!(prev > 0) || next === prev) return;
   const rect = wrap.getBoundingClientRect();
-  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-  const factor = Math.max(0.86, Math.min(1.16, e.scale > 0 ? e.scale / (wrap._gScale || e.scale) : 1));
-  wrap._gScale = e.scale;
-  applyZoomAt(mx, my, factor);
+  applyZoomAt(e.clientX - rect.left, e.clientY - rect.top, next / prev);
 }, { passive: false });
-wrap.addEventListener('gestureend', function() { wrap._gScale = 0; });
+wrap.addEventListener('gestureend', function() {
+  wrap._gScale = 1;
+  setTimeout(function() { pinchGesture = false; }, 60);
+});
 wrap.addEventListener('dblclick', function(e) {
   const rect = wrap.getBoundingClientRect();
   const i = hit(e.clientX - rect.left, e.clientY - rect.top);
@@ -1016,7 +1009,7 @@ def _build_html(
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
   .leg-dot-entity {{ background: #38BDF8; border-color: #FFFFFF; }}
-  #graph-wrap {{ position: relative; width: 100%; height: calc(100vh - 56px); cursor: grab; }}
+  #graph-wrap {{ position: relative; width: 100%; height: calc(100vh - 56px); cursor: grab; touch-action: none; }}
   #graph-wrap:active {{ cursor: grabbing; }}
   #graph {{ position: absolute; inset: 0; width: 100%; height: 100%; display: block; }}
   #load-hint {{
@@ -1084,7 +1077,7 @@ def _build_html(
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
   </div>
-  <div id="graph-hint">Зум: колесо мыши или щипок на тачпаде. Два пальца на Windows сдвигают граф. Узел можно перетащить. На большом графе теги лучше включать после приближения.</div>
+  <div id="graph-hint">На большом графе теги лучше включать после приближения.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>

@@ -131,6 +131,27 @@ def upsert_watch_source(
             conn.commit()
 
 
+def set_watch_source_state(
+    watch_id: int,
+    watch: bool,
+    content_hash: str | None = None,
+) -> None:
+    """Меняет флаг отслеживания и, если передан, список исключённых путей внутри источника."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                UPDATE watch_sources
+                SET watch = %s,
+                    content_hash = COALESCE(%s, content_hash),
+                    updated_at = NOW()
+                WHERE id = %s
+                ''',
+                (bool(watch), content_hash, watch_id),
+            )
+            conn.commit()
+
+
 def list_watch_sources(
     watch_only: bool = True,
     graph_id: str | None = None,
