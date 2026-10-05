@@ -250,6 +250,32 @@ def mark_watch_synced_path(
             conn.commit()
 
 
+def delete_watch_source(watch_id: int) -> None:
+    """Удаляет строку отслеживания источника."""
+    if not watch_id:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute('DELETE FROM watch_sources WHERE id = %s', (watch_id,))
+            conn.commit()
+
+
+def delete_watch_source_path(graph_id: str, source_kind: str, source_path: str) -> None:
+    """Удаляет строку отслеживания по ключу источника."""
+    if not graph_id or not source_kind or not source_path:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                DELETE FROM watch_sources
+                WHERE graph_id = %s AND source_kind = %s AND source_path = %s
+                ''',
+                (graph_id, source_kind, source_path),
+            )
+            conn.commit()
+
+
 def find_ingest_digest_by_hash(graph_id: str, content_hash: str) -> dict | None:
     """Возвращает запись, если этот текст уже встраивали в граф."""
     if not graph_id or not content_hash:

@@ -33,7 +33,7 @@ def _check_single_page(url: str, source: dict) -> dict:
         }
     title = title or url
 
-    state = parse_watch_state(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"), root=url)
     db_at, db_label = db_moment(source)
     if url in set(state["excluded"]):
         print(f"[auto_refresh] страница «{title}»: отменена при загрузке. пропуск.")
@@ -69,7 +69,7 @@ def _check_child_pages(url: str, source: dict) -> dict:
             "watched": 0,
         }
 
-    state = parse_watch_state(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"), root=url)
     hashes = state["files"]
     raw_hash = (source.get("content_hash") or "").strip()
     if not hashes and raw_hash and not raw_hash.startswith("{"):

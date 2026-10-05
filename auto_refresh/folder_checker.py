@@ -6,9 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
-    from app.handlers.folders_mac import EXTRACTABLE_EXTENSIONS, list_folder_files
+    from app.handlers.folders_mac import EXTRACTABLE_EXTENSIONS, list_folder_files, sort_files_by_mtime
 except ImportError:
-    from folders_mac import EXTRACTABLE_EXTENSIONS, list_folder_files
+    from folders_mac import EXTRACTABLE_EXTENSIONS, list_folder_files, sort_files_by_mtime
+
+# лимит Oracle VARCHAR2(512) у CONTENT_HASH; Postgres TEXT шире, но пишем компактно
+CONTENT_HASH_MAX = 512
 
 
 def as_utc(value) -> datetime | None:
@@ -60,7 +63,56 @@ def log_date_check(
     )
 
 
-def parse_watch_state(raw) -> dict:
+def _is_url(value: str) -> bool:
+    text = (value or "").lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _rel_key(path: str, root: str | None) -> str:
+    text = str(path or "")
+    if not text or not root or _is_url(text):
+        return text
+    try:
+        abs_path = os.path.abspath(os.path.expanduser(text))
+        abs_root = os.path.abspath(os.path.expanduser(root))
+        if abs_path == abs_root:
+            return "."
+        prefix = abs_root if abs_root.endswith(os.sep) else abs_root + os.sep
+        if abs_path.startswith(prefix):
+            return os.path.relpath(abs_path, abs_root)
+    except Exception:
+        pass
+    return text
+
+
+def _abs_key(path: str, root: str | None) -> str:
+    text = str(path or "")
+    if not text or _is_url(text):
+        return text
+    if text == ".":
+        return os.path.abspath(os.path.expanduser(root)) if root else text
+    if os.path.isabs(text):
+        return os.path.abspath(text)
+    if root:
+        try:
+            return os.path.abspath(os.path.join(os.path.expanduser(root), text))
+        except Exception:
+            return text
+    return text
+
+
+def _plain_hash(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("hash") or "")
+    return str(value or "")
+
+
+def _fits_content_hash_limit(text: str) -> bool:
+    # В Oracle лимит считается в байтах, поэтому проверяем UTF-8 размер.
+    return len((text or "").encode("utf-8")) <= CONTENT_HASH_MAX
+
+
+def parse_watch_state(raw, root: str | None = None) -> dict:
     """Хэши файлов плюс очереди: pending догружаются, excluded больше не отслеживаются."""
     empty = {"files": {}, "pending": [], "excluded": []}
     if not raw:
@@ -74,19 +126,64 @@ def parse_watch_state(raw) -> dict:
             return empty
     if not isinstance(data, dict):
         return empty
-    if any(key in data for key in ("files", "pending", "excluded")):
-        files = data.get("files") if isinstance(data.get("files"), dict) else {}
-        pending = [str(item) for item in (data.get("pending") or [])]
-        excluded = [str(item) for item in (data.get("excluded") or [])]
-        return {"files": dict(files), "pending": pending, "excluded": excluded}
+    if any(key in data for key in ("files", "pending", "excluded", "f", "p", "x")):
+        raw_files = data.get("f") if isinstance(data.get("f"), dict) else None
+        if raw_files is None:
+            raw_files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        pending = [str(item) for item in (data.get("p") if "p" in data else data.get("pending") or [])]
+        excluded = [str(item) for item in (data.get("x") if "x" in data else data.get("excluded") or [])]
+        files = {str(key): value for key, value in dict(raw_files).items()}
+        if root:
+            files = {_abs_key(key, root): value for key, value in files.items()}
+            pending = [_abs_key(item, root) for item in pending]
+            excluded = [_abs_key(item, root) for item in excluded]
+        return {"files": files, "pending": pending, "excluded": excluded}
     return {"files": dict(data), "pending": [], "excluded": []}
 
 
-def dump_watch_state(files: dict, pending: list, excluded: list) -> str:
-    return json.dumps(
-        {"files": files, "pending": list(pending), "excluded": list(excluded)},
-        ensure_ascii=False,
-    )
+def dump_watch_state(files: dict, pending: list, excluded: list, root: str | None = None) -> str:
+    """Компактный JSON под лимит CONTENT_HASH (512). Относительные пути, только хэш."""
+    compact_files = {}
+    for path, meta in dict(files or {}).items():
+        digest = _plain_hash(meta)
+        if not digest:
+            continue
+        compact_files[_rel_key(str(path), root)] = digest
+    payload = {
+        "f": compact_files,
+        "p": [_rel_key(str(item), root) for item in pending or []],
+        "x": [_rel_key(str(item), root) for item in excluded or []],
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if _fits_content_hash_limit(text):
+        return text
+    # хэши лежат в ingest_digests — для watch оставляем только очереди
+    slim = {"p": payload["p"], "x": payload["x"]}
+    text = json.dumps(slim, ensure_ascii=False, separators=(",", ":"))
+    if _fits_content_hash_limit(text):
+        print(
+            f"[auto_refresh] content_hash ужат до {len(text.encode('utf-8'))} байт "
+            f"(хэши файлов вынесены в ingest_digests)"
+        )
+        return text
+    # Лимит всё ещё превышен: сначала режем pending, потом excluded.
+    kept_pending = list(payload["p"])
+    kept_excluded = list(payload["x"])
+    while kept_pending:
+        kept_pending.pop()
+        text = json.dumps({"p": kept_pending, "x": kept_excluded}, ensure_ascii=False, separators=(",", ":"))
+        if _fits_content_hash_limit(text):
+            print(f"[auto_refresh] content_hash ужат с урезанным pending: {len(text.encode('utf-8'))} байт")
+            return text
+    while kept_excluded:
+        kept_excluded.pop()
+        text = json.dumps({"x": kept_excluded}, ensure_ascii=False, separators=(",", ":"))
+        if _fits_content_hash_limit(text):
+            print(f"[auto_refresh] content_hash ужат до excluded: {len(text.encode('utf-8'))} байт")
+            return text
+    text = json.dumps({"x": []}, ensure_ascii=False, separators=(",", ":"))
+    print("[auto_refresh] content_hash очищен до пустого excluded (лимит Oracle 512 байт)")
+    return text
 
 
 def folder_hashes(raw) -> dict:
@@ -143,7 +240,7 @@ def check_folder_changes(source: dict) -> dict:
         return {"files": [], "unchanged": [], "stale": [], "error": err}
 
     db_at, db_label = db_moment(source)
-    state = parse_watch_state(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"), root=folder)
     excluded = set()
     for raw in state["excluded"]:
         text = str(raw or "").strip()
@@ -175,6 +272,9 @@ def check_folder_changes(source: dict) -> dict:
             changed.append(path)
         else:
             unchanged.append(path)
+
+    changed = sort_files_by_mtime(changed)
+    unchanged = sort_files_by_mtime(unchanged)
 
     prefix = folder if folder.endswith(os.sep) else folder + os.sep
     stale = []

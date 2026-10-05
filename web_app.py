@@ -26,6 +26,9 @@ from config.settings import settings
 from storage.postgres.db_connect import (
     create_database,
     create_tables,
+    delete_ingest_digest,
+    delete_watch_source,
+    delete_watch_source_path,
     find_ingest_digest_by_hash,
     get_ingest_digest,
     list_watch_sources,
@@ -46,6 +49,7 @@ from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
     FileTooLargeError,
     extract_file_text,
+    is_temp_open_file,
     list_folder_files,
 )
 from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
@@ -440,7 +444,7 @@ def _remember_interrupt(slug: str, cancelled: bool) -> None:
             ),
             None,
         )
-        state = parse_watch_state(current.get("content_hash") if current else "")
+        state = parse_watch_state(current.get("content_hash") if current else "", root=snapshot["root"])
         done = snapshot["done"]
         batch = set(snapshot["items"])
         rest = [item for item in snapshot["items"] if item not in done]
@@ -458,7 +462,7 @@ def _remember_interrupt(slug: str, cancelled: bool) -> None:
             snapshot["graph_id"],
             snapshot["kind"],
             snapshot["root"],
-            content_hash=dump_watch_state(files, pending, excluded),
+            content_hash=dump_watch_state(files, pending, excluded, root=snapshot["root"]),
         )
     except Exception as e:
         print(f"web_app interrupt save warning: {e}")
@@ -489,7 +493,7 @@ def _save_manifest_finished(slug: str) -> None:
             ),
             None,
         )
-        state = parse_watch_state(current.get("content_hash") if current else "")
+        state = parse_watch_state(current.get("content_hash") if current else "", root=snapshot["root"])
         files = dict(state["files"])
         files.update(snapshot["done"])
         item_set = set(snapshot["items"])
@@ -499,7 +503,7 @@ def _save_manifest_finished(slug: str) -> None:
             snapshot["graph_id"],
             snapshot["kind"],
             snapshot["root"],
-            content_hash=dump_watch_state(files, pending, excluded),
+            content_hash=dump_watch_state(files, pending, excluded, root=snapshot["root"]),
         )
     except Exception as e:
         print(f"web_app manifest save warning: {e}")
@@ -1655,7 +1659,7 @@ body {
 .project-card .sources-open .menu-hint { max-width: 240px; }
 .src-board { margin-top: 4px; }
 .src-head { display: flex; justify-content: flex-end; margin: 0 0 8px; }
-.src-watch-title { width: 148px; text-align: center; font-size: 12px; line-height: 1.3; color: var(--muted); }
+.src-watch-title { width: 188px; text-align: center; font-size: 12px; line-height: 1.3; color: var(--muted); }
 .src-tree, .src-tree ul { list-style: none; margin: 0; padding: 0; }
 .tree-row { display: flex; align-items: center; gap: 10px; min-height: 28px; }
 .tree-branch { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
@@ -1667,8 +1671,14 @@ body {
 .tree-name { font-size: 14px; color: var(--text); word-break: break-word; }
 .tree-path { color: var(--muted); font-size: 11px; word-break: break-all; }
 .tree-leaf { padding: 1px 0; }
-.tree-watch { flex: 0 0 148px; width: 148px; display: flex; align-items: center; justify-content: center; }
+.tree-watch { flex: 0 0 188px; width: 188px; display: flex; align-items: center; justify-content: center; gap: 10px; }
 .src-tree .tree-check { position: relative; margin: 0; flex: 0 0 18px; width: 18px; height: 18px; }
+.tree-trash {
+  width: 28px; height: 28px; border: 1px solid transparent; border-radius: 8px;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
+}
+.tree-trash:hover { color: var(--error); border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.08); }
 button.tree-dir-name { border: none; background: transparent; padding: 0; cursor: pointer; text-align: left; font: inherit; color: var(--text); }
 .src-tree ul[hidden] { display: none; }
 .sources-warn { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
@@ -2953,6 +2963,19 @@ def _watch_box(kind: str, root: str, item: str, watched: bool) -> str:
     )
 
 
+def _trash_box(kind: str, root: str, item: str, title: str) -> str:
+    return (
+        '<button type="button" class="tree-trash" aria-label="Удалить источник" '
+        f'title="Удалить источник из проекта" data-kind="{escape(kind)}" '
+        f'data-root="{escape(root)}" data-item="{escape(item)}" '
+        f'data-title="{escape(title)}" onclick="askDeleteSource(this)">🗑</button>'
+    )
+
+
+def _item_actions(kind: str, root: str, item: str, watched: bool, title: str) -> str:
+    return _watch_box(kind, root, item, watched) + _trash_box(kind, root, item, title)
+
+
 def _tree_row(main: str, check: str, depth: int) -> str:
     margin = depth * 18
     nest = " tree-branch-nest" if margin else ""
@@ -2978,7 +3001,7 @@ def _nest_files(root: str, paths: list[str]) -> dict:
 
 def _file_row(title: str, kind: str, root: str, path: str, watched: bool, icon: str = "📄", depth: int = 0) -> str:
     main = '<span class="tree-caret-spacer"></span>' + _source_name(title, icon, path)
-    return '<li class="tree-leaf">' + _tree_row(main, _watch_box(kind, root, path, watched), depth) + "</li>"
+    return '<li class="tree-leaf">' + _tree_row(main, _item_actions(kind, root, path, watched, title), depth) + "</li>"
 
 
 def _render_file_tree(node: dict, kind: str, root: str, excluded: set, parent_watch: bool, open_now: bool, title: str, depth: int = 0) -> str:
@@ -2997,9 +3020,10 @@ def _render_file_tree(node: dict, kind: str, root: str, excluded: set, parent_wa
         + f'<button type="button" class="tree-name tree-dir-name" onclick="toggleTree(this.parentElement.querySelector(\'.tree-caret\'))">📁 {escape(title)}</button>'
         + path_bit
     )
+    actions = _trash_box(kind, root, root, title) if depth == 0 else ""
     return (
         '<li class="tree-dir">'
-        + _tree_row(main, "", depth)
+        + _tree_row(main, actions, depth)
         + f"<ul{hidden}>{inner}</ul></li>"
     )
 
@@ -3009,11 +3033,11 @@ def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, 
     title = node.get("title") or _page_label(source)
     children = node.get("children") or []
     watched = parent_watch and source not in excluded
-    box = _watch_box("confluence", root, source, watched)
+    actions = _item_actions("confluence", root, source, watched, title)
     name = _source_name(title, "🌐", source)
     if not children:
         main = '<span class="tree-caret-spacer"></span>' + name
-        return '<li class="tree-leaf">' + _tree_row(main, box, depth) + "</li>"
+        return '<li class="tree-leaf">' + _tree_row(main, actions, depth) + "</li>"
     hidden = "" if open_now else " hidden"
     inner = "".join(
         _render_page_tree(child, root, excluded, parent_watch, False, depth + 1)
@@ -3022,7 +3046,7 @@ def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, 
     main = _tree_toggle(open_now) + name
     return (
         '<li class="tree-dir">'
-        + _tree_row(main, box, depth)
+        + _tree_row(main, actions, depth)
         + f"<ul{hidden}>{inner}</ul></li>"
     )
 
@@ -3060,7 +3084,8 @@ def _excluded_items(row: dict | None, kind: str) -> set[str]:
     if not row:
         return set()
     from auto_refresh.folder_checker import parse_watch_state
-    state = parse_watch_state(row.get("content_hash"))
+    root = row.get("source_path") or ""
+    state = parse_watch_state(row.get("content_hash"), root=root)
     return {item for raw in state["excluded"] if (item := _canon_item(kind, str(raw)))}
 
 
@@ -3081,7 +3106,7 @@ def _folder_files(row: dict, ingested: list[str]) -> list[str]:
             found.extend(files)
     except Exception as e:
         print(f"web_app folder tree warning: {e}")
-    state = parse_watch_state(row.get("content_hash"))
+    state = parse_watch_state(row.get("content_hash"), root=root)
     for key in list(state["files"]) + ingested:
         if key and not _is_url(str(key)) and _under_root(str(key), root):
             found.append(os.path.abspath(str(key)))
@@ -3091,7 +3116,7 @@ def _folder_files(row: dict, ingested: list[str]) -> list[str]:
 def _confluence_pages(row: dict) -> list[str]:
     from auto_refresh.folder_checker import parse_watch_state
     root = (row.get("source_path") or "").strip()
-    state = parse_watch_state(row.get("content_hash"))
+    state = parse_watch_state(row.get("content_hash"), root=root)
     pages = [root] if root else []
     for key in state["files"]:
         if key and key != root:
@@ -3154,7 +3179,7 @@ def _tracked(row: dict | None, item: str) -> bool:
     if not row or not row.get("watch"):
         return False
     from auto_refresh.folder_checker import parse_watch_state
-    state = parse_watch_state(row.get("content_hash"))
+    state = parse_watch_state(row.get("content_hash"), root=row.get("source_path") or "")
     return item not in set(state["excluded"])
 
 
@@ -3313,7 +3338,7 @@ def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool)
             known.append(key)
     if item_key not in known:
         known.append(item_key)
-    state = parse_watch_state(row.get("content_hash"))
+    state = parse_watch_state(row.get("content_hash"), root=stored_root)
     excluded = set()
     for raw in state["excluded"]:
         key = _canon_item(kind, str(raw))
@@ -3331,9 +3356,92 @@ def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool)
     set_watch_source_state(
         row["id"],
         parent_watch,
-        dump_watch_state(state["files"], state["pending"], sorted(excluded)),
+        dump_watch_state(state["files"], state["pending"], sorted(excluded), root=stored_root),
     )
     return {path: parent_watch and path not in excluded for path in known}
+
+
+def _drop_project_source(graph_id: str, source_input: str) -> int:
+    deleted = 0
+    try:
+        deleted = int(linker.repository.delete_by_source_input(graph_id, source_input) or 0)
+    except Exception as e:
+        print(f"web_app source delete graph warning: {e}")
+        raise
+    try:
+        delete_ingest_digest(graph_id, source_input)
+    except Exception as e:
+        print(f"web_app source delete digest warning: {e}")
+    return deleted
+
+
+def _delete_source_item(scope: dict, kind: str, root: str, item: str) -> dict:
+    """Удаляет источник из проекта: карточки, связи, digest и учёт в watch_sources."""
+    from auto_refresh.folder_checker import dump_watch_state, parse_watch_state
+    graph_id = scope["graph_id"]
+    root_key = _canon_item(kind, root)
+    item_key = _canon_item(kind, item)
+    if not item_key:
+        raise ValueError("Не указан источник")
+
+    rows = list_watch_sources(watch_only=False, graph_id=graph_id)
+    row = _find_watch_row(rows, kind, root_key)
+    extract_child = bool(row.get("extract_child")) if row else False
+    stored_root = (row.get("source_path") if row else root) or root
+    whole_folder = kind == "folder" and item_key == root_key
+    whole = kind == "file" or (
+        kind == "confluence" and item_key == root_key and not extract_child
+    ) or whole_folder
+
+    deleted = 0
+    if whole_folder and row:
+        ingested = _project_source_inputs(graph_id)
+        for path in _known_items(row, ingested):
+            key = _canon_item(kind, path)
+            if key:
+                deleted += _drop_project_source(graph_id, key)
+    else:
+        deleted = _drop_project_source(graph_id, item_key)
+
+    if whole:
+        if row:
+            delete_watch_source(row["id"])
+        else:
+            delete_watch_source_path(graph_id, kind, stored_root)
+        return {"removed": [item_key], "deleted_cards": deleted}
+
+    if row is None:
+        return {"removed": [item_key], "deleted_cards": deleted}
+
+    ingested = _project_source_inputs(graph_id)
+    known = []
+    for path in _known_items(row, ingested):
+        key = _canon_item(kind, path)
+        if key and key != item_key and key not in known:
+            known.append(key)
+    state = parse_watch_state(row.get("content_hash"), root=stored_root)
+    files = {
+        key: value
+        for key, value in state["files"].items()
+        if _canon_item(kind, str(key)) != item_key
+    }
+    pending = [path for path in state["pending"] if _canon_item(kind, str(path)) != item_key]
+    excluded = set()
+    for raw in state["excluded"]:
+        key = _canon_item(kind, str(raw))
+        if key and key != item_key:
+            excluded.add(key)
+    excluded.add(item_key)
+    parent_watch = any(path not in excluded for path in known)
+    if not known and not files and not pending:
+        delete_watch_source(row["id"])
+    else:
+        set_watch_source_state(
+            row["id"],
+            parent_watch,
+            dump_watch_state(files, pending, sorted(excluded), root=stored_root),
+        )
+    return {"removed": [item_key], "deleted_cards": deleted}
 
 
 @app.get("/p/{slug}/sources", response_class=HTMLResponse)
@@ -3348,11 +3456,22 @@ async def project_sources(slug: str):
             <h1>Источники</h1>
             <p>{escape(scope["name"])}</p>
         </div>
-        <p class="sources-note">Директории и страницы с вложениями раскрываются, как в проводнике. Галочка включает отслеживание этого файла или страницы: ночное и ручное обновление смотрит только на отмеченные.</p>
+        <p class="sources-note">Директории и страницы с вложениями раскрываются, как в проводнике. Галочка включает отслеживание этого файла или страницы: ночное и ручное обновление смотрит только на отмеченные. Корзина удаляет источник из проекта вместе с карточками и связями — сам файл или страница Confluence не трогаются.</p>
         {_sources_tree_html(scope)}
+    </div>
+    <div class="modal-overlay" id="deleteSourceModal">
+        <div class="modal-box">
+            <h3>🗑 Удалить источник?</h3>
+            <p id="deleteSourceText">Источник будет удалён из проекта вместе со всеми карточками и связями. Файл на диске и страница Confluence останутся без изменений.</p>
+            <div class="modal-btns">
+                <button type="button" class="cancel" onclick="closeModal('deleteSourceModal')">Отмена</button>
+                <button type="button" class="confirm" id="confirmDeleteSource">Удалить</button>
+            </div>
+        </div>
     </div>
     """
     js = """
+    let pendingDelete = null;
     function toggleTree(button) {
         const row = button.closest('li');
         const list = row ? row.querySelector(':scope > ul') : null;
@@ -3386,7 +3505,48 @@ async def project_sources(slug: str):
             input.checked = previous;
         }
     }
-    """ % json.dumps(slug)
+    function askDeleteSource(button) {
+        pendingDelete = {
+            kind: button.dataset.kind || '',
+            root: button.dataset.root || '',
+            item: button.dataset.item || '',
+            title: button.dataset.title || button.dataset.item || 'источник',
+            button: button
+        };
+        const text = document.getElementById('deleteSourceText');
+        if (text) {
+            text.textContent = '«' + pendingDelete.title + '» будет удалён из проекта вместе со всеми карточками и связями. Файл на диске и страница Confluence останутся без изменений.';
+        }
+        openModal('deleteSourceModal');
+    }
+    async function confirmDeleteSource() {
+        if (!pendingDelete) return;
+        const body = new FormData();
+        body.set('kind', pendingDelete.kind);
+        body.set('root', pendingDelete.root);
+        body.set('item', pendingDelete.item);
+        const btn = document.getElementById('confirmDeleteSource');
+        if (btn) btn.disabled = true;
+        try {
+            const resp = await fetch('/p/' + encodeURIComponent(%s) + '/sources/delete', {method: 'POST', body: body});
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) {
+                alert((data && data.error) || 'Не удалось удалить источник');
+                return;
+            }
+            const row = pendingDelete.button.closest('li.tree-leaf, li.tree-dir');
+            if (row) row.remove();
+            closeModal('deleteSourceModal');
+        } catch (err) {
+            alert('Не удалось удалить источник');
+        } finally {
+            if (btn) btn.disabled = false;
+            pendingDelete = null;
+        }
+    }
+    const confirmBtn = document.getElementById('confirmDeleteSource');
+    if (confirmBtn) confirmBtn.addEventListener('click', confirmDeleteSource);
+    """ % (json.dumps(slug), json.dumps(slug))
     return HTMLResponse(html_page("Источники", body, js))
 
 
@@ -3412,6 +3572,29 @@ async def project_source_watch(
         print(f"web_app source watch warning: {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     return JSONResponse({"ok": True, "items": flags})
+
+
+@app.post("/p/{slug}/sources/delete")
+async def project_source_delete(
+    slug: str,
+    kind: str = Form(""),
+    root: str = Form(""),
+    item: str = Form(""),
+):
+    scope, err = _writable_scope(slug)
+    if err:
+        return JSONResponse({"ok": False, "error": "Проект недоступен"}, status_code=403)
+    kind = (kind or "").strip()
+    root = (root or "").strip()
+    item = (item or "").strip()
+    if kind not in {"folder", "confluence", "file"} or not root or not item:
+        return JSONResponse({"ok": False, "error": "Не указан источник"}, status_code=400)
+    try:
+        result = _delete_source_item(scope, kind, root, item)
+    except Exception as e:
+        print(f"web_app source delete warning: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True, **result})
 
 
 @app.get("/p/{slug}/progress.json")
@@ -4090,6 +4273,12 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
 
     if not file or not file.filename:
         return RedirectResponse(f"/p/{slug}/add?msg=Выберите файл&st=err", status_code=303)
+
+    if is_temp_open_file(file.filename):
+        return RedirectResponse(
+            f"/p/{slug}/add?msg=Временные файлы с именем на «~» не загружаются&st=err",
+            status_code=303,
+        )
 
     ext = Path(file.filename).suffix.lower()
     if ext not in SUPPORTED_UPLOAD_EXTS:

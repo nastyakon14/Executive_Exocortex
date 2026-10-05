@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.handlers.confluence import get_confluence_page_content, is_confluence_fetch_error, page_plain_text
-from app.handlers.folders_mac import FileTooLargeError, extract_file_text
+from app.handlers.folders_mac import FileTooLargeError, extract_file_text, is_temp_open_file
 from storage.postgres.db_connect import (
     delete_ingest_digest,
     get_ingest_digest,
@@ -95,7 +95,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
         return 0, 0, 1, probe["error"]
 
     graph_id = source["graph_id"]
-    state = parse_watch_state(source.get("content_hash"))
+    state = parse_watch_state(source.get("content_hash"), root=source.get("source_path") or "")
     hashes = dict(state["files"])
     pending = set(state["pending"])
     excluded = set(state["excluded"])
@@ -120,10 +120,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
         pending.discard(path)
         prev, _stored = file_meta(hashes.get(path))
         if prev:
-            try:
-                hashes[path] = {"hash": prev, "mtime": os.path.getmtime(path)}
-            except OSError:
-                pass
+            hashes[path] = prev
         skipped += 1
 
     for path in probe.get("files") or []:
@@ -145,7 +142,7 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
             text = extract_file_text(path)
             digest = _text_hash(text)
             if _same_source_text(graph_id, path, digest, file_meta(hashes.get(path))[0]):
-                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
+                hashes[path] = digest
                 pending.discard(path)
                 skipped += 1
                 print(f"[auto_refresh] файл «{os.path.basename(path)}»: текст не изменился, запись в граф пропущена.")
@@ -154,14 +151,14 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
                 print(f"[auto_refresh] файл «{os.path.basename(path)}»: текст пустой, старые карточки удаляются.")
                 with _ingest_run_lock:
                     _drop_source(graph_id, path)
-                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
+                hashes[path] = digest
                 pending.discard(path)
                 updated += 1
                 continue
             print(f"[auto_refresh] файл «{os.path.basename(path)}»: запуск обновления графа.")
             ok, ans = _ingest_source(slug, graph_id, text, path, f"[auto] {os.path.basename(path)}")
             if ok:
-                hashes[path] = {"hash": digest, "mtime": os.path.getmtime(path)}
+                hashes[path] = digest
                 pending.discard(path)
                 updated += 1
                 print(f"[auto_refresh] файл «{os.path.basename(path)}»: обновление завершено.")
@@ -184,7 +181,8 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
     if updated == 0 and failed == 0:
         print(f"[auto_refresh] папка: обновлять нечего, пропущено {skipped}.")
         return updated, skipped, failed, last_err
-    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded))
+    root = source.get("source_path") or ""
+    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded), root=root)
     if failed and updated == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
@@ -200,13 +198,14 @@ def _apply_folder(source: dict, slug: str, probe: dict) -> tuple[int, int, int, 
 def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[int, int, int, str]:
     """Каждая дочерняя страница сверяется и встраивается отдельно, как файл в папке."""
     graph_id = source["graph_id"]
-    state = parse_watch_state(source.get("content_hash"))
+    root = source.get("source_path") or ""
+    state = parse_watch_state(source.get("content_hash"), root=root)
     hashes = dict(state["files"])
     pending = set(state["pending"])
     excluded = set(state["excluded"])
     raw_hash = (source.get("content_hash") or "").strip()
     if not hashes and raw_hash and not raw_hash.startswith("{"):
-        hashes = {(source.get("source_path") or ""): raw_hash}
+        hashes = {root: raw_hash}
 
     updated = skipped = failed = 0
     last_err = ""
@@ -242,7 +241,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
                 last_err = text.strip()
                 continue
             digest = _text_hash(text)
-            if _same_source_text(graph_id, source_input, digest, hashes.get(source_input) or ""):
+            if _same_source_text(graph_id, source_input, digest, file_meta(hashes.get(source_input))[0]):
                 hashes[source_input] = digest
                 pending.discard(source_input)
                 skipped += 1
@@ -272,7 +271,7 @@ def _apply_confluence_children(source: dict, slug: str, probe: dict) -> tuple[in
             failed += 1
             last_err = str(e)
 
-    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded))
+    payload = dump_watch_state(hashes, sorted(pending), sorted(excluded), root=root)
     if failed and updated == 0 and skipped == 0:
         mark_watch_synced(source["id"], error=last_err, synced=False)
     else:
@@ -298,8 +297,8 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
     url = source["source_path"]
     print(f"[auto_refresh] страница «{url}»: запуск загрузки текста.")
     graph_id = source["graph_id"]
-    state = parse_watch_state(source.get("content_hash"))
-    stored = state["files"].get(url) or ""
+    state = parse_watch_state(source.get("content_hash"), root=url)
+    stored = file_meta(state["files"].get(url))[0]
     raw_hash = (source.get("content_hash") or "").strip()
     if not stored and raw_hash and not raw_hash.startswith("{"):
         stored = raw_hash
@@ -325,7 +324,9 @@ def _apply_confluence(source: dict, slug: str, probe: dict) -> tuple[int, int, i
         files[url] = page_digest
         mark_watch_synced(
             source["id"],
-            content_hash=dump_watch_state(files, pending, [item for item in excluded if item != url]),
+            content_hash=dump_watch_state(
+                files, pending, [item for item in excluded if item != url], root=url,
+            ),
             synced=True,
         )
 
@@ -351,6 +352,9 @@ def _apply_file(source: dict, slug: str) -> tuple[int, int, int, str]:
     """Один файл, отмеченный галочкой вне папки."""
     path = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
     name = os.path.basename(path) or path
+    if is_temp_open_file(path):
+        print(f"[auto_refresh] файл «{name}»: временный файл с префиксом '~'. пропуск.")
+        return 0, 1, 0, ""
     if not os.path.isfile(path):
         print(f"[auto_refresh] файл «{name}»: не найден. пропуск.")
         return 0, 0, 1, f"Файл не найден: {name}"
@@ -412,6 +416,8 @@ def _page_label(page: dict) -> str:
 def _lone_file_needs_update(source: dict) -> tuple[bool, str]:
     path = os.path.abspath(os.path.expanduser(source.get("source_path") or ""))
     name = os.path.basename(path) or path
+    if is_temp_open_file(path):
+        return False, name
     if not os.path.isfile(path):
         return False, name
     try:
@@ -441,6 +447,8 @@ def _publish_refresh_plan(slug: str, probes: dict, lone_files: list[dict]) -> No
             page_names.append(str(probe.get("title") or src.get("source_path") or "страница"))
     for src in lone_files:
         path = os.path.abspath(os.path.expanduser(src.get("source_path") or ""))
+        if is_temp_open_file(path):
+            continue
         if not os.path.isfile(path):
             continue
         files_tracked += 1
@@ -487,6 +495,13 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
         folders = [s for s in sources if s.get("source_kind") == "folder"]
         pages = [s for s in sources if s.get("source_kind") == "confluence"]
         lone_files = [s for s in sources if s.get("source_kind") == "file"]
+        lone_files.sort(
+            key=lambda s: (
+                os.path.getmtime(os.path.abspath(os.path.expanduser(s.get("source_path") or "")))
+                if os.path.isfile(os.path.abspath(os.path.expanduser(s.get("source_path") or "")))
+                else 0.0
+            )
+        )
         probes: dict[int, tuple[str, dict, dict]] = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
             jobs = {}

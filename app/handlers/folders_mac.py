@@ -52,6 +52,24 @@ class FileTooLargeError(ValueError):
         super().__init__(message)
 
 
+def is_temp_open_file(path: str) -> bool:
+    """Временные файлы открытых документов Office и аналоги (имена с ~)."""
+    name = os.path.basename(path or "")
+    return bool(name) and name.startswith("~")
+
+
+def _mtime_key(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def sort_files_by_mtime(files: list[str]) -> list[str]:
+    """Сначала старые, потом новые — чтобы более поздний файл не перезаписал более ранний."""
+    return sorted(files, key=_mtime_key)
+
+
 def extract_paths(root_path):
     """Извлекает дочернее содержимое директории."""
     all_files = []
@@ -59,6 +77,8 @@ def extract_paths(root_path):
 
     for dirpath, dirs, filenames in os.walk(root_path):
         for filename in filenames:
+            if filename.startswith("~"):
+                continue
             full_path = os.path.abspath(os.path.join(dirpath, filename))
             all_files.append(full_path)
         for dirname in dirs:
@@ -80,15 +100,20 @@ def list_folder_files(folder_path, extract_child_content=False):
 
     if extract_child_content:
         _, files = extract_paths(folder_path)
-        files = [f for f in files if f.lower().endswith(EXTRACTABLE_EXTENSIONS)]
+        files = [
+            f for f in files
+            if f.lower().endswith(EXTRACTABLE_EXTENSIONS) and not is_temp_open_file(f)
+        ]
     else:
         files = [
             os.path.abspath(str(f))
             for f in Path(folder_path).iterdir()
-            if f.is_file() and f.suffix.lower() in EXTRACTABLE_EXTENSIONS
+            if f.is_file()
+            and f.suffix.lower() in EXTRACTABLE_EXTENSIONS
+            and not is_temp_open_file(str(f))
         ]
-        files.sort()
 
+    files = sort_files_by_mtime(files)
     if not files:
         return [], (
             "В директории нет поддерживаемых файлов "
