@@ -385,6 +385,9 @@ let raf = 0;
 let hay = [];
 const CELL = 160;
 let grid = new Map();
+let clusters = [];
+let clusterHot = -1;
+let hoverX = 0, hoverY = 0;
 
 function fillOf(i) { return G[i] ? '#38BDF8' : PAL[C[i]][0]; }
 function strokeOf(i) { return G[i] ? '#FFFFFF' : PAL[C[i]][1]; }
@@ -443,6 +446,69 @@ function buildIndex() {
     const m = META[i] || [];
     hay[i] = ((m[7] || '') + ' ' + (L[i] || '') + ' ' + (m[2] || '') + ' ' + (m[4] || '') + ' ' + (m[5] || '')).toLowerCase();
   }
+}
+
+function sourceLabel(raw) {
+  const src = String(raw || '').trim();
+  if (!src) return '';
+  if (src === 'text') return 'текст';
+  if (/^https?:\/\//i.test(src)) {
+    const tail = src.replace(/[#?].*$/, '').replace(/\/+$/, '').split('/').pop();
+    return tail || src;
+  }
+  const parts = src.split(/[\\/]/);
+  return parts[parts.length - 1] || src;
+}
+
+function buildClusters() {
+  const grouped = new Map();
+  for (let i = 0; i < N; i++) {
+    if (G[i] === 1) continue;
+    const key = C[i] | 0;
+    let g = grouped.get(key);
+    if (!g) {
+      g = { color: key, nodes: [], sumX: 0, sumY: 0, topic: new Map(), source: new Map() };
+      grouped.set(key, g);
+    }
+    g.nodes.push(i);
+    g.sumX += X[i];
+    g.sumY += Y[i];
+    const m = META[i] || [];
+    const topic = String(m[2] || '').trim();
+    if (topic) g.topic.set(topic, (g.topic.get(topic) || 0) + 1);
+    const src = String(m[8] || '').trim();
+    if (src) g.source.set(src, (g.source.get(src) || 0) + 1);
+  }
+
+  clusters = [];
+  grouped.forEach(function(g, cid) {
+    const count = g.nodes.length;
+    if (!count) return;
+    const cx = g.sumX / count;
+    const cy = g.sumY / count;
+    let outer = 60;
+    for (let k = 0; k < g.nodes.length; k++) {
+      const i = g.nodes[k];
+      const dx = X[i] - cx, dy = Y[i] - cy;
+      outer = Math.max(outer, Math.sqrt(dx * dx + dy * dy) + R[i] + 10);
+    }
+    // "Облако" кластера делаем компактным, чтобы не перекрывать весь экран.
+    const drawR = Math.max(46, Math.min(190, outer * 0.45 + 26));
+    const hitR = Math.max(drawR * 1.18, 64);
+    const topics = [...g.topic.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]);
+    const sources = [...g.source.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => x[0]);
+    clusters.push({
+      id: cid,
+      color: g.color,
+      n: count,
+      cx: cx,
+      cy: cy,
+      r: drawR,
+      hr: hitR,
+      topics: topics,
+      sources: sources
+    });
+  });
 }
 
 function reindexNode(i, oldX, oldY) {
@@ -546,6 +612,28 @@ function draw() {
   const maxE = zoom < 0.14 ? 4500 : 9000;
   const maxN = zoom < 0.2 ? 2800 : 5500;
 
+  // Показываем облака кластеров только на общем плане, чтобы не шуметь при приближении.
+  if (zoom <= 0.85 || clusterHot >= 0) {
+    for (let ci = 0; ci < clusters.length; ci++) {
+      const c = clusters[ci];
+      const sr = c.r * zoom;
+      if (sr < 12) continue;
+      const sx0 = sx(c.cx), sy0 = sy(c.cy);
+      if (sx0 + sr < -30 || sx0 - sr > W + 30 || sy0 + sr < -30 || sy0 - sr > H + 30) continue;
+      const pal = PAL[c.color % PAL.length];
+      const active = clusterHot === ci;
+      ctx.globalAlpha = active ? 0.12 : 0.05;
+      ctx.beginPath();
+      ctx.arc(sx0, sy0, sr, 0, Math.PI * 2);
+      ctx.fillStyle = pal[0];
+      ctx.fill();
+      ctx.globalAlpha = active ? 0.45 : 0.16;
+      ctx.lineWidth = active ? 1.8 : 1.0;
+      ctx.strokeStyle = pal[1];
+      ctx.stroke();
+    }
+  }
+
   if (showEdges) {
     let drawn = 0;
     ctx.lineWidth = Math.max(0.7, Math.min(2.2, zoom * 1.2));
@@ -611,11 +699,67 @@ function hit(px, py) {
   return best;
 }
 
+function hitCluster(px, py) {
+  const x = wx(px), y = wy(py);
+  let best = -1;
+  let bestScore = Infinity;
+  for (let i = 0; i < clusters.length; i++) {
+    const c = clusters[i];
+    const dx = x - c.cx, dy = y - c.cy;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    const hr = c.hr || c.r;
+    if (d > hr) continue;
+    const score = (hr - d);
+    if (score < bestScore) {
+      best = i;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+function clusterByColor(colorId) {
+  const cid = colorId | 0;
+  for (let i = 0; i < clusters.length; i++) {
+    if ((clusters[i].color | 0) === cid) return i;
+  }
+  return -1;
+}
+
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
+function hideClusterTip() {
+  const tip = document.getElementById('cluster-tip');
+  if (!tip) return;
+  tip.style.display = 'none';
+}
+function showClusterTip(ci, px, py) {
+  const tip = document.getElementById('cluster-tip');
+  if (!tip || ci < 0 || ci >= clusters.length) return;
+  const c = clusters[ci];
+  const topic = c.topics.length ? c.topics.map(esc).join(' / ') : 'Темы без названия';
+  const samples = c.sources.length
+    ? c.sources.map(function(s) { return '<li>' + esc(sourceLabel(s)) + '</li>'; }).join('')
+    : '<li>источник не указан</li>';
+  tip.innerHTML =
+    '<div class="ct-title">О чем этот кластер</div>' +
+    '<div class="ct-row"><b>Карточек:</b> ' + c.n + '</div>' +
+    '<div class="ct-row"><b>Ключевые темы:</b> ' + topic + '</div>' +
+    '<div class="ct-row"><b>Примеры источников:</b><ul>' + samples + '</ul></div>';
+  tip.style.display = 'block';
+  const pad = 12;
+  const tw = tip.offsetWidth || 320;
+  const th = tip.offsetHeight || 160;
+  let left = Math.round(px + 14);
+  let top = Math.round(py + 14);
+  if (left + tw > W - pad) left = Math.max(pad, W - tw - pad);
+  if (top + th > H - pad) top = Math.max(pad, H - th - pad);
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+
 function closeDetail() {
   document.getElementById('detail-panel').style.display = 'none';
   selected = -1;
@@ -745,7 +889,32 @@ window.addEventListener('mouseup', function(e) {
 window.addEventListener('mousemove', function(e) {
   if (nodeDrag < 0 && !panDrag) {
     const rect = wrap.getBoundingClientRect();
-    wrap.style.cursor = hit(e.clientX - rect.left, e.clientY - rect.top) >= 0 ? 'pointer' : 'grab';
+    const lx = e.clientX - rect.left;
+    const ly = e.clientY - rect.top;
+    hoverX = lx; hoverY = ly;
+    const ni = hit(lx, ly);
+    if (ni >= 0) {
+      if (G[ni] === 0) {
+        clusterHot = clusterByColor(C[ni]);
+        if (clusterHot >= 0) showClusterTip(clusterHot, lx, ly);
+        else hideClusterTip();
+      } else {
+        clusterHot = -1;
+        hideClusterTip();
+      }
+      wrap.style.cursor = 'pointer';
+    } else {
+      const ci = hitCluster(lx, ly);
+      clusterHot = ci;
+      if (ci >= 0) {
+        showClusterTip(ci, lx, ly);
+        wrap.style.cursor = 'help';
+      } else {
+        hideClusterTip();
+        wrap.style.cursor = 'grab';
+      }
+    }
+    requestDraw();
     return;
   }
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
@@ -917,6 +1086,9 @@ function applyPayload(data) {
   document.getElementById('stat-e').textContent = data.te || 0;
   document.getElementById('stat-r').textContent = data.tr || 0;
   buildIndex();
+  buildClusters();
+  clusterHot = -1;
+  hideClusterTip();
   resize();
   fit();
   requestDraw();
@@ -1034,6 +1206,15 @@ def _build_html(
   }}
   #detail-panel .neighbor-item:hover {{ background: rgba(59,130,246,0.2); }}
   #detail-panel hr {{ border-color: #334155; margin: 10px 0; }}
+  #cluster-tip {{
+    position: absolute; display: none; z-index: 12; max-width: 330px;
+    background: rgba(15, 23, 42, 0.97); border: 1px solid #334155; border-radius: 10px;
+    padding: 10px 12px; pointer-events: none; box-shadow: 0 8px 20px rgba(0,0,0,.25);
+    font-size: 12px; color: #e2e8f0; line-height: 1.45;
+  }}
+  #cluster-tip .ct-title {{ font-weight: 700; margin-bottom: 6px; color: #f8fafc; }}
+  #cluster-tip .ct-row {{ margin: 3px 0; }}
+  #cluster-tip ul {{ margin: 4px 0 0 16px; }}
   #search-box {{ position: absolute; top: 64px; left: 16px; z-index: 10; display: flex; flex-direction: column; gap: 8px; }}
   #search-box input {{
     background: rgba(15, 23, 42, 0.95); border: 1px solid #334155; border-radius: 8px;
@@ -1059,6 +1240,8 @@ def _build_html(
   body.light-theme #detail-panel a {{ color: #2563eb; }}
   body.light-theme #detail-panel .neighbor-item {{ background: #f3f4f6; color: #374151; }}
   body.light-theme #search-box input {{ background: #ffffff; border: 1px solid #d1d5db; color: #374151; }}
+  body.light-theme #cluster-tip {{ background: rgba(255,255,255,0.98); border: 1px solid #d1d5db; color: #374151; }}
+  body.light-theme #cluster-tip .ct-title {{ color: #111827; }}
 </style>
 </head>
 <body class="light-theme">
@@ -1082,6 +1265,7 @@ def _build_html(
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
   <div id="load-hint">Загрузка графа…</div>
+  <div id="cluster-tip"></div>
 </div>
 <div id="legend">
   <h3>Легенда</h3>

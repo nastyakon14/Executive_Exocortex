@@ -10,6 +10,57 @@ from dataclasses import dataclass, field
 
 from storage.neo4j.client import Neo4jClient
 
+_ENTITY_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+_RU_NAME_SUFFIXES = (
+    "ого", "ему", "ами", "ями", "ыми", "ими",
+    "овым", "евым", "овой", "евой", "овою",
+    "ова", "ева", "ина", "ына", "ову", "еву", "ину",
+    "ове", "еве",
+    "ой", "ий", "ый", "ая", "ое", "ые", "ие", "ую", "юю",
+    "ов", "ев", "ин", "ын", "ым", "им", "ом", "ем",
+    "ах", "ях", "ам", "ям",
+    "а", "я", "у", "ю", "е", "о", "ы", "и", "й",
+)
+
+
+def _word_stem(word: str) -> str:
+    w = (word or "").casefold()
+    if len(w) <= 3:
+        return w
+    for suf in _RU_NAME_SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            w = w[:-len(suf)]
+            break
+    return w[:5] if len(w) > 5 else w
+
+
+def _person_stems(text: str) -> tuple[str, ...]:
+    words = _ENTITY_WORD_RE.findall((text or "").casefold())
+    return tuple(_word_stem(w) for w in words if w)
+
+
+def _normalize_entity_identity(raw_tag: str) -> tuple[str, str, str]:
+    """
+    Возвращает (name_key, display_name, entity_type).
+    Для ФИО name_key склеивается по стемам, чтобы падежи шли в одну сущность.
+    """
+    raw = str(raw_tag or "").strip()
+    if not raw:
+        return "", "", "tag"
+
+    compact = " ".join(raw.replace("_", " ").replace("-", " ").split())
+    words = _ENTITY_WORD_RE.findall(compact)
+    looks_person = 2 <= len(words) <= 3 and all(len(w) >= 2 for w in words)
+    if looks_person:
+        stems = _person_stems(compact)
+        if stems:
+            key = "person:" + "|".join(stems)
+            display = " ".join(words)
+            return key, display, "person"
+
+    key = compact.casefold().replace(" ", "_")
+    return key, compact, "tag"
+
 
 def _to_lucene_query(text: str) -> str:
     """Собирает безопасный запрос для Neo4j full-text (Lucene)."""
@@ -294,23 +345,50 @@ class ZettelRepository:
         """Создаёт узлы Entity (привязанные к user_id) и связи MENTIONS."""
         if not tags:
             return
-        
+
+        prepared: list[dict[str, str]] = []
+        seen_keys = set()
+        for tag in tags:
+            name_key, display_name, entity_type = _normalize_entity_identity(tag)
+            if not name_key or name_key in seen_keys:
+                continue
+            seen_keys.add(name_key)
+            prepared.append({
+                "name": name_key,
+                "display_name": display_name or name_key,
+                "entity_type": entity_type or "tag",
+            })
+        if not prepared:
+            return
+
         now = datetime.now(timezone.utc).isoformat()
-        
+
         # Entity уникальна в рамках (name, user_id)
         query = """
         MATCH (z:Zettel {zettel_id: $zettel_id, user_id: $user_id})
         UNWIND $tags as tag
-        MERGE (e:Entity {name: tag, user_id: $user_id})
-        ON CREATE SET e.display_name = tag, e.entity_type = 'tag', e.mention_count = 1
-        ON MATCH SET e.mention_count = e.mention_count + 1
+        MERGE (e:Entity {name: tag.name, user_id: $user_id})
+        ON CREATE SET
+            e.display_name = tag.display_name,
+            e.entity_type = tag.entity_type,
+            e.mention_count = 1
+        ON MATCH SET
+            e.mention_count = e.mention_count + 1,
+            e.display_name = CASE
+                WHEN coalesce(e.display_name, '') = '' THEN tag.display_name
+                ELSE e.display_name
+            END,
+            e.entity_type = CASE
+                WHEN e.entity_type = 'tag' AND tag.entity_type = 'person' THEN 'person'
+                ELSE e.entity_type
+            END
         MERGE (z)-[:MENTIONS {created_at: datetime($created_at)}]->(e)
         """
-        
+
         self.client.execute_write(query, {
             "zettel_id": zettel_id,
             "user_id": user_id,
-            "tags": tags,
+            "tags": prepared,
             "created_at": now,
         })
     
@@ -1057,26 +1135,52 @@ class ZettelRepository:
 
         entities = []
         seen_entities = set()
+        mention_by_key: Dict[str, int] = {}
+        display_by_key: Dict[str, str] = {}
+        entity_type_by_key: Dict[str, str] = {}
+        edge_entity_key: Dict[Tuple[str, str], str] = {}
         for row in entities_result:
             uid = row.get("user_id") or ""
             raw_name = row.get("name") or ""
-            key = f"{uid}::{raw_name}" if prefix_luhmann else raw_name
+            name_key, display_name, entity_type = _normalize_entity_identity(raw_name)
+            if not name_key:
+                continue
+            key = f"{uid}::{name_key}" if prefix_luhmann else name_key
+            edge_entity_key[(uid, raw_name)] = key
+            mention_by_key[key] = mention_by_key.get(key, 0) + int(row.get("mention_count") or 0)
+            raw_display = (row.get("display_name") or "").strip() or display_name
+            chosen = display_by_key.get(key)
+            if not chosen or len(raw_display) < len(chosen):
+                display_by_key[key] = raw_display
+            cur_type = entity_type_by_key.get(key)
+            if cur_type != "person":
+                entity_type_by_key[key] = "person" if (entity_type == "person" or row.get("entity_type") == "person") else (cur_type or "tag")
             if key in seen_entities:
                 continue
             seen_entities.add(key)
             entities.append({
                 "name": key,
-                "display_name": row.get("display_name") or raw_name,
-                "entity_type": row.get("entity_type") or "tag",
-                "mention_count": row.get("mention_count") or 0,
+                "display_name": raw_display,
+                "entity_type": entity_type_by_key.get(key, "tag"),
+                "mention_count": mention_by_key.get(key, 0),
             })
+        for item in entities:
+            key = item["name"]
+            item["display_name"] = display_by_key.get(key) or item["display_name"]
+            item["entity_type"] = entity_type_by_key.get(key, item["entity_type"])
+            item["mention_count"] = mention_by_key.get(key, item["mention_count"])
 
         edges = []
         for row in edges_result:
             to_id = row["to_id"]
-            if prefix_luhmann and str(to_id).startswith("entity:"):
+            if str(to_id).startswith("entity:"):
                 uid = row.get("user_id") or ""
-                to_id = f"entity:{uid}::{to_id[7:]}"
+                raw = str(to_id)[7:]
+                canon = edge_entity_key.get((uid, raw))
+                if canon:
+                    to_id = f"entity:{canon}"
+                elif prefix_luhmann:
+                    to_id = f"entity:{uid}::{raw}"
             edges.append({
                 "from_id": row["from_id"],
                 "to_id": to_id,
