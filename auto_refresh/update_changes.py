@@ -428,6 +428,35 @@ def _lone_file_needs_update(source: dict) -> tuple[bool, str]:
     return file_needs_extract(path, db_at, mtime), name
 
 
+def _has_refresh_actions(probes: dict, lone_files: list[dict]) -> bool:
+    """Нужно ли запускать фазу обновления графа после проверки дат."""
+    for kind, _src, probe in probes.values():
+        if probe.get("error"):
+            return True
+        if kind == "folder":
+            if (probe.get("files") or []) or (probe.get("stale") or []):
+                return True
+            continue
+        # Confluence
+        if probe.get("extract_child"):
+            if (probe.get("pages") or []) or (probe.get("stale") or []):
+                return True
+        elif probe.get("changed"):
+            return True
+
+    for src in lone_files:
+        path = os.path.abspath(os.path.expanduser(src.get("source_path") or ""))
+        if is_temp_open_file(path):
+            continue
+        # Отсутствующий файл — это не "без изменений", нужно пройти _apply_file и зафиксировать ошибку.
+        if not os.path.isfile(path):
+            return True
+        needs, _name = _lone_file_needs_update(src)
+        if needs:
+            return True
+    return False
+
+
 def _publish_refresh_plan(slug: str, probes: dict, lone_files: list[dict]) -> None:
     file_names: list[str] = []
     page_names: list[str] = []
@@ -517,6 +546,15 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                     probes[src["id"]] = (kind, src, {"error": str(e), "changed": False, "files": [], "stale": []})
 
         _publish_refresh_plan(slug, probes, lone_files)
+        if not _has_refresh_actions(probes, lone_files):
+            print("[auto_refresh] источники не новее последней сверки: обновление графа не запускается.")
+            return {
+                "ok": True,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+                "message": "Изменений нет: источники не новее последней сверки",
+            }
         for kind, src, probe in probes.values():
             _guard_ingest(slug, src.get("source_path") or src.get("source_kind") or "")
             if kind == "folder":
@@ -561,7 +599,7 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
         "failed": failed,
         "message": message,
     }
-    if result["ok"]:
+    if result["ok"] and updated > 0:
         from web_app import touch_project_data
         touch_project_data(slug, "refresh")
     return result
