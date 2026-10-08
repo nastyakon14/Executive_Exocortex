@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     graphrag_search_limit: int = 5
     graphrag_context_hops: int = 1
     graphrag_similarity_threshold: float = 0.3
+    graphrag_reranker_enabled: bool = True
+    graphrag_reranker_model_name: str = "google/gemini-2.5-flash"
+    graphrag_reranker_temperature: float = 0.0
+    graphrag_reranker_pool_size: int = 24
+    graphrag_reranker_max_chars_per_doc: int = 900
 
     # chromadb (legacy)
     chroma_mode: Literal["http", "persistent", "memory"] = "http"

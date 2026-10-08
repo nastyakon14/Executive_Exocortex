@@ -12,6 +12,7 @@ from datetime import datetime
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -147,6 +148,100 @@ class RAGResponse:
     processing_time_ms: int = 0
 
 
+class RerankItem(BaseModel):
+    idx: int = Field(description="Индекс кандидата из входного списка (нумерация с 1).")
+    score: float = Field(description="Оценка релевантности от 0 до 1.")
+
+
+class RerankResult(BaseModel):
+    items: list[RerankItem] = Field(default_factory=list)
+
+
+class GraphReranker:
+    """LLM-reranker для переранжирования кандидатов после retrieval."""
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        model_name: str = settings.graphrag_reranker_model_name,
+        temperature: float = settings.graphrag_reranker_temperature,
+        max_chars_per_doc: int = settings.graphrag_reranker_max_chars_per_doc,
+    ):
+        self.enabled = bool(enabled)
+        self.max_chars_per_doc = max(300, int(max_chars_per_doc))
+        self.llm = None
+        self.structured_llm = None
+        if self.enabled:
+            self.llm = make_chat_openai(model_name, temperature, streaming=False)
+            self.structured_llm = self.llm.with_structured_output(RerankResult)
+
+    @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        body = " ".join((text or "").split())
+        if len(body) <= limit:
+            return body
+        return body[: limit - 1] + "…"
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[tuple[ZettelNode, float]],
+        limit: int,
+    ) -> list[tuple[ZettelNode, float]]:
+        if not self.enabled or not self.structured_llm or not candidates:
+            return candidates[:limit]
+
+        prompt_rows: list[str] = []
+        for i, (node, base_score) in enumerate(candidates, 1):
+            prompt_rows.append(
+                (
+                    f"[{i}] luhmann={node.luhmann_id or '-'} "
+                    f"type={node.thought_type or '-'} base={float(base_score):.4f}\n"
+                    f"topic: {node.topic or '-'}\n"
+                    f"content: {self._clip(node.content or '', self.max_chars_per_doc)}"
+                )
+            )
+        prompt = (
+            "Ты reranker для GraphRAG. Оцени каждый кандидат, насколько он помогает ответить на запрос.\n"
+            "Правила:\n"
+            "1) Учитывай только семантическую полезность для ответа.\n"
+            "2) Штрафуй общие/шумные мысли.\n"
+            "3) Сохрани только релевантные кандидаты, отсортируй по убыванию score.\n"
+            "4) score от 0 до 1.\n\n"
+            f"Запрос:\n{query}\n\n"
+            f"Кандидаты:\n{chr(10).join(prompt_rows)}"
+        )
+        try:
+            ranked: RerankResult = invoke_structured(
+                self.structured_llm,
+                [
+                    SystemMessage(content="Ты аккуратный ранжировщик релевантности для русскоязычного GraphRAG."),
+                    HumanMessage(content=prompt),
+                ],
+            )
+        except Exception as e:
+            print(f"[GraphRAG] reranker fallback (model error): {e}")
+            return candidates[:limit]
+
+        chosen: list[tuple[ZettelNode, float]] = []
+        seen = set()
+        for item in ranked.items:
+            idx = int(item.idx) - 1
+            if idx < 0 or idx >= len(candidates) or idx in seen:
+                continue
+            seen.add(idx)
+            node, _base = candidates[idx]
+            score = max(0.0, min(1.0, float(item.score)))
+            node.similarity = score
+            chosen.append((node, score))
+            if len(chosen) >= limit:
+                break
+
+        if not chosen:
+            return candidates[:limit]
+        return chosen
+
+
 # извлечение контекста из графа (retrieval)
 
 class GraphRetriever:
@@ -159,13 +254,17 @@ class GraphRetriever:
         self,
         embedding_model: LocalEmbeddingModel = None,
         repository: ZettelRepository = None,
+        reranker: GraphReranker | None = None,
         search_limit: int = settings.graphrag_search_limit,
         context_hops: int = settings.graphrag_context_hops,
+        reranker_pool_size: int = settings.graphrag_reranker_pool_size,
     ):
         self._embedding_model = embedding_model
         self._repository = repository
+        self._reranker = reranker
         self.search_limit = search_limit
         self.context_hops = context_hops
+        self.reranker_pool_size = max(search_limit, int(reranker_pool_size))
     
     @property
     def embedding_model(self) -> LocalEmbeddingModel:
@@ -190,7 +289,7 @@ class GraphRetriever:
         """Выполняет graphrag retrieval для конкретного пользователя или по всем проектам."""
         context = RetrievedContext()
         
-        pool = max(self.search_limit * 4, 20)
+        pool = max(self.reranker_pool_size, self.search_limit * 4, 20)
         query_embedding = self.embedding_model.embed_query(query)
         if user_id == "__all__":
             vector_hits = self.repository.vector_search_all(
@@ -213,9 +312,14 @@ class GraphRetriever:
             user_ids=user_ids if user_id == "__all__" else None,
         )
         if vector_hits and lexical_hits:
-            candidates = self.repository.rrf_fuse([vector_hits, lexical_hits], limit=self.search_limit)
+            candidates = self.repository.rrf_fuse([vector_hits, lexical_hits], limit=pool)
         else:
-            candidates = (vector_hits or lexical_hits)[: self.search_limit]
+            candidates = (vector_hits or lexical_hits)[:pool]
+
+        if self._reranker:
+            candidates = self._reranker.rerank(query, candidates, limit=self.search_limit)
+        else:
+            candidates = candidates[: self.search_limit]
 
         context.entry_points = []
         for node, score in candidates:
@@ -401,12 +505,25 @@ class GraphRAG:
         user_prompt_template: str = settings.graphrag_user_prompt_template,
         no_context_response: str = settings.graphrag_no_context_response,
         similarity_threshold: float = settings.graphrag_similarity_threshold,
+        reranker_enabled: bool = settings.graphrag_reranker_enabled,
+        reranker_model_name: str = settings.graphrag_reranker_model_name,
+        reranker_temperature: float = settings.graphrag_reranker_temperature,
+        reranker_pool_size: int = settings.graphrag_reranker_pool_size,
+        reranker_max_chars_per_doc: int = settings.graphrag_reranker_max_chars_per_doc,
         privacy_anonymizer=None,
     ):
         self.similarity_threshold = similarity_threshold
+        reranker = GraphReranker(
+            enabled=reranker_enabled,
+            model_name=reranker_model_name,
+            temperature=reranker_temperature,
+            max_chars_per_doc=reranker_max_chars_per_doc,
+        )
         self.retriever = GraphRetriever(
             embedding_model=embedding_model,
             repository=repository,
+            reranker=reranker,
+            reranker_pool_size=reranker_pool_size,
         )
         self.generator = RAGGenerator(
             model_name=model_name,
