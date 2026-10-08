@@ -517,9 +517,10 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
     if manage_status:
         begin_ingest(slug, "checking")
     from web_app import ensure_refresh_progress
-    ensure_refresh_progress(slug)
+    opened_live = ensure_refresh_progress(slug)
     updated = skipped = failed = 0
     errors: list[str] = []
+    cancelled = False
     try:
         folders = [s for s in sources if s.get("source_kind") == "folder"]
         pages = [s for s in sources if s.get("source_kind") == "confluence"]
@@ -576,11 +577,21 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                 errors.append(err)
     except Exception as e:
         if type(e).__name__ == "IngestCancelled":
+            cancelled = True
             raise
         failed += 1
         errors.append(str(e))
     finally:
         if manage_status:
+            if opened_live:
+                from web_app import finish_live_progress
+                if cancelled:
+                    finish_live_progress(slug, ok=False, cancelled=True)
+                else:
+                    detail = "; ".join(errors[:3]) if failed else (
+                        f"Обновлено: {updated}" if updated else "Изменений нет"
+                    )
+                    finish_live_progress(slug, ok=failed == 0, message=detail)
             msg = "; ".join(errors[:3]) if failed else ""
             end_ingest(slug, ok=failed == 0, message=msg)
 

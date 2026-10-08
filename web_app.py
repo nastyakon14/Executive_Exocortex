@@ -275,12 +275,14 @@ def _leave_job(slug: str, ok: bool, message: str = "", *, cancelled: bool = Fals
     finish_live_progress(slug, ok=ok, message=message, cancelled=cancelled)
 
 
-def ensure_refresh_progress(slug: str) -> None:
+def ensure_refresh_progress(slug: str) -> bool:
+    """Открывает плашку автообновления. False, если обработка этого проекта уже на экране."""
     with _state_lock:
         ctrl = _ingest_ctrl.get(slug)
         if ctrl and ctrl.get("active"):
-            return
+            return False
     open_live_progress(slug, "refresh", "Автообновление графа", own_job=False)
+    return True
 
 
 def set_refresh_summary(slug: str, summary: dict) -> None:
@@ -1657,20 +1659,23 @@ body {
 .project-card .status-open { display: inline-block; margin: 0 18px 8px; }
 .project-card .sources-open { display: inline-flex; flex-direction: column; align-items: flex-start; margin: 0 18px 14px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card2); max-width: calc(100% - 36px); }
 .project-card .sources-open .menu-hint { max-width: 240px; }
-.src-board { margin-top: 4px; }
-.src-head { display: flex; justify-content: flex-end; margin: 0 0 8px; }
+.src-board { margin-top: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 6px 8px 12px; }
+.src-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 6px; padding: 10px 12px 10px 14px; border-bottom: 1px solid var(--border); }
+.src-head-label { font-size: 12px; color: var(--muted); }
 .src-watch-title { width: 188px; text-align: center; font-size: 12px; line-height: 1.3; color: var(--muted); }
 .src-tree, .src-tree ul { list-style: none; margin: 0; padding: 0; }
-.tree-row { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+.tree-row { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 2px 8px; border-radius: 10px; }
+.tree-row:hover { background: var(--card2); }
 .tree-branch { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
-.tree-branch-nest { border-left: 1px solid var(--border); padding-left: 8px; }
+.tree-branch-nest { border-left: 1px solid var(--border); padding-left: 10px; }
 .tree-caret, .tree-caret-spacer { width: 16px; height: 16px; flex-shrink: 0; border: none; background: transparent; padding: 0; cursor: pointer; }
 .tree-caret-spacer { cursor: default; }
 .tree-caret::before { content: ''; display: block; width: 0; height: 0; margin-left: 4px; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.15s; }
 .tree-caret[aria-expanded="true"]::before { transform: rotate(90deg); }
 .tree-name { font-size: 14px; color: var(--text); word-break: break-word; }
-.tree-path { color: var(--muted); font-size: 11px; word-break: break-all; }
+.tree-path { color: var(--muted); font-size: 11px; word-break: break-all; opacity: 0.85; }
 .tree-leaf { padding: 1px 0; }
+.src-tree > .tree-leaf > .tree-name { display: flex; align-items: center; min-height: 36px; padding: 0 8px; }
 .tree-watch { flex: 0 0 188px; width: 188px; display: flex; align-items: center; justify-content: center; gap: 10px; }
 .src-tree .tree-check { position: relative; margin: 0; flex: 0 0 18px; width: 18px; height: 18px; }
 .tree-trash {
@@ -1681,10 +1686,10 @@ body {
 .tree-trash:hover { color: var(--error); border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.08); }
 button.tree-dir-name { border: none; background: transparent; padding: 0; cursor: pointer; text-align: left; font: inherit; color: var(--text); }
 .src-tree ul[hidden] { display: none; }
-.sources-warn { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
-.tree-empty, .sources-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
-.sources-note { color: var(--muted); font-size: 13px; line-height: 1.45; margin: 0 0 16px; }
-.src-section { font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
+.sources-warn { margin: 8px 12px 4px; color: var(--muted); font-size: 13px; line-height: 1.4; }
+.tree-empty, .sources-empty { color: var(--muted); font-size: 13px; padding: 10px 12px; }
+.sources-note { color: var(--text2); font-size: 13px; line-height: 1.5; margin: 0 0 16px; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
+.src-section { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 16px 12px 4px; }
 .progress-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px 16px 16px; }
 .refresh-summary { white-space: pre-line; font-size: 14px; line-height: 1.5; color: var(--text); margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
 .progress-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
@@ -2963,17 +2968,18 @@ def _watch_box(kind: str, root: str, item: str, watched: bool) -> str:
     )
 
 
-def _trash_box(kind: str, root: str, item: str, title: str) -> str:
+def _trash_box(kind: str, root: str, item: str, title: str, whole: bool = False) -> str:
+    scope = ' data-whole="1"' if whole else ""
     return (
         '<button type="button" class="tree-trash" aria-label="Удалить источник" '
         f'title="Удалить источник из проекта" data-kind="{escape(kind)}" '
         f'data-root="{escape(root)}" data-item="{escape(item)}" '
-        f'data-title="{escape(title)}" onclick="askDeleteSource(this)">🗑</button>'
+        f'data-title="{escape(title)}"{scope} onclick="askDeleteSource(this)">🗑</button>'
     )
 
 
-def _item_actions(kind: str, root: str, item: str, watched: bool, title: str) -> str:
-    return _watch_box(kind, root, item, watched) + _trash_box(kind, root, item, title)
+def _item_actions(kind: str, root: str, item: str, watched: bool, title: str, whole: bool = False) -> str:
+    return _watch_box(kind, root, item, watched) + _trash_box(kind, root, item, title, whole=whole)
 
 
 def _tree_row(main: str, check: str, depth: int) -> str:
@@ -3020,7 +3026,7 @@ def _render_file_tree(node: dict, kind: str, root: str, excluded: set, parent_wa
         + f'<button type="button" class="tree-name tree-dir-name" onclick="toggleTree(this.parentElement.querySelector(\'.tree-caret\'))">📁 {escape(title)}</button>'
         + path_bit
     )
-    actions = _trash_box(kind, root, root, title) if depth == 0 else ""
+    actions = _trash_box(kind, root, root, title, whole=True) if depth == 0 else ""
     return (
         '<li class="tree-dir">'
         + _tree_row(main, actions, depth)
@@ -3033,7 +3039,7 @@ def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, 
     title = node.get("title") or _page_label(source)
     children = node.get("children") or []
     watched = parent_watch and source not in excluded
-    actions = _item_actions("confluence", root, source, watched, title)
+    actions = _item_actions("confluence", root, source, watched, title, whole=(depth == 0))
     name = _source_name(title, "🌐", source)
     if not children:
         main = '<span class="tree-caret-spacer"></span>' + name
@@ -3276,7 +3282,7 @@ def _sources_tree_html(scope: dict) -> str:
         return '<p class="sources-empty">В проекте пока нет загруженных файлов, директорий и страниц.</p>'
     return (
         '<div class="src-board">'
-        '<div class="src-head"><div class="src-watch-title">Отслеживать изменения</div></div>'
+        '<div class="src-head"><span class="src-head-label">Источник</span><div class="src-watch-title">Отслеживать</div></div>'
         + "".join(chunks)
         + "</div>"
     )
@@ -3377,6 +3383,11 @@ def _drop_project_source(graph_id: str, source_input: str) -> int:
 
 def _delete_source_item(scope: dict, kind: str, root: str, item: str) -> dict:
     """Удаляет источник из проекта: карточки, связи, digest и учёт в watch_sources."""
+    with _ingest_run_lock:
+        return _delete_source_item_locked(scope, kind, root, item)
+
+
+def _delete_source_item_locked(scope: dict, kind: str, root: str, item: str) -> dict:
     from auto_refresh.folder_checker import dump_watch_state, parse_watch_state
     graph_id = scope["graph_id"]
     root_key = _canon_item(kind, root)
@@ -3389,26 +3400,29 @@ def _delete_source_item(scope: dict, kind: str, root: str, item: str) -> dict:
     extract_child = bool(row.get("extract_child")) if row else False
     stored_root = (row.get("source_path") if row else root) or root
     whole_folder = kind == "folder" and item_key == root_key
-    whole = kind == "file" or (
-        kind == "confluence" and item_key == root_key and not extract_child
-    ) or whole_folder
+    whole_confluence = kind == "confluence" and item_key == root_key
+    whole = kind == "file" or whole_confluence or whole_folder
 
     deleted = 0
-    if whole_folder and row:
+    removed: list[str] = []
+    drop_tree = whole_folder or (whole_confluence and extract_child)
+    if drop_tree and row:
         ingested = _project_source_inputs(graph_id)
         for path in _known_items(row, ingested):
             key = _canon_item(kind, path)
-            if key:
+            if key and key not in removed:
                 deleted += _drop_project_source(graph_id, key)
-    else:
-        deleted = _drop_project_source(graph_id, item_key)
+                removed.append(key)
+    if item_key not in removed:
+        deleted += _drop_project_source(graph_id, item_key)
+        removed.append(item_key)
 
     if whole:
         if row:
             delete_watch_source(row["id"])
         else:
             delete_watch_source_path(graph_id, kind, stored_root)
-        return {"removed": [item_key], "deleted_cards": deleted}
+        return {"removed": removed, "deleted_cards": deleted}
 
     if row is None:
         return {"removed": [item_key], "deleted_cards": deleted}
@@ -3454,9 +3468,8 @@ async def project_sources(slug: str):
         {project_nav(scope)}
         <div class="header">
             <h1>Источники</h1>
-            <p>{escape(scope["name"])}</p>
         </div>
-        <p class="sources-note">Директории и страницы с вложениями раскрываются, как в проводнике. Галочка включает отслеживание этого файла или страницы: ночное и ручное обновление смотрит только на отмеченные. Корзина удаляет источник из проекта вместе с карточками и связями — сам файл или страница Confluence не трогаются.</p>
+        <p class="sources-note">Галочка включает ночное и ручное обновление только для отмеченных файлов и страниц. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
         {_sources_tree_html(scope)}
     </div>
     <div class="modal-overlay" id="deleteSourceModal">
@@ -3511,11 +3524,15 @@ async def project_sources(slug: str):
             root: button.dataset.root || '',
             item: button.dataset.item || '',
             title: button.dataset.title || button.dataset.item || 'источник',
+            whole: button.dataset.whole === '1',
             button: button
         };
         const text = document.getElementById('deleteSourceText');
         if (text) {
-            text.textContent = '«' + pendingDelete.title + '» будет удалён из проекта вместе со всеми карточками и связями. Файл на диске и страница Confluence останутся без изменений.';
+            const name = '«' + pendingDelete.title + '»';
+            text.textContent = pendingDelete.whole
+                ? name + ' будет удалён из проекта целиком: карточки, связи и вложенные файлы или страницы. Сам файл и страница Confluence не трогаются.'
+                : name + ' будет удалён из проекта вместе с карточками и связями. Файл на диске и страница Confluence останутся без изменений.';
         }
         openModal('deleteSourceModal');
     }
