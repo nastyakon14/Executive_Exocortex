@@ -349,6 +349,98 @@ def delete_ingest_digest(graph_id: str, source_input: str) -> None:
             conn.commit()
 
 
+def _replace_stored_texts(text: str, mapping: dict[str, str]) -> str:
+    updated = text or ""
+    for old, new in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        if old and old != new:
+            updated = updated.replace(old, new)
+    return updated
+
+
+def list_confluence_link_texts() -> list[str]:
+    """Строки Postgres, в которых может лежать ссылка Confluence."""
+    found: list[str] = []
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT source_input FROM ingest_digests
+                WHERE source_input LIKE '%/pages/%'
+                '''
+            )
+            found.extend(str(row[0]) for row in cursor.fetchall() if row and row[0])
+            cursor.execute(
+                '''
+                SELECT source_path, content_hash FROM watch_sources
+                WHERE source_kind = 'confluence'
+                   OR source_path LIKE '%/pages/%'
+                   OR COALESCE(content_hash, '') LIKE '%/pages/%'
+                '''
+            )
+            for source_path, content_hash in cursor.fetchall():
+                if source_path:
+                    found.append(str(source_path))
+                if content_hash:
+                    found.append(str(content_hash))
+    return found
+
+
+def rewrite_confluence_link_texts(mapping: dict[str, str]) -> None:
+    """Заменяет короткие ссылки Confluence в ingest_digests и watch_sources."""
+    if not mapping:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT graph_id, source_input, content_hash FROM ingest_digests')
+            for graph_id, source_input, content_hash in cursor.fetchall():
+                new_source = _replace_stored_texts(str(source_input or ""), mapping)
+                if new_source == source_input:
+                    continue
+                cursor.execute(
+                    '''
+                    DELETE FROM ingest_digests
+                    WHERE graph_id = %s AND source_input = %s
+                    ''',
+                    (graph_id, source_input),
+                )
+                cursor.execute(
+                    '''
+                    INSERT INTO ingest_digests (graph_id, source_input, content_hash, created_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (graph_id, source_input) DO NOTHING
+                    ''',
+                    (graph_id, new_source, content_hash),
+                )
+            cursor.execute(
+                '''
+                SELECT id, source_path, content_hash FROM watch_sources
+                WHERE source_kind = 'confluence'
+                   OR source_path LIKE '%/pages/%'
+                   OR COALESCE(content_hash, '') LIKE '%/pages/%'
+                '''
+            )
+            for watch_id, source_path, content_hash in cursor.fetchall():
+                new_path = _replace_stored_texts(str(source_path or ""), mapping)
+                new_hash = _replace_stored_texts(str(content_hash or ""), mapping)
+                if new_path == source_path and new_hash == content_hash:
+                    continue
+                cursor.execute('SAVEPOINT conf_link')
+                try:
+                    cursor.execute(
+                        '''
+                        UPDATE watch_sources
+                        SET source_path = %s, content_hash = %s, updated_at = NOW()
+                        WHERE id = %s
+                        ''',
+                        (new_path, new_hash, watch_id),
+                    )
+                    cursor.execute('RELEASE SAVEPOINT conf_link')
+                except Exception as exc:
+                    cursor.execute('ROLLBACK TO SAVEPOINT conf_link')
+                    print(f"confluence watch link rewrite skip {source_path}: {exc}")
+        conn.commit()
+
+
 def update_history_messages(user_id, message_id, message_text, message_date, message_type, bot_answer):
     """Сохраняет пару «сообщение пользователя — ответ бота» в postgres."""
     with get_connection() as conn:

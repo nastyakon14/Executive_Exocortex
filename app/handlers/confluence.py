@@ -660,16 +660,10 @@ def attachments_text(page_id: str) -> str:
     return "\n\n".join(blocks)
 
 
-def _replace_short_urls(text: str, mapping: dict[str, str]) -> str:
-    updated = text or ""
-    for old, new in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
-        if old and old != new:
-            updated = updated.replace(old, new)
-    return updated
-
-
 def rewrite_stored_confluence_links() -> None:
-    """В базе короткий /pages/<id> заменяется на viewpage.action?pageId=."""
+    """Короткий /pages/<id> в хранилищах заменяется на viewpage.action?pageId=."""
+    from storage.postgres.db_connect import list_confluence_link_texts, rewrite_confluence_link_texts
+
     mapping: dict[str, str] = {}
 
     def remember(value: str) -> None:
@@ -700,38 +694,14 @@ def rewrite_stored_confluence_links() -> None:
     except Exception as exc:
         print(f"confluence link rewrite neo4j read warning: {exc}")
         client = None
-        rows = []
     else:
         client = get_neo4j_client()
 
     try:
-        from storage.postgres.db_connect import get_connection
-
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT source_input FROM ingest_digests
-                    WHERE source_input LIKE '%/pages/%'
-                    """
-                )
-                for row in cursor.fetchall():
-                    remember(str(row[0] or ""))
-                cursor.execute(
-                    """
-                    SELECT source_path, content_hash FROM watch_sources
-                    WHERE source_kind = 'confluence'
-                       OR source_path LIKE '%/pages/%'
-                       OR COALESCE(content_hash, '') LIKE '%/pages/%'
-                    """
-                )
-                watch_rows = cursor.fetchall()
-                for source_path, content_hash in watch_rows:
-                    remember(str(source_path or ""))
-                    remember(str(content_hash or ""))
+        for text in list_confluence_link_texts():
+            remember(text)
     except Exception as exc:
         print(f"confluence link rewrite postgres read warning: {exc}")
-        watch_rows = []
 
     if not mapping:
         return
@@ -750,58 +720,7 @@ def rewrite_stored_confluence_links() -> None:
             print(f"confluence link rewrite neo4j write warning: {exc}")
 
     try:
-        from storage.postgres.db_connect import get_connection
-
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT graph_id, source_input, content_hash FROM ingest_digests")
-                for graph_id, source_input, content_hash in cursor.fetchall():
-                    new_source = _replace_short_urls(str(source_input or ""), mapping)
-                    if new_source == source_input:
-                        continue
-                    cursor.execute(
-                        """
-                        DELETE FROM ingest_digests
-                        WHERE graph_id = %s AND source_input = %s
-                        """,
-                        (graph_id, source_input),
-                    )
-                    cursor.execute(
-                        """
-                        INSERT INTO ingest_digests (graph_id, source_input, content_hash, created_at)
-                        VALUES (%s, %s, %s, NOW())
-                        ON CONFLICT (graph_id, source_input) DO NOTHING
-                        """,
-                        (graph_id, new_source, content_hash),
-                    )
-                cursor.execute(
-                    """
-                    SELECT id, source_path, content_hash FROM watch_sources
-                    WHERE source_kind = 'confluence'
-                       OR source_path LIKE '%/pages/%'
-                       OR COALESCE(content_hash, '') LIKE '%/pages/%'
-                    """
-                )
-                for watch_id, source_path, content_hash in cursor.fetchall():
-                    new_path = _replace_short_urls(str(source_path or ""), mapping)
-                    new_hash = _replace_short_urls(str(content_hash or ""), mapping)
-                    if new_path == source_path and new_hash == content_hash:
-                        continue
-                    cursor.execute("SAVEPOINT conf_link")
-                    try:
-                        cursor.execute(
-                            """
-                            UPDATE watch_sources
-                            SET source_path = %s, content_hash = %s, updated_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (new_path, new_hash, watch_id),
-                        )
-                        cursor.execute("RELEASE SAVEPOINT conf_link")
-                    except Exception as exc:
-                        cursor.execute("ROLLBACK TO SAVEPOINT conf_link")
-                        print(f"confluence watch link rewrite skip {source_path}: {exc}")
-            conn.commit()
+        rewrite_confluence_link_texts(mapping)
     except Exception as exc:
         print(f"confluence link rewrite postgres write warning: {exc}")
     print(f"confluence links rewritten: {len(mapping)}")
