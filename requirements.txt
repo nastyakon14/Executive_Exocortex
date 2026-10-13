@@ -9,6 +9,7 @@ speech_recognition
 pytesseract
 pdfplumber
 img2table
+extract-msg
 
 psycopg2
 chromadb

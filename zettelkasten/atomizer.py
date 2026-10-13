@@ -26,6 +26,23 @@ ATOMIZER_PRIOR_THOUGHTS = 16
 ATOMIZER_PRIOR_CHARS = 4000
 
 
+def normalize_tags(tags: list[str] | None) -> list[str]:
+    """Нижний регистр, подчёркивания заменяются пробелом: финансовая_оценка → финансовая оценка."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in tags or []:
+        tag = " ".join(str(raw or "").replace("_", " ").lower().split())
+        tag = tag.strip(".,;:!?\"'«»()[]{}#")
+        tag = " ".join(tag.split())
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+        if len(normalized) >= 5:
+            break
+    return normalized
+
+
 def invoke_structured(structured_llm, messages):
     return structured_llm.invoke(messages)
 
@@ -83,7 +100,7 @@ class AtomicThought(BaseModel):
     tags: list[str] = Field(
         description=(
             "Ключевые теги — сущности: имена людей, проекты, организации, технологии. "
-            "snake_case, на языке оригинала. От 1 до 5 тегов."
+            "Нижний регистр, слова через пробел, без символа _. На языке оригинала. От 1 до 5 тегов."
             "Теги должны быть связаны с содержанием мысли и помогать найти её в базе знаний."
             "Теги должны быть на языке оригинала."
             "Теги должны быть уникальными."
@@ -124,7 +141,7 @@ class ZettelCard(BaseModel):
     topic: str = Field(description="Краткая тема мысли (1-3 слова)")  # тема мысли для отображения на графе
     content: str = Field(description="Контент карточки")    # одно краткое самодостаточное атомарное утверждение (1-2 предложения)
     thought_type: ThoughtType = Field(description="Тип мысли")   # тип мысли: факт, решение, задача, риск, идея, контекст, вопрос, ответ, объяснение, комментарий, заметка, память, напоминание, побуждение к действию, другое
-    tags: list[str] = Field(description="Теги карточки")         # ключевые теги — сущности: имена людей, проекты, организации, технологии. snake_case, на языке оригинала. От 1 до 5 тегов.
+    tags: list[str] = Field(description="Теги карточки")         # ключевые теги — сущности: имена людей, проекты, организации, технологии. нижний регистр, слова через пробел, без _. От 1 до 5 тегов.
     parent_hint: Optional[str] = Field(default=None, description="Точная цитата другой мысли из этого же списка, которую данная мысль уточняет или объясняет") # точная цитата другой мысли из этого же списка, которую данная мысль уточняет или объясняет None если мысль самостоятельна
     is_root_topic: bool = Field(description="True если эта мысль открывает новую независимую тему") # True если эта мысль открывает новую независимую тему False если она развивает,раскрывает или уточняет другую мысль из этого текста преложенную раньше.
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Дата время создания карточки") # дата время создания карточки
@@ -538,14 +555,7 @@ class NoteAtomizer:
         return content
 
     def _normalize_tags(self, tags: list[str]) -> list[str]:
-        normalized = []
-        seen = set()
-        for tag in tags:
-            tag = tag.lower().strip().replace(" ", "_").replace("-", "_")
-            if tag and tag not in seen:
-                normalized.append(tag)
-                seen.add(tag)
-        return normalized[:5]
+        return normalize_tags(tags)
 
     def _validate_and_fix(self, cards: list[ZettelCard]) -> list[ZettelCard]:
         """Пост-валидация: убираем пустые карточки и чиним битые parent_hint."""

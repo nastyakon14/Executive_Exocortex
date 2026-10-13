@@ -34,10 +34,11 @@ EXTRACTABLE_EXTENSIONS = (
     ".xls",
     ".xlsm",
     ".xlsb",
+    ".msg",
 )
 extensions = EXTRACTABLE_EXTENSIONS
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
-SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg)"
+SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg)"
 
 TOO_LARGE_MESSAGE = "Превышен максимальный размер файла (50 МБ)"
 TOO_LARGE_EXCEL_MESSAGE = "Превышен максимальный размер Excel-файла (10 МБ)"
@@ -171,6 +172,12 @@ def extract_file_text(file_path: str) -> str:
             except ImportError:
                 from excel_reader import read_excel
             return read_excel(file_path) or ""
+        if ext == ".msg":
+            try:
+                from app.handlers.outlook_msg import read_msg
+            except ImportError:
+                from outlook_msg import read_msg
+            return read_msg(file_path) or ""
     except FileTooLargeError:
         raise
     except MemoryError as e:

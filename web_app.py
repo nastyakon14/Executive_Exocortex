@@ -40,10 +40,14 @@ from storage.postgres.db_connect import (
 )
 from app.handlers.confluence import (
     CONFLUENCE_HOST,
+    display_confluence_source,
     get_confluence_page_content,
     is_confluence_fetch_error,
+    legacy_short_confluence_url,
     list_confluence_pages,
     page_plain_text,
+    public_confluence_url,
+    rewrite_stored_confluence_links,
 )
 from app.handlers.folders_mac import (
     EXTRACTABLE_EXTENSIONS,
@@ -1056,6 +1060,13 @@ def _content_digest(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _canonical_source(source_input: str) -> str:
+    text = (source_input or "").strip() or "text"
+    if text.lower().startswith(("http://", "https://")):
+        return public_confluence_url(text)
+    return text
+
+
 def run_ingest(
     slug: str,
     graph_id: str,
@@ -1066,6 +1077,7 @@ def run_ingest(
     on_stage=None,
     manage_status: bool = True,
 ) -> tuple[bool, str]:
+    source_input = _canonical_source(source_input)
     digest = _content_digest(text) if (text or "").strip() else ""
     if digest:
         try:
@@ -1130,6 +1142,11 @@ def _boot_auto_refresh() -> None:
     from auto_refresh.update_changes import start_nightly_scheduler
     start_nightly_scheduler()
 
+
+try:
+    rewrite_stored_confluence_links()
+except Exception as e:
+    print(f"web_app confluence link rewrite warning: {e}")
 
 _boot_auto_refresh()
 
@@ -1279,7 +1296,7 @@ def save_user_note(
 
         for card in raw_cards:
             unmask_card(card, entity_map)
-            card.source_input = (source_input or "").strip() or "text"
+            card.source_input = _canonical_source(source_input)
             card.source_quote = find_source_quote(text, card.content)
 
         total = len(raw_cards)
@@ -1310,7 +1327,13 @@ def ingest_replacing(
     on_stage=None,
 ) -> tuple[bool, str]:
     """Сначала встраивает новую версию, старые карточки этого источника снимает только после успеха."""
+    source_input = _canonical_source(source_input)
+    legacy = legacy_short_confluence_url(source_input)
     old_ids = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
+    if legacy and legacy != source_input:
+        old_ids = list(dict.fromkeys(
+            old_ids + linker.repository.list_zettel_ids_by_source(graph_id, legacy)
+        ))
     old_set = set(old_ids)
     ok, ans = save_user_note(
         graph_id,
@@ -1322,6 +1345,11 @@ def ingest_replacing(
     if ok:
         if old_ids:
             linker.repository.delete_zettel_ids(graph_id, old_ids)
+        if legacy and legacy != source_input:
+            try:
+                delete_ingest_digest(graph_id, legacy)
+            except Exception as e:
+                print(f"web_app legacy digest delete warning: {e}")
         return True, ans
     current = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
     fresh = [item for item in current if item not in old_set]
@@ -1346,6 +1374,7 @@ FILE_FORMAT_LABELS = {
     ".png": "PNG",
     ".jpg": "JPG",
     ".jpeg": "JPEG",
+    ".msg": "MSG",
 }
 
 
@@ -1409,11 +1438,12 @@ def _tick_row(name: str, label: str, hint: str) -> str:
 def describe_source_input(raw: str) -> dict:
     value = (raw or "").strip() or "text"
     if value.lower().startswith(("http://", "https://")):
+        href = display_confluence_source(value)
         return {
             "kind": "confluence",
             "title": "Страница Confluence",
-            "label": value,
-            "href": value,
+            "label": href,
+            "href": href,
         }
     if value == "text":
         return {
@@ -3058,8 +3088,11 @@ def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, 
 
 
 def _page_label(url: str) -> str:
-    tail = (url or "").rstrip("/").split("/")[-1]
-    return tail or url
+    text = display_confluence_source((url or "").strip())
+    if text.lower().startswith(("http://", "https://")):
+        return text
+    tail = text.rstrip("/").split("/")[-1]
+    return tail or text
 
 
 def _is_url(value: str) -> bool:
@@ -3691,13 +3724,13 @@ async def progress_page(slug: str):
                 const fileNames = plan.files_names || [];
                 const pageNames = plan.pages_names || [];
                 const lines = [
-                    'Файлы, за которыми следим: ' + (plan.files_tracked || 0),
-                    'Файлы новее последней сверки, их обновим: ' + (plan.files_update || 0)
+                    'Файлы, которые отслеживаются: ' + (plan.files_tracked || 0),
+                    'Файлы для обновления: ' + (plan.files_update || 0)
                 ];
                 fileNames.forEach(function(name) { lines.push(name); });
                 lines.push('');
-                lines.push('Страницы Confluence, за которыми следим: ' + (plan.pages_tracked || 0));
-                lines.push('Страницы новее последней сверки, их обновим: ' + (plan.pages_update || 0));
+                lines.push('Страницы Confluence, которые отслеживаются: ' + (plan.pages_tracked || 0));
+                lines.push('Страницы для обновления: ' + (plan.pages_update || 0));
                 pageNames.forEach(function(name) { lines.push(name); });
                 summary.style.display = '';
                 summary.textContent = lines.join('\\n');
@@ -3929,7 +3962,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             </div>
             <div id="file-mode-upload">
                 <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitFileIngest(event, this)">
-                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.xlsx,.xls,.xlsm,.png,.jpg,.jpeg" required></div>
+                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.xlsx,.xls,.xlsm,.png,.jpg,.jpeg,.msg" required></div>
                     <button type="submit" class="btn">Обработать</button>
                 </form>
             </div>
@@ -4300,7 +4333,7 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
     ext = Path(file.filename).suffix.lower()
     if ext not in SUPPORTED_UPLOAD_EXTS:
         return RedirectResponse(
-            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg&st=err",
+            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg&st=err",
             status_code=303,
         )
 
@@ -4486,14 +4519,15 @@ async def add_confluence(
     scope, err = _writable_scope(slug)
     if err:
         return err
-    page_url = url.strip()
+    raw_url = url.strip()
+    page_url = public_confluence_url(raw_url)
     watch = _form_flag(watch_changes)
     child = _form_flag(extract_child_pages)
 
-    if not page_url:
+    if not raw_url:
         return RedirectResponse(f"/p/{slug}/add?msg=Вставьте ссылку на страницу Confluence&st=err", status_code=303)
 
-    if CONFLUENCE_HOST not in page_url.lower():
+    if CONFLUENCE_HOST not in raw_url.lower():
         return RedirectResponse(
             f"/p/{slug}/add?msg={escape(f'Ссылка должна быть на Confluence и содержать в себе {CONFLUENCE_HOST}')}&st=err",
             status_code=303,
@@ -4515,7 +4549,7 @@ async def add_confluence(
                 return False, err_text
             _save_watch_source(scope, "confluence", page_url, watch, extract_child=False)
             if on_stage:
-                on_stage("read", "Разбор содержимого", "Достаём текст со страницы")
+                on_stage("read", "Разбор содержимого", "Достаём текст страницы и вложений")
             ok, ans = run_ingest(
                 slug, scope["graph_id"], text, page_url, "confluence", page_url,
                 on_stage=on_stage, manage_status=False,

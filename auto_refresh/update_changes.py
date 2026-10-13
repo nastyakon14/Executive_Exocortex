@@ -58,18 +58,26 @@ def _same_source_text(graph_id: str, source_input: str, digest: str, stored_hash
 
 
 def _drop_source(graph_id: str, source_input: str) -> None:
-    from web_app import linker
+    from app.handlers.confluence import legacy_short_confluence_url
+    from web_app import _canonical_source, linker
 
-    linker.repository.delete_by_source_input(graph_id, source_input)
-    try:
-        delete_ingest_digest(graph_id, source_input)
-    except Exception as e:
-        print(f"[auto_refresh] digest delete warning: {e}")
+    source_input = _canonical_source(source_input)
+    keys = [source_input]
+    legacy = legacy_short_confluence_url(source_input)
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+    for key in keys:
+        linker.repository.delete_by_source_input(graph_id, key)
+        try:
+            delete_ingest_digest(graph_id, key)
+        except Exception as e:
+            print(f"[auto_refresh] digest delete warning: {e}")
 
 
 def _ingest_source(slug: str, graph_id: str, text: str, source_input: str, log_text: str) -> tuple[bool, str]:
-    from web_app import _ingest_run_lock, ingest_replacing, log_event, set_ingest_phase
+    from web_app import _canonical_source, _ingest_run_lock, ingest_replacing, log_event, set_ingest_phase
 
+    source_input = _canonical_source(source_input)
     with _ingest_run_lock:
         set_ingest_phase(slug, "refreshing")
         ok, ans = ingest_replacing(graph_id, text, source_input)

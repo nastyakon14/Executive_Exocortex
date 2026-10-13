@@ -39,6 +39,18 @@ def _person_stems(text: str) -> tuple[str, ...]:
     return tuple(_word_stem(w) for w in words if w)
 
 
+def _clean_tags(tags: List[str] | None) -> List[str]:
+    from zettelkasten.atomizer import normalize_tags
+    return normalize_tags(list(tags or []))
+
+
+def _present_entity_label(display: str, entity_type: str) -> str:
+    text = " ".join(str(display or "").replace("_", " ").split())
+    if (entity_type or "tag") != "person":
+        text = text.lower()
+    return text
+
+
 def _normalize_entity_identity(raw_tag: str) -> tuple[str, str, str]:
     """
     Возвращает (name_key, display_name, entity_type).
@@ -152,6 +164,7 @@ class ZettelRepository:
         Создаёт новый узел Zettel (корневой или без связей).
         """
         zettel_id = zettel_id or str(uuid.uuid4())
+        tags = _clean_tags(tags)
         now = datetime.now(timezone.utc).isoformat()
         
         query = """
@@ -229,6 +242,7 @@ class ZettelRepository:
         Создаёт дочерний узел Zettel и связывает его с родителем через CHILD_OF.
         """
         zettel_id = zettel_id or str(uuid.uuid4())
+        tags = _clean_tags(tags)
         now = datetime.now(timezone.utc).isoformat()
         
         query = """
@@ -334,7 +348,7 @@ class ZettelRepository:
             topic=z.get("topic", ""),
             content=z["content"],
             thought_type=z["thought_type"],
-            tags=z["tags"],
+            tags=_clean_tags(z.get("tags")),
             is_root_topic=z["is_root_topic"],
             embedding=z["embedding"],
             source_input=z.get("source_input") or "text",
@@ -1126,7 +1140,7 @@ class ZettelRepository:
                 "topic": row.get("topic") or "",
                 "content": row.get("content") or "",
                 "thought_type": row.get("thought_type") or "",
-                "tags": list(row.get("tags") or []),
+                "tags": _clean_tags(row.get("tags")),
                 "is_root_topic": bool(row.get("is_root_topic")),
                 "parent_luhmann": parent_luhmann,
                 "source_input": row.get("source_input") or "text",
@@ -1148,7 +1162,10 @@ class ZettelRepository:
             key = f"{uid}::{name_key}" if prefix_luhmann else name_key
             edge_entity_key[(uid, raw_name)] = key
             mention_by_key[key] = mention_by_key.get(key, 0) + int(row.get("mention_count") or 0)
-            raw_display = (row.get("display_name") or "").strip() or display_name
+            raw_display = _present_entity_label(
+                (row.get("display_name") or "").strip() or display_name,
+                row.get("entity_type") or entity_type,
+            )
             chosen = display_by_key.get(key)
             if not chosen or len(raw_display) < len(chosen):
                 display_by_key[key] = raw_display

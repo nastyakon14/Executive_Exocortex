@@ -326,8 +326,12 @@ class EntityMap:
             variants.extend([
                 inner,
                 inner.lower(),
+                token.lower(),
                 inner.replace('_', ' '),
+                inner.lower().replace('_', ' '),
                 f'[{inner.replace("_", " ")}]',
+                f'[{inner.lower()}]',
+                f'[{inner.lower().replace("_", " ")}]',
             ])
             for src in variants:
                 if src and src not in seen:
@@ -346,7 +350,8 @@ def unmask_card(card, entity_map: EntityMap):
     card.topic = entity_map.unmask(card.topic or "")
     if card.parent_hint:
         card.parent_hint = entity_map.unmask(card.parent_hint)
-    card.tags = [entity_map.unmask(t) for t in (card.tags or [])]
+    from zettelkasten.atomizer import normalize_tags
+    card.tags = normalize_tags([entity_map.unmask(t) for t in (card.tags or [])])
     return card
 
 

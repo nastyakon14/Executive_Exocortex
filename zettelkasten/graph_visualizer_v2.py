@@ -38,6 +38,19 @@ def _luhmann_sort_key(luhmann_id: str) -> tuple:
     return (int(m.group(1)), luhmann_id) if m else (9999, luhmann_id)
 
 
+def _public_source_url(url: str) -> str:
+    text = (url or "").strip()
+    if not text or text == "text":
+        return text or "text"
+    if not (text.lower().startswith(("http://", "https://")) or text.isdigit()):
+        return text
+    try:
+        from app.handlers.confluence import display_confluence_source
+        return display_confluence_source(text)
+    except Exception:
+        return text
+
+
 def _find_root_luhmann(luhmann_id: str, parent_by_luhmann: dict) -> str:
     current = luhmann_id
     seen = set()
@@ -259,7 +272,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             _short_text(content, 2500),
             preview,
             " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or "", z.get("source_quote") or ""]).lower(),
-            z.get("source_input") or "text",
+            _public_source_url(z.get("source_input") or "text"),
             z.get("source_quote") or "",
         ])
 
@@ -452,12 +465,14 @@ function sourceLabel(raw) {
   const src = String(raw || '').trim();
   if (!src) return '';
   if (src === 'text') return 'текст';
-  if (/^https?:\/\//i.test(src)) {
-    const tail = src.replace(/[#?].*$/, '').replace(/\/+$/, '').split('/').pop();
-    return tail || src;
-  }
+  if (/^https?:\/\//i.test(src)) return src;
   const parts = src.split(/[\\/]/);
   return parts[parts.length - 1] || src;
+}
+function sourceExample(raw) {
+  const src = String(raw || '').trim();
+  if (/^https?:\/\//i.test(src)) return esc(src);
+  return esc(sourceLabel(src));
 }
 
 function buildClusters() {
@@ -741,7 +756,7 @@ function showClusterTip(ci, px, py) {
   const c = clusters[ci];
   const topic = c.topics.length ? c.topics.map(esc).join(' / ') : 'Темы без названия';
   const samples = c.sources.length
-    ? c.sources.map(function(s) { return '<li>' + esc(sourceLabel(s)) + '</li>'; }).join('')
+    ? c.sources.map(function(s) { return '<li>' + sourceExample(s) + '</li>'; }).join('')
     : '<li>источник не указан</li>';
   tip.innerHTML =
     '<div class="ct-title">О чем этот кластер</div>' +
@@ -1207,11 +1222,12 @@ def _build_html(
   #detail-panel .neighbor-item:hover {{ background: rgba(59,130,246,0.2); }}
   #detail-panel hr {{ border-color: #334155; margin: 10px 0; }}
   #cluster-tip {{
-    position: absolute; display: none; z-index: 12; max-width: 330px;
+    position: absolute; display: none; z-index: 12; max-width: 460px;
     background: rgba(15, 23, 42, 0.97); border: 1px solid #334155; border-radius: 10px;
     padding: 10px 12px; pointer-events: none; box-shadow: 0 8px 20px rgba(0,0,0,.25);
     font-size: 12px; color: #e2e8f0; line-height: 1.45;
   }}
+  #cluster-tip li {{ word-break: break-all; }}
   #cluster-tip .ct-title {{ font-weight: 700; margin-bottom: 6px; color: #f8fafc; }}
   #cluster-tip .ct-row {{ margin: 3px 0; }}
   #cluster-tip ul {{ margin: 4px 0 0 16px; }}
