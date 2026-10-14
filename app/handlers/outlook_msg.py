@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import extract_msg
 
@@ -21,11 +23,18 @@ def read_msg(file_path: str) -> str:
     msg = extract_msg.openMsg(path)
     _MSG_DEPTH += 1
     try:
-        letters: list[str] = []
-        files: list[str] = []
+        items: list[dict] = []
         with tempfile.TemporaryDirectory(prefix="outlook_attachments_") as folder:
-            _collect_message(msg, letters, files, seen=set(), depth=0, folder=folder)
-        parts = [part for part in letters + files if (part or "").strip()]
+            _collect_message(msg, items, seen=set(), depth=0, folder=folder)
+        items.sort(key=lambda item: item["stamp"])
+        parts: list[str] = []
+        for item in items:
+            letter = (item.get("letter") or "").strip()
+            if letter:
+                parts.append(letter)
+            parts.extend(
+                file_text for file_text in (item.get("files") or []) if (file_text or "").strip()
+            )
         return "\n\n".join(parts)
     finally:
         _MSG_DEPTH -= 1
@@ -35,24 +44,61 @@ def read_msg(file_path: str) -> str:
             pass
 
 
-def _collect_message(msg, letters: list[str], files: list[str], seen: set, depth: int, folder: str) -> None:
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _message_stamp(msg) -> datetime:
+    """Дата письма для сортировки: сначала старые, потом новые."""
+    raw = getattr(msg, "date", None)
+    if isinstance(raw, datetime):
+        return _aware(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = parsedate_to_datetime(text)
+        if parsed is not None:
+            return _aware(parsed)
+    except Exception:
+        pass
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return _aware(datetime.strptime(text, fmt))
+        except ValueError:
+            continue
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _collect_message(msg, items: list[dict], seen: set, depth: int, folder: str) -> None:
     if msg is None or depth > 20 or id(msg) in seen:
         return
     seen.add(id(msg))
-    letter = _message_text(msg)
-    if letter:
-        letters.append(letter)
+    item = {
+        "stamp": _message_stamp(msg),
+        "letter": _message_text(msg),
+        "files": [],
+    }
+    items.append(item)
     for attachment in list(getattr(msg, "attachments", None) or []):
         nested = _embedded_message(attachment)
         if nested is not None:
-            _collect_message(nested, letters, files, seen, depth + 1, folder)
+            _collect_message(nested, items, seen, depth + 1, folder)
             continue
         name = _attachment_name(attachment)
         if not name or name.startswith("~"):
             continue
         text = _attachment_text(attachment, folder, name)
         if text:
-            files.append(f"Вложение «{name}»:\n\n{text}")
+            item["files"].append(f"Вложение «{name}»:\n\n{text}")
 
 
 def _message_text(msg) -> str:
