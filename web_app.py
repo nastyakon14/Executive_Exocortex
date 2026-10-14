@@ -31,6 +31,7 @@ from storage.postgres.db_connect import (
     delete_watch_source_path,
     find_ingest_digest_by_hash,
     get_ingest_digest,
+    get_ingest_digest_meta,
     list_watch_sources,
     mark_watch_synced_path,
     set_watch_source_state,
@@ -42,6 +43,8 @@ from app.handlers.confluence import (
     CONFLUENCE_HOST,
     display_confluence_source,
     get_confluence_page_content,
+    get_confluence_page_version_info,
+    get_page_version_info_by_id,
     is_confluence_fetch_error,
     legacy_short_confluence_url,
     list_confluence_pages,
@@ -226,6 +229,7 @@ INGEST_ACCEPTED_MSG = (
     "На проекте загорится зелёный статус, когда граф будет готов."
 )
 INGEST_SKIP_MSG = "Этот материал уже есть в графе — повторная обработка не нужна."
+INGEST_SKIP_UNCHANGED_MSG = "Источник не новее последней загрузки — повторная обработка не нужна."
 INGEST_CANCEL_MSG = (
     "Загрузка отменена. Уже записанные данные сохранены, оставшиеся материалы не обрабатываются."
 )
@@ -1065,6 +1069,84 @@ def _canonical_source(source_input: str) -> str:
     if text.lower().startswith(("http://", "https://")):
         return public_confluence_url(text)
     return text
+
+
+def _source_sync_at(graph_id: str, source_input: str):
+    """Когда этот путь/URL последний раз успешно клали в граф этого проекта."""
+    from auto_refresh.folder_checker import as_utc
+    source_input = _canonical_source(source_input)
+    stamps = []
+    try:
+        meta = get_ingest_digest_meta(graph_id, source_input)
+        if meta:
+            stamps.append(as_utc(meta.get("created_at")))
+    except Exception as e:
+        print(f"web_app digest meta warning: {e}")
+    try:
+        for src in list_watch_sources(watch_only=False, graph_id=graph_id):
+            root = _canonical_source(src.get("source_path") or "")
+            if not root:
+                continue
+            same = root == source_input
+            nested = (
+                src.get("source_kind") == "folder"
+                and not source_input.lower().startswith(("http://", "https://"))
+                and source_input.startswith(root.rstrip(os.sep) + os.sep)
+            )
+            if same or nested:
+                stamps.append(as_utc(src.get("last_synced_at")))
+    except Exception as e:
+        print(f"web_app watch stamp warning: {e}")
+    stamps = [item for item in stamps if item is not None]
+    return max(stamps) if stamps else None
+
+
+def skip_if_source_not_newer(
+    graph_id: str,
+    source_input: str,
+    *,
+    page_id: str | None = None,
+) -> str | None:
+    """Как автообновление: если дата источника не новее последней загрузки, LLM не гоняем."""
+    from auto_refresh.folder_checker import as_utc, file_mtime_utc, file_needs_extract
+
+    source_input = _canonical_source(source_input)
+    synced = _source_sync_at(graph_id, source_input)
+    if synced is None:
+        return None
+    try:
+        own_cards = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
+    except Exception:
+        own_cards = []
+    if not own_cards:
+        return None
+
+    if source_input.lower().startswith(("http://", "https://")):
+        try:
+            if page_id:
+                remote, _title = get_page_version_info_by_id(str(page_id))
+            else:
+                remote, _title = get_confluence_page_version_info(source_input)
+            remote = as_utc(remote)
+        except Exception as e:
+            print(f"web_app confluence date skip warning: {e}")
+            return None
+        if remote is not None and remote <= synced:
+            print(f"web_app ingest skip not newer slug source={source_input}")
+            return INGEST_SKIP_UNCHANGED_MSG
+        return None
+
+    path = os.path.abspath(os.path.expanduser(source_input))
+    if not os.path.isfile(path):
+        return None
+    try:
+        mtime = file_mtime_utc(path)
+    except OSError:
+        return None
+    if not file_needs_extract(path, synced, mtime):
+        print(f"web_app ingest skip not newer file={path}")
+        return INGEST_SKIP_UNCHANGED_MSG
+    return None
 
 
 def run_ingest(
@@ -1949,6 +2031,8 @@ input[type="file"]::file-selector-button { background: var(--accent); color: #ff
 .loading-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(248,250,252,0.92); display: none; align-items: center; justify-content: center; z-index: 1100; backdrop-filter: blur(8px); }
 [data-theme="dark"] .loading-overlay { background: rgba(10,10,15,0.92); }
 .loading-overlay.active { display: flex; }
+.loading-back { position: absolute; top: 18px; left: 22px; z-index: 1; display: none; margin: 0; }
+.loading-overlay.active .loading-back { display: inline-flex; }
 .loading-box { text-align: center; min-width: 280px; max-width: 440px; padding: 8px 12px; }
 .spinner { width: 56px; height: 56px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -2220,6 +2304,9 @@ function showLoading(text, subtext, stages) {
     if (sub) sub.textContent = subtext || '';
     renderLoadingStages(stages || []);
     applyIngestControls('running');
+    const back = document.getElementById('loadingBack');
+    const slug = ingestSlug();
+    if (back) back.href = slug ? ('/p/' + encodeURIComponent(slug)) : '/';
     document.getElementById('loadingOverlay').classList.add('active');
     watchIngestControls();
 }
@@ -2506,6 +2593,7 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 <div id="sprayLayer" class="spray-layer"></div>
 {theme_btn}
 <div id="loadingOverlay" class="loading-overlay">
+    <a class="back-link loading-back" id="loadingBack" href="/">← Закрыть и вернуться в проект</a>
     <div class="loading-box">
         <div class="spinner"></div>
         <div class="loading-text"><span id="loadingText">Обработка</span><span class="loading-dots"></span></div>
@@ -4497,24 +4585,31 @@ async def add_folder(
                 q.put({"type": "file_start", "name": name, "index": i, "total": total})
                 abs_path = os.path.abspath(path)
                 try:
-                    on_stage("read", f"Чтение {fmt}", f"«{name}»")
-                    text = extract_file_text(path)
-                    if not (text or "").strip():
-                        ok, ans = False, "Текст не извлечен"
+                    skip_msg = skip_if_source_not_newer(uid, abs_path)
+                    if skip_msg:
+                        ok, ans = True, skip_msg
+                        prev = get_ingest_digest(uid, abs_path)
+                        if prev:
+                            _mark_manifest_done(slug, abs_path, prev)
                     else:
-                        ok, ans = run_ingest(
-                            slug,
-                            uid,
-                            text,
-                            abs_path,
-                            "folder",
-                            f"[{name}]",
-                            on_stage=on_stage,
-                            manage_status=False,
-                        )
-                    if ok:
-                        digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-                        _mark_manifest_done(slug, abs_path, digest)
+                        on_stage("read", f"Чтение {fmt}", f"«{name}»")
+                        text = extract_file_text(path)
+                        if not (text or "").strip():
+                            ok, ans = False, "Текст не извлечен"
+                        else:
+                            ok, ans = run_ingest(
+                                slug,
+                                uid,
+                                text,
+                                abs_path,
+                                "folder",
+                                f"[{name}]",
+                                on_stage=on_stage,
+                                manage_status=False,
+                            )
+                        if ok:
+                            digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+                            _mark_manifest_done(slug, abs_path, digest)
                 except IngestCancelled:
                     raise
                 except FileTooLargeError as e:
@@ -4582,6 +4677,14 @@ async def add_confluence(
         _enter_job(slug, "confluence", "Загрузка Confluence")
         if not child:
             _bind_manifest(slug, "confluence", page_url, scope["graph_id"], watch, [page_url])
+            skip_msg = skip_if_source_not_newer(scope["graph_id"], page_url)
+            if skip_msg:
+                prev = get_ingest_digest(scope["graph_id"], page_url)
+                if prev:
+                    _mark_manifest_done(slug, page_url, prev)
+                    if watch:
+                        _save_manifest_finished(slug)
+                return True, skip_msg
             if on_stage:
                 on_stage("fetch", "Загрузка страницы Confluence", "Запрашиваем содержимое")
             text = get_confluence_page_content(page_url)
@@ -4625,6 +4728,15 @@ async def add_confluence(
             note_batch(slug, index, total, page.get("title") or page["source_input"], index - 1)
             source_input = page["source_input"]
             label = "основная страница" if page.get("is_parent") else f"дочерняя страница {index - 1}"
+            skip_msg = skip_if_source_not_newer(
+                scope["graph_id"], source_input, page_id=page.get("page_id"),
+            )
+            if skip_msg:
+                ok_n += 1
+                prev = get_ingest_digest(scope["graph_id"], _canonical_source(source_input))
+                if prev:
+                    _mark_manifest_done(slug, source_input, prev)
+                continue
             if on_stage:
                 on_stage("read", "Разбор содержимого", f"{label}, {index} из {total}")
             text = page_plain_text(page["page_id"])

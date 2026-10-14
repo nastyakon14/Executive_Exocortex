@@ -300,19 +300,52 @@ def find_ingest_digest_by_hash(graph_id: str, content_hash: str) -> dict | None:
 
 def get_ingest_digest(graph_id: str, source_input: str) -> str | None:
     """Хэш последнего успешного ingest для этого источника."""
+    row = get_ingest_digest_meta(graph_id, source_input)
+    return row["content_hash"] if row else None
+
+
+def get_ingest_digest_meta(graph_id: str, source_input: str) -> dict | None:
+    """Хэш и время последней успешной загрузки источника в этом проекте."""
     if not graph_id or not source_input:
         return None
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 '''
-                SELECT content_hash FROM ingest_digests
+                SELECT graph_id, source_input, content_hash, created_at
+                FROM ingest_digests
                 WHERE graph_id = %s AND source_input = %s
                 ''',
                 (graph_id, source_input),
             )
             row = cursor.fetchone()
-            return row[0] if row else None
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+
+def find_latest_digest_by_source(source_input: str) -> dict | None:
+    """Последняя загрузка этого пути или URL в любом проекте."""
+    if not source_input:
+        return None
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT graph_id, source_input, content_hash, created_at
+                FROM ingest_digests
+                WHERE source_input = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                ''',
+                (source_input,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
 
 
 def upsert_ingest_digest(graph_id: str, source_input: str, content_hash: str) -> None:
