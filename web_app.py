@@ -1703,7 +1703,11 @@ body {
 .tree-caret::before { content: ''; display: block; width: 0; height: 0; margin-left: 4px; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.15s; }
 .tree-caret[aria-expanded="true"]::before { transform: rotate(90deg); }
 .tree-name { font-size: 14px; color: var(--text); word-break: break-word; }
+a.tree-link { color: var(--accent); text-decoration: none; }
+a.tree-link:hover { text-decoration: underline; }
 .tree-path { color: var(--muted); font-size: 11px; word-break: break-all; opacity: 0.85; }
+a.tree-path { color: var(--muted); text-decoration: none; }
+a.tree-path:hover { text-decoration: underline; color: var(--accent); }
 .tree-leaf { padding: 1px 0; }
 .src-tree > .tree-leaf > .tree-name { display: flex; align-items: center; min-height: 36px; padding: 0 8px; }
 .tree-watch { flex: 0 0 188px; width: 188px; display: flex; align-items: center; justify-content: center; gap: 10px; }
@@ -2982,8 +2986,38 @@ def _tree_toggle(expanded: bool) -> str:
     return f'<button type="button" class="tree-caret" aria-expanded="{state}" aria-label="Развернуть" onclick="toggleTree(this)"></button>'
 
 
+def _source_href(item: str) -> str | None:
+    text = (item or "").strip()
+    if not text or text == "text":
+        return None
+    if text.lower().startswith(("http://", "https://")):
+        return display_confluence_source(text)
+    try:
+        return Path(os.path.abspath(os.path.expanduser(text))).as_uri()
+    except Exception:
+        return None
+
+
 def _source_name(title: str, icon: str, item: str) -> str:
-    return f'<span class="tree-name" title="{escape(item)}">{icon} {escape(title)}</span>'
+    label = f"{icon} {escape(title)}"
+    href = _source_href(item)
+    if href:
+        return (
+            f'<a class="tree-name tree-link" href="{escape(href)}" title="{escape(item)}" '
+            f'target="_blank" rel="noopener noreferrer">{label}</a>'
+        )
+    return f'<span class="tree-name" title="{escape(item)}">{label}</span>'
+
+
+def _source_path_html(path: str) -> str:
+    href = _source_href(path)
+    shown = escape(path)
+    if href:
+        return (
+            f'<a class="tree-path" href="{escape(href)}" title="{shown}" '
+            f'target="_blank" rel="noopener noreferrer">{shown}</a>'
+        )
+    return f'<span class="tree-path">{shown}</span>'
 
 
 def _watch_box(kind: str, root: str, item: str, watched: bool) -> str:
@@ -3040,22 +3074,30 @@ def _file_row(title: str, kind: str, root: str, path: str, watched: bool, icon: 
     return '<li class="tree-leaf">' + _tree_row(main, _item_actions(kind, root, path, watched, title), depth) + "</li>"
 
 
-def _render_file_tree(node: dict, kind: str, root: str, excluded: set, parent_watch: bool, open_now: bool, title: str, depth: int = 0) -> str:
+def _render_file_tree(
+    node: dict,
+    kind: str,
+    root: str,
+    excluded: set,
+    parent_watch: bool,
+    open_now: bool,
+    title: str,
+    depth: int = 0,
+    dir_path: str | None = None,
+) -> str:
+    folder = dir_path or root
     chunks = []
     for dirname in sorted(node["dirs"], key=str.lower):
+        child_path = os.path.join(folder, dirname)
         chunks.append(_render_file_tree(
-            node["dirs"][dirname], kind, root, excluded, parent_watch, False, dirname, depth + 1,
+            node["dirs"][dirname], kind, root, excluded, parent_watch, False, dirname, depth + 1, child_path,
         ))
     for fname, path in sorted(node["files"], key=lambda item: item[0].lower()):
         chunks.append(_file_row(fname, kind, root, path, parent_watch and path not in excluded, depth=depth + 1))
     inner = "".join(chunks) or '<li class="tree-empty">В директории нет файлов</li>'
     hidden = "" if open_now else " hidden"
-    path_bit = f'<span class="tree-path">{escape(root)}</span>' if open_now else ""
-    main = (
-        _tree_toggle(open_now)
-        + f'<button type="button" class="tree-name tree-dir-name" onclick="toggleTree(this.parentElement.querySelector(\'.tree-caret\'))">📁 {escape(title)}</button>'
-        + path_bit
-    )
+    path_bit = _source_path_html(folder) if open_now else ""
+    main = _tree_toggle(open_now) + _source_name(title, "📁", folder) + path_bit
     actions = _trash_box(kind, root, root, title, whole=True) if depth == 0 else ""
     return (
         '<li class="tree-dir">'

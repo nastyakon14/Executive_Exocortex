@@ -2,16 +2,17 @@
 # метод zettelkasten: одна мысль = одна карточка
 
 from __future__ import annotations
+import json
 import os
 import uuid
 import re
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
@@ -124,12 +125,38 @@ class AtomicThought(BaseModel):
     )
 
 
+def _coerce_thoughts_list(value: Any) -> Any:
+    """Модель иногда кладёт JSON-массив в строку — разбираем до списка объектов."""
+    if isinstance(value, dict) and "thoughts" in value:
+        value = value.get("thoughts")
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            start, end = text.find("["), text.rfind("]")
+            if start >= 0 and end > start:
+                try:
+                    value = json.loads(text[start : end + 1])
+                except json.JSONDecodeError:
+                    pass
+    return value
+
+
 class AtomicThoughtList(BaseModel):
     '''Список всех атомарных мыслей, извлечённых из текста'''
     thoughts: list[AtomicThought] = Field(
         description="Список всех атомарных мыслей, извлечённых из текста"
     )
-    created_at: datetime = Field(default_factory=datetime.now(timezone.utc))  # дата время создания списка атомарных  мыслей
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("thoughts", mode="before")
+    @classmethod
+    def _thoughts_as_list(cls, value: Any) -> Any:
+        return _coerce_thoughts_list(value)
 
 
 class ZettelCard(BaseModel):
@@ -257,6 +284,9 @@ class NoteAtomizer:
             "eof while parsing",
             "unterminated string",
             "unterminated string starting",
+            "list_type",
+            "should be a valid array",
+            "input should be a valid array",
         )
         return any(m in msg for m in markers)
 
