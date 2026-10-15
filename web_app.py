@@ -3577,17 +3577,52 @@ def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool)
     return {path: parent_watch and path not in excluded for path in known}
 
 
+def _source_keys_for_drop(graph_id: str, source_input: str) -> list[str]:
+    """Ключи source_input в графе: загрузка файла пишет имя, папка — абсолютный путь."""
+    raw = (source_input or "").strip()
+    if not raw:
+        return []
+    aliases: list[str] = []
+
+    def add(value: str) -> None:
+        key = (value or "").strip()
+        if key and key not in aliases:
+            aliases.append(key)
+
+    add(raw)
+    add(_canonical_source(raw))
+    if not _is_url(raw):
+        add(os.path.basename(raw))
+        try:
+            add(os.path.abspath(os.path.expanduser(raw)))
+        except Exception:
+            pass
+    try:
+        ingested = [str(item) for item in linker.repository.list_source_inputs(graph_id) if item]
+    except Exception:
+        ingested = []
+    in_graph = [key for key in aliases if key in ingested]
+    full = [key for key in in_graph if os.path.sep in key or _is_url(key)]
+    if full:
+        return full
+    if in_graph:
+        return in_graph
+    return aliases
+
+
 def _drop_project_source(graph_id: str, source_input: str) -> int:
     deleted = 0
-    try:
-        deleted = int(linker.repository.delete_by_source_input(graph_id, source_input) or 0)
-    except Exception as e:
-        print(f"web_app source delete graph warning: {e}")
-        raise
-    try:
-        delete_ingest_digest(graph_id, source_input)
-    except Exception as e:
-        print(f"web_app source delete digest warning: {e}")
+    keys = _source_keys_for_drop(graph_id, source_input)
+    for key in keys:
+        try:
+            deleted += int(linker.repository.delete_by_source_input(graph_id, key) or 0)
+        except Exception as e:
+            print(f"web_app source delete graph warning: {e}")
+            raise
+        try:
+            delete_ingest_digest(graph_id, key)
+        except Exception as e:
+            print(f"web_app source delete digest warning: {e}")
     return deleted
 
 

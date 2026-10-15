@@ -68,6 +68,9 @@ def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
     return {root: _BRANCH_PALETTE[i % len(_BRANCH_PALETTE)] for i, root in enumerate(roots)}
 
 
+_EXCEL_TYPES = frozenset({"excel_sheet", "excel_column", "excel_value", "excel_row"})
+
+
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
     zettels = graph_data.get("zettels") or []
     entities = graph_data.get("entities") or []
@@ -76,10 +79,15 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     children: dict[str, list[str]] = defaultdict(list)
     luhmann_to_id: dict[str, str] = {}
     parent_of: dict[str, str | None] = {}
+    type_by_lid: dict[str, str] = {}
+    zid_to_lid: dict[str, str] = {}
     order: list[str] = []
     for z in zettels:
         lid = z["luhmann_id"]
-        luhmann_to_id[lid] = z["zettel_id"]
+        zid = z["zettel_id"]
+        luhmann_to_id[lid] = zid
+        zid_to_lid[zid] = lid
+        type_by_lid[lid] = z.get("thought_type") or ""
         order.append(lid)
         parent = z.get("parent_luhmann")
         parent_of[lid] = parent
@@ -96,9 +104,29 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             roots.append(lid)
     roots.sort(key=_luhmann_sort_key)
 
+    related_values: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        if edge.get("rel_type") != "RELATED_TO":
+            continue
+        left, right = edge.get("from_id"), edge.get("to_id")
+        if not left or not right:
+            continue
+        left_t = type_by_lid.get(zid_to_lid.get(left, ""), "")
+        right_t = type_by_lid.get(zid_to_lid.get(right, ""), "")
+        if left_t == "excel_row" and right_t == "excel_value":
+            related_values[left].append(right)
+        elif right_t == "excel_row" and left_t == "excel_value":
+            related_values[right].append(left)
+
     x_unit = 150
     y_gap = 165
     leaf_memo: dict[str, int] = {}
+
+    def structural_kids(lid: str) -> list[str]:
+        return [
+            child for child in children[lid]
+            if child in known and type_by_lid.get(child) != "excel_row"
+        ]
 
     def leaf_count(lid: str, stack: set[str]) -> int:
         cached = leaf_memo.get(lid)
@@ -107,7 +135,7 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         if lid in stack:
             return 1
         stack.add(lid)
-        kids = [c for c in children[lid] if c in known]
+        kids = structural_kids(lid)
         total = sum(leaf_count(c, stack) for c in kids) if kids else 1
         stack.remove(lid)
         leaf_memo[lid] = max(total, 1)
@@ -124,13 +152,63 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         if zid:
             pos[zid] = (x_left + width / 2, y)
         cursor = x_left
-        for child in children[lid]:
-            if child not in known:
-                continue
+        for child in structural_kids(lid):
             child_w = leaf_count(child, set()) * x_unit
             place(child, cursor, y + y_gap, stack)
             cursor += child_w
         stack.remove(lid)
+
+    def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> float:
+        sheet_zid = luhmann_to_id.get(sheet_lid)
+        if sheet_zid:
+            pos[sheet_zid] = (origin_x, origin_y)
+        cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
+        n_cols = max(len(cols), 1)
+        col_radius = 260 + max(0, n_cols - 6) * 24
+        max_val_r = 70
+        for index, col in enumerate(cols):
+            angle = -math.pi / 2 + (2 * math.pi * index) / n_cols
+            cx = origin_x + col_radius * math.cos(angle)
+            cy = origin_y + col_radius * math.sin(angle)
+            col_zid = luhmann_to_id.get(col)
+            if col_zid:
+                pos[col_zid] = (cx, cy)
+            vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
+            n_vals = max(len(vals), 1)
+            val_r = 58 + min(n_vals, 18) * 8
+            max_val_r = max(max_val_r, val_r)
+            for v_index, val in enumerate(vals):
+                val_angle = (2 * math.pi * v_index) / n_vals
+                val_zid = luhmann_to_id.get(val)
+                if val_zid:
+                    pos[val_zid] = (
+                        cx + val_r * math.cos(val_angle),
+                        cy + val_r * math.sin(val_angle),
+                    )
+        golden = math.pi * (3 - math.sqrt(5))
+        buckets: dict[str, int] = defaultdict(int)
+        for row in children[sheet_lid]:
+            if type_by_lid.get(row) != "excel_row":
+                continue
+            row_zid = luhmann_to_id.get(row)
+            if not row_zid:
+                continue
+            value_ids = related_values.get(row_zid) or []
+            pts = [pos[vid] for vid in value_ids if vid in pos]
+            if pts:
+                ax = sum(pt[0] for pt in pts) / len(pts)
+                ay = sum(pt[1] for pt in pts) / len(pts)
+                key = value_ids[0]
+            else:
+                ax = origin_x
+                ay = origin_y + col_radius + max_val_r + 90
+                key = "_none"
+            k = buckets[key]
+            buckets[key] += 1
+            rad = 16 + 6.2 * math.sqrt(k)
+            spin = k * golden
+            pos[row_zid] = (ax + rad * math.cos(spin), ay + rad * math.sin(spin))
+        return 2 * (col_radius + max_val_r + 120)
 
     depth_memo: dict[str, int] = {}
 
@@ -141,17 +219,32 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         if lid in stack:
             return 0
         stack.add(lid)
-        kids = [c for c in children[lid] if c in known]
+        kids = structural_kids(lid)
         depth = 1 + max((tree_depth(c, stack) for c in kids), default=0)
         stack.remove(lid)
         depth_memo[lid] = depth
         return depth
 
+    excel_roots = [lid for lid in roots if type_by_lid.get(lid) == "excel_sheet"]
+    other_roots = [lid for lid in roots if type_by_lid.get(lid) != "excel_sheet"]
+
     row_limit = 3200
     x_cursor = 0.0
     y_cursor = 0.0
     row_h = 0.0
-    for root in roots:
+    for sheet in excel_roots:
+        n_cols = max(len([c for c in children[sheet] if type_by_lid.get(c) == "excel_column"]), 1)
+        col_radius = 260 + max(0, n_cols - 6) * 24
+        span = 2 * (col_radius + 220)
+        if x_cursor > 0 and x_cursor + span > row_limit:
+            x_cursor = 0.0
+            y_cursor += row_h + 280
+            row_h = 0.0
+        place_excel_sheet(sheet, x_cursor + span / 2, y_cursor + span / 2)
+        x_cursor += span + 160
+        row_h = max(row_h, span)
+
+    for root in other_roots:
         width = leaf_count(root, set()) * x_unit
         height = tree_depth(root, set()) * y_gap
         if x_cursor > 0 and x_cursor + width > row_limit:
@@ -162,6 +255,9 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         x_cursor += width + 110
         row_h = max(row_h, height)
 
+    excel_zids = {
+        z["zettel_id"] for z in zettels if (z.get("thought_type") or "") in _EXCEL_TYPES
+    }
     neighbors: dict[str, list[str]] = defaultdict(list)
     for edge in edges:
         to_id = str(edge.get("to_id") or "")
@@ -171,7 +267,10 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
 
     for i, entity in enumerate(entities):
         eid = f"entity:{entity['name']}"
-        pts = [pos[zid] for zid in neighbors.get(eid, []) if zid in pos]
+        linked = neighbors.get(eid, [])
+        if linked and all(zid in excel_zids for zid in linked):
+            continue
+        pts = [pos[zid] for zid in linked if zid in pos]
         if pts:
             ax = sum(p[0] for p in pts) / len(pts)
             ay = sum(p[1] for p in pts) / len(pts)
@@ -198,6 +297,26 @@ def _node_label(text: str) -> str:
     if len(words) <= take:
         return " ".join(words)
     return " ".join(words[:take]) + "…"
+
+
+def _excel_node_style(
+    thought_type: str,
+    luhmann_id: str,
+    parent_by_luhmann: dict,
+    color_index: dict,
+    root: str,
+    depth: int,
+) -> tuple[int, int, int]:
+    if thought_type == "excel_row":
+        return 2, 12, 7
+    if thought_type == "excel_sheet":
+        return 0, 70, color_index.get(root, 0)
+    if thought_type in {"excel_column", "excel_value"}:
+        source = luhmann_id if thought_type == "excel_column" else (parent_by_luhmann.get(luhmann_id) or luhmann_id)
+        parts = [p for p in (source or "").split(".") if p.isdigit()]
+        color = int(parts[-1]) % len(_BRANCH_PALETTE) if parts else 1
+        return 0, 44 if thought_type == "excel_column" else 26, color
+    return 0, _thought_size(depth), color_index[root]
 
 
 def _thought_size(depth: int) -> int:
@@ -254,12 +373,13 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         xy = positions.get(nid, (0.0, 0.0))
         root = _find_root_luhmann(z["luhmann_id"], parent_by_luhmann)
         id_index[nid] = len(nodes)
+        group, radius, color = _excel_node_style(tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth)
         nodes.append({
             "x": round(xy[0], 1),
             "y": round(xy[1], 1),
-            "r": _thought_size(depth),
-            "g": 0,
-            "c": color_index[root],
+            "r": radius,
+            "g": group,
+            "c": color,
             "l": _node_label(display),
         })
         preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
@@ -278,7 +398,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
 
     for e in graph_data["entities"]:
         eid = f"entity:{e['name']}"
-        if eid in id_index:
+        if eid in id_index or eid not in positions:
             continue
         xy = positions.get(eid, (0.0, 0.0))
         name = e.get("display_name") or e.get("name") or ""
@@ -392,6 +512,7 @@ let adjOff, adjTo, adjK, adjFrom;
 let W = 0, H = 0, dpr = 1;
 let camX = 0, camY = 0, zoom = 1;
 let tagsOn = true;
+let rowsOn = false;
 let selected = -1;
 let panDrag = false, nodeDrag = -1, lastX = 0, lastY = 0, moved = false;
 let raf = 0;
@@ -402,8 +523,16 @@ let clusters = [];
 let clusterHot = -1;
 let hoverX = 0, hoverY = 0;
 
-function fillOf(i) { return G[i] ? '#38BDF8' : PAL[C[i]][0]; }
-function strokeOf(i) { return G[i] ? '#FFFFFF' : PAL[C[i]][1]; }
+function fillOf(i) {
+  if (G[i] === 1) return '#38BDF8';
+  if (G[i] === 2) return '#64748B';
+  return PAL[C[i]][0];
+}
+function strokeOf(i) {
+  if (G[i] === 1) return '#FFFFFF';
+  if (G[i] === 2) return '#94A3B8';
+  return PAL[C[i]][1];
+}
 function isLight() { return document.body.classList.contains('light-theme'); }
 function sx(x) { return (x - camX) * zoom + W / 2; }
 function sy(y) { return (y - camY) * zoom + H / 2; }
@@ -411,6 +540,7 @@ function wx(x) { return (x - W / 2) / zoom + camX; }
 function wy(y) { return (y - H / 2) / zoom + camY; }
 function nodeVisible(i) {
   if (G[i] === 1 && !(tagsOn && zoom >= 0.32)) return 0;
+  if (G[i] === 2 && !rowsOn) return 0;
   if (visMask && visMask[i] === 0) return 0;
   return 1;
 }
@@ -478,7 +608,7 @@ function sourceExample(raw) {
 function buildClusters() {
   const grouped = new Map();
   for (let i = 0; i < N; i++) {
-    if (G[i] === 1) continue;
+    if (G[i] === 1 || G[i] === 2) continue;
     const key = C[i] | 0;
     let g = grouped.get(key);
     if (!g) {
@@ -858,6 +988,11 @@ function focusNode(idx) {
     const b = document.getElementById('btn-tags');
     if (b) b.classList.add('active');
   }
+  if (G[idx] === 2) {
+    rowsOn = true;
+    const b = document.getElementById('btn-rows');
+    if (b) b.classList.add('active');
+  }
   camX = X[idx]; camY = Y[idx];
   zoom = Math.max(zoom, 0.9);
   showDetail(idx);
@@ -868,6 +1003,7 @@ function fit() {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < N; i++) {
     if (!tagsOn && G[i] === 1) continue;
+    if (!rowsOn && G[i] === 2) continue;
     if (X[i] < minX) minX = X[i];
     if (Y[i] < minY) minY = Y[i];
     if (X[i] > maxX) maxX = X[i];
@@ -1011,11 +1147,13 @@ function applySearch(raw) {
   visMask = new Uint8Array(N);
   const matched = [];
   let tagHit = false;
+  let rowHit = false;
   for (let i = 0; i < N; i++) {
     if (hay[i].indexOf(q) !== -1) {
       visMask[i] = 1;
       matched.push(i);
       if (G[i] === 1) tagHit = true;
+      if (G[i] === 2) rowHit = true;
     }
   }
   hot = matched.length ? new Uint8Array(N) : null;
@@ -1034,6 +1172,11 @@ function applySearch(raw) {
     const b = document.getElementById('btn-tags');
     if (b) b.classList.add('active');
   }
+  if (rowHit && !rowsOn) {
+    rowsOn = true;
+    const b = document.getElementById('btn-rows');
+    if (b) b.classList.add('active');
+  }
   if (matched.length === 1) {
     camX = X[matched[0]]; camY = Y[matched[0]];
     zoom = Math.max(zoom, 0.8);
@@ -1050,6 +1193,12 @@ const tagsBtn = document.getElementById('btn-tags');
 tagsBtn.addEventListener('click', function() {
   tagsOn = !tagsOn;
   tagsBtn.classList.toggle('active', tagsOn);
+  requestDraw();
+});
+const rowsBtn = document.getElementById('btn-rows');
+if (rowsBtn) rowsBtn.addEventListener('click', function() {
+  rowsOn = !rowsOn;
+  rowsBtn.classList.toggle('active', rowsOn);
   requestDraw();
 });
 const themeToggleBtn = document.getElementById('theme-toggle');
@@ -1095,8 +1244,10 @@ function applyPayload(data) {
   hot = null;
   visMask = null;
   tagsOn = N < 800 && E < 2500;
+  rowsOn = false;
   if (tagsOn) tagsBtn.classList.add('active');
   else tagsBtn.classList.remove('active');
+  if (rowsBtn) rowsBtn.classList.remove('active');
   document.getElementById('stat-z').textContent = data.tz || 0;
   document.getElementById('stat-e').textContent = data.te || 0;
   document.getElementById('stat-r').textContent = data.tr || 0;
@@ -1196,6 +1347,9 @@ def _build_html(
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
   .leg-dot-entity {{ background: #38BDF8; border-color: #FFFFFF; }}
+  .leg-dot-column {{ background: #9078C8; border-color: #7058A8; }}
+  .leg-dot-value {{ background: #72B862; border-color: #529842; }}
+  .leg-dot-row {{ background: #64748B; border-color: #94A3B8; }}
   #graph-wrap {{ position: relative; width: 100%; height: calc(100vh - 56px); cursor: grab; touch-action: none; }}
   #graph-wrap:active {{ cursor: grabbing; }}
   #graph {{ position: absolute; inset: 0; width: 100%; height: 100%; display: block; }}
@@ -1275,8 +1429,9 @@ def _build_html(
   <input type="text" id="searchInput" placeholder="🔍 Найти карточку или тег..."/>
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
+    <button type="button" id="btn-rows">Строки таблицы</button>
   </div>
-  <div id="graph-hint">На большом графе теги лучше включать после приближения.</div>
+  <div id="graph-hint">Таблица: в центре лист, вокруг столбцы и их значения. Строки по умолчанию скрыты — включаются кнопкой.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
@@ -1285,7 +1440,10 @@ def _build_html(
 </div>
 <div id="legend">
   <h3>Легенда</h3>
-  <div class="leg-item"><div class="leg-dot leg-dot-thought"></div> Мысль</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-thought"></div> Лист / мысль</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-column"></div> Столбец</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-value"></div> Значение</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-row"></div> Строка</div>
   <div class="leg-item"><div class="leg-dot leg-dot-entity"></div> Тег</div>
 </div>
 <div id="detail-panel">
