@@ -241,24 +241,64 @@ class GraphRetriever:
                 context.expanded_nodes.append(node_context.parent)
                 expanded_ids.add(node_context.parent.zettel_id)
                 context.paths.append(f"[{entry.luhmann_id}] → CHILD_OF → [{node_context.parent.luhmann_id}]")
-            
-            for child in node_context.children:
+
+            children = node_context.children
+            if entry.thought_type == "excel_column":
+                children = children[:40]
+            for child in children:
                 if child.zettel_id not in expanded_ids:
                     context.expanded_nodes.append(child)
                     expanded_ids.add(child.zettel_id)
                     context.paths.append(f"[{child.luhmann_id}] → CHILD_OF → [{entry.luhmann_id}]")
-            
-            for related in node_context.related:
-                if related.zettel_id not in expanded_ids:
-                    context.expanded_nodes.append(related)
-                    expanded_ids.add(related.zettel_id)
-                    context.paths.append(f"[{entry.luhmann_id}] ↔ RELATED_TO ↔ [{related.luhmann_id}]")
+
+            related = node_context.related
+            if entry.thought_type == "excel_value":
+                related = []
+            for related_node in related:
+                if related_node.zettel_id not in expanded_ids:
+                    context.expanded_nodes.append(related_node)
+                    expanded_ids.add(related_node.zettel_id)
+                    context.paths.append(f"[{entry.luhmann_id}] ↔ RELATED_TO ↔ [{related_node.luhmann_id}]")
             
             for entity in node_context.entities:
                 if not any(e.name == entity.name for e in context.entities):
                     context.entities.append(entity)
-        
+
+        self._expand_excel_rows(context, user_id, expanded_ids)
         return context
+
+    def _expand_excel_rows(self, context: RetrievedContext, user_id: str, expanded_ids: set) -> None:
+        values = [
+            node for node in context.entry_points
+            if node.thought_type == "excel_value"
+        ]
+        if not values:
+            return
+        by_owner: dict[str, list] = {}
+        for node in values:
+            owner = node.user_id or user_id
+            if owner == "__all__":
+                continue
+            by_owner.setdefault(owner, []).append(node)
+        for owner, nodes in by_owner.items():
+            ids = [node.zettel_id for node in nodes]
+            require_all = len(ids) > 1
+            rows = self.repository.excel_rows_sharing_values(
+                owner,
+                ids,
+                limit=40,
+                require_all=require_all,
+            )
+            if require_all and not rows:
+                rows = self.repository.excel_rows_sharing_values(
+                    owner, ids, limit=20, require_all=False,
+                )
+            for row in rows:
+                if row.zettel_id in expanded_ids:
+                    continue
+                context.expanded_nodes.append(row)
+                expanded_ids.add(row.zettel_id)
+                context.paths.append("excel: значения одной строки")
     
     def retrieve_by_entity(self, user_id: str, entity_name: str, limit: int = 20) -> RetrievedContext:
         """Поиск всех мыслей пользователя, связанных с конкретной сущностью."""

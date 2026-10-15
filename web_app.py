@@ -1158,9 +1158,14 @@ def run_ingest(
     log_text: str,
     on_stage=None,
     manage_status: bool = True,
+    excel_tables=None,
 ) -> tuple[bool, str]:
     source_input = _canonical_source(source_input)
-    digest = _content_digest(text) if (text or "").strip() else ""
+    digest_source = text or ""
+    if excel_tables:
+        from app.handlers.excel_reader import excel_fingerprint, strip_excel_graph_stub
+        digest_source = excel_fingerprint(strip_excel_graph_stub(text or ""), excel_tables)
+    digest = _content_digest(digest_source) if (digest_source or "").strip() else ""
     if digest:
         try:
             prev = get_ingest_digest(graph_id, source_input)
@@ -1186,7 +1191,9 @@ def run_ingest(
         print(f"web_app ingest start slug={slug} chars={len(text or '')}")
         with _ingest_run_lock:
             set_ingest_phase(slug, "linking")
-            ok, ans = ingest_replacing(graph_id, text, source_input, on_stage=on_stage)
+            ok, ans = ingest_replacing(
+                graph_id, text, source_input, on_stage=on_stage, excel_tables=excel_tables,
+            )
         if ok and digest:
             try:
                 upsert_ingest_digest(graph_id, source_input, digest)
@@ -1407,9 +1414,18 @@ def ingest_replacing(
     text: str,
     source_input: str,
     on_stage=None,
+    excel_tables=None,
 ) -> tuple[bool, str]:
     """Сначала встраивает новую версию, старые карточки этого источника снимает только после успеха."""
+    from app.handlers.excel_reader import is_table_path, split_excel, strip_excel_graph_stub
+    from zettelkasten.excel_graph import ingest_excel_tables
+
     source_input = _canonical_source(source_input)
+    tables = list(excel_tables or [])
+    small_text = strip_excel_graph_stub(text or "")
+    if not tables and is_table_path(source_input) and os.path.isfile(source_input):
+        small_text, tables = split_excel(source_input)
+
     legacy = legacy_short_confluence_url(source_input)
     old_ids = linker.repository.list_zettel_ids_by_source(graph_id, source_input)
     if legacy and legacy != source_input:
@@ -1417,13 +1433,43 @@ def ingest_replacing(
             old_ids + linker.repository.list_zettel_ids_by_source(graph_id, legacy)
         ))
     old_set = set(old_ids)
-    ok, ans = save_user_note(
-        graph_id,
-        text,
-        on_stage=on_stage,
-        source_input=source_input,
-        exclude_zettel_ids=old_set,
-    )
+
+    ok = True
+    messages: list[str] = []
+    if tables:
+        def stage(key: str, title: str, sub: str = "") -> None:
+            ingest_checkpoint()
+            if on_stage:
+                on_stage(key, title, sub)
+
+        stage("link", "Табличный граф Excel", "Столбцы, значения и строки без атомайзера")
+        ok_graph, ans_graph = ingest_excel_tables(
+            linker.repository,
+            embedding_model,
+            graph_id,
+            source_input,
+            tables,
+            on_stage=stage,
+        )
+        ok = ok and ok_graph
+        if ans_graph:
+            messages.append(ans_graph)
+    if ok and small_text.strip():
+        ok_text, ans_text = save_user_note(
+            graph_id,
+            small_text,
+            on_stage=on_stage,
+            source_input=source_input,
+            exclude_zettel_ids=old_set,
+        )
+        ok = ok and ok_text
+        if ans_text:
+            messages.append(ans_text)
+    if not tables and not small_text.strip():
+        ok = False
+        messages.append("Текст не извлечен")
+
+    ans = "\n".join(part for part in messages if part).strip()
     if ok:
         if old_ids:
             linker.repository.delete_zettel_ids(graph_id, old_ids)
@@ -1453,6 +1499,7 @@ FILE_FORMAT_LABELS = {
     ".xls": "Excel",
     ".xlsm": "Excel",
     ".xlsb": "Excel",
+    ".csv": "CSV",
     ".png": "PNG",
     ".jpg": "JPG",
     ".jpeg": "JPEG",
@@ -4092,7 +4139,7 @@ async def add_page(slug: str, msg: str = "", st: str = ""):
             </div>
             <div id="file-mode-upload">
                 <form action="/p/{escape(slug)}/add/file" method="post" enctype="multipart/form-data" onsubmit="return submitFileIngest(event, this)">
-                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.xlsx,.xls,.xlsm,.png,.jpg,.jpeg,.msg" required></div>
+                    <div class="form-group"><label>Файл (.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .csv, .png, .jpg, .jpeg, .msg)</label><input type="file" name="file" accept=".pdf,.txt,.pptx,.ppt,.doc,.docx,.xlsx,.xls,.xlsm,.csv,.png,.jpg,.jpeg,.msg" required></div>
                     <button type="submit" class="btn">Обработать</button>
                 </form>
             </div>
@@ -4463,7 +4510,7 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
     ext = Path(file.filename).suffix.lower()
     if ext not in SUPPORTED_UPLOAD_EXTS:
         return RedirectResponse(
-            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg&st=err",
+            f"/p/{slug}/add?msg=Поддерживаются .pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .csv, .png, .jpg, .jpeg, .msg&st=err",
             status_code=303,
         )
 
@@ -4478,9 +4525,17 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
         try:
             if on_stage:
                 on_stage("read", f"Чтение {fmt}", f"«{filename}»")
-            text = extract_file_text(str(tmp))
-            if not (text or "").strip():
-                return False, "Текст не извлечен"
+            excel_tables = None
+            from app.handlers.excel_reader import is_table_path, split_excel, excel_fingerprint
+            if is_table_path(str(tmp)):
+                small, excel_tables = split_excel(str(tmp))
+                text = excel_fingerprint(small, excel_tables)
+                if not small.strip() and not excel_tables:
+                    return False, "Текст не извлечен"
+            else:
+                text = extract_file_text(str(tmp))
+                if not (text or "").strip():
+                    return False, "Текст не извлечен"
             return run_ingest(
                 slug,
                 scope["graph_id"],
@@ -4490,6 +4545,7 @@ async def add_file(slug: str, request: Request, file: UploadFile = File(None)):
                 f"[{filename}]",
                 on_stage=on_stage,
                 manage_status=False,
+                excel_tables=excel_tables,
             )
         except IngestCancelled:
             raise

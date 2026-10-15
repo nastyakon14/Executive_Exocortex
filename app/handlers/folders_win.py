@@ -36,14 +36,15 @@ EXTRACTABLE_EXTENSIONS = (
     ".xls",
     ".xlsm",
     ".xlsb",
+    ".csv",
     ".msg",
 )
 extensions = EXTRACTABLE_EXTENSIONS
-EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
-SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .png, .jpg, .jpeg, .msg)"
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv"}
+SUPPORTED_FILES_HINT = "(.pdf, .txt, .pptx, .ppt, .doc, .docx, .xlsx, .xls, .xlsm, .csv, .png, .jpg, .jpeg, .msg)"
 
 TOO_LARGE_MESSAGE = "Превышен максимальный размер файла (50 МБ)"
-TOO_LARGE_EXCEL_MESSAGE = "Превышен максимальный размер Excel-файла (10 МБ)"
+TOO_LARGE_EXCEL_MESSAGE = "Превышен максимальный размер таблицы Excel/CSV (10 МБ)"
 MEMORY_ERROR_MESSAGE = (
     "Не хватило памяти на обработку файла. "
     "Загрузите папку частями или возьмите меньшие файлы."

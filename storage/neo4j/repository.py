@@ -299,6 +299,125 @@ class ZettelRepository:
             source_input=source_input or "text",
             source_quote=source_quote or "",
         )
+
+    def create_zettels_batch(self, user_id: str, items: List[Dict[str, Any]]) -> int:
+        """Пачка узлов без печати. Entity-связи вызываются отдельно."""
+        if not items:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for item in items:
+            rows.append({
+                "zettel_id": item["zettel_id"],
+                "luhmann_id": item["luhmann_id"],
+                "topic": item.get("topic") or "",
+                "content": item.get("content") or "",
+                "thought_type": item.get("thought_type") or "fact",
+                "tags": _clean_tags(item.get("tags")),
+                "embedding": item.get("embedding") or [],
+                "is_root_topic": bool(item.get("is_root_topic")),
+                "source_input": item.get("source_input") or "text",
+                "source_quote": item.get("source_quote") or "",
+            })
+        query = """
+        UNWIND $rows AS row
+        CREATE (z:Zettel {
+            zettel_id: row.zettel_id,
+            user_id: $user_id,
+            luhmann_id: row.luhmann_id,
+            topic: row.topic,
+            content: row.content,
+            thought_type: row.thought_type,
+            tags: row.tags,
+            embedding: row.embedding,
+            is_root_topic: row.is_root_topic,
+            source_input: row.source_input,
+            source_quote: row.source_quote,
+            created_at: datetime($created_at),
+            updated_at: datetime($created_at)
+        })
+        """
+        chunk = 200
+        for start in range(0, len(rows), chunk):
+            self.client.execute_write(query, {
+                "user_id": user_id,
+                "rows": rows[start:start + chunk],
+                "created_at": now,
+            })
+        if any(item.get("is_root_topic") for item in items):
+            self._max_root_id_cache.pop(user_id, None)
+        return len(rows)
+
+    def create_child_links(self, user_id: str, links: List[Dict[str, str]]) -> None:
+        if not links:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        query = """
+        UNWIND $links AS link
+        MATCH (child:Zettel {zettel_id: link.child, user_id: $user_id})
+        MATCH (parent:Zettel {zettel_id: link.parent, user_id: $user_id})
+        MERGE (child)-[:CHILD_OF {created_at: datetime($created_at)}]->(parent)
+        """
+        chunk = 400
+        for start in range(0, len(links), chunk):
+            self.client.execute_write(query, {
+                "user_id": user_id,
+                "links": links[start:start + chunk],
+                "created_at": now,
+            })
+
+    def create_related_links(self, user_id: str, links: List[Dict[str, str]]) -> None:
+        if not links:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        query = """
+        UNWIND $links AS link
+        MATCH (left:Zettel {zettel_id: link.left, user_id: $user_id})
+        MATCH (right:Zettel {zettel_id: link.right, user_id: $user_id})
+        MERGE (left)-[:RELATED_TO {created_at: datetime($created_at)}]->(right)
+        """
+        chunk = 400
+        for start in range(0, len(links), chunk):
+            self.client.execute_write(query, {
+                "user_id": user_id,
+                "links": links[start:start + chunk],
+                "created_at": now,
+            })
+
+    def excel_rows_sharing_values(
+        self,
+        user_id: str,
+        value_ids: List[str],
+        limit: int = 40,
+        require_all: bool = True,
+    ) -> List[ZettelNode]:
+        ids = [item for item in (value_ids or []) if item]
+        if not ids:
+            return []
+        if require_all and len(ids) > 1:
+            query = """
+            MATCH (first:Zettel {zettel_id: $first, user_id: $user_id})-[:RELATED_TO]-(row:Zettel {
+                user_id: $user_id, thought_type: 'excel_row'
+            })
+            WHERE ALL(vid IN $rest WHERE EXISTS {
+                MATCH (other:Zettel {zettel_id: vid, user_id: $user_id})-[:RELATED_TO]-(row)
+            })
+            RETURN DISTINCT row AS z
+            LIMIT $limit
+            """
+            params = {"user_id": user_id, "first": ids[0], "rest": ids[1:], "limit": limit}
+        else:
+            query = """
+            MATCH (value:Zettel {user_id: $user_id})-[:RELATED_TO]-(row:Zettel {
+                user_id: $user_id, thought_type: 'excel_row'
+            })
+            WHERE value.zettel_id IN $ids
+            RETURN DISTINCT row AS z
+            LIMIT $limit
+            """
+            params = {"user_id": user_id, "ids": ids, "limit": limit}
+        result = self.client.execute_read(query, params)
+        return [self._node_to_zettel(row["z"]) for row in result]
     
     def update_zettel_content(
         self,
@@ -901,7 +1020,7 @@ class ZettelRepository:
         MATCH (z:Zettel {{zettel_id: $zettel_id, user_id: $user_id}})-[:RELATED_TO*1..{hops}]-(related:Zettel {{user_id: $user_id}})
         WHERE related.zettel_id <> $zettel_id
         RETURN DISTINCT related as z
-        LIMIT 10
+        LIMIT 50
         """
         result = self.client.execute_read(query, {"zettel_id": zettel_id, "user_id": user_id})
         return [self._node_to_zettel(r["z"]) for r in result]
