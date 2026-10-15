@@ -5,6 +5,8 @@ from datetime import date, datetime
 
 import pandas as pd
 
+MAX_SHEET_ROWS = 300
+
 
 def read_excel(file_path):
     """Текст всех листов: отдельные таблицы, настоящие заголовки, без Unnamed."""
@@ -14,6 +16,8 @@ def read_excel(file_path):
         parts = []
         for sheet_name in book.sheet_names:
             frame = book.parse(sheet_name, header=None)
+            if _sheet_row_count(frame) > MAX_SHEET_ROWS:
+                continue
             text = _sheet_text(frame, merges.get(sheet_name) or [])
             if text:
                 parts.append(f"Лист: {sheet_name}\n{text}")
@@ -42,6 +46,12 @@ def _merged_ranges(file_path) -> dict[str, list[tuple[int, int, int, int]]]:
     finally:
         workbook.close()
     return found
+
+
+def _sheet_row_count(frame: pd.DataFrame) -> int:
+    if frame is None or frame.empty:
+        return 0
+    return int(len(frame))
 
 
 def _sheet_text(frame: pd.DataFrame, merges: list[tuple[int, int, int, int]]) -> str:
