@@ -158,47 +158,59 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             cursor += child_w
         stack.remove(lid)
 
-    def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> tuple[float, float]:
+    def excel_rings(sheet_lid: str) -> tuple[list[tuple[str, list[str]]], float, float]:
         cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
-        n_cols = max(len(cols), 1)
-        cols_per_row = min(4, n_cols)
-        col_w, val_h = 300.0, 34.0
-        col_blocks: list[tuple[str, list[str]]] = []
+        blocks: list[tuple[str, list[str]]] = []
+        max_vr = 140.0
         for col in cols:
             vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
-            col_blocks.append((col, vals))
-        row_heights: dict[int, float] = defaultdict(float)
-        for index, (_col, vals) in enumerate(col_blocks):
-            gy = index // cols_per_row
-            row_heights[gy] = max(row_heights[gy], 56 + max(len(vals), 1) * val_h)
-        row_y = [0.0]
-        for gy in range(max(row_heights, default=-1) + 1):
-            row_y.append(row_y[-1] + row_heights.get(gy, 160) + 48)
+            nv = len(vals)
+            vr = 118.0 + nv * 6.0 if nv <= 14 else max(210.0, nv * 9.0)
+            max_vr = max(max_vr, vr)
+            blocks.append((col, vals))
+        n_cols = max(len(blocks), 1)
+        if n_cols <= 1:
+            col_orbit = 180.0 + max_vr
+        else:
+            col_orbit = (2.0 * max_vr + 130.0) / (2.0 * math.sin(math.pi / n_cols))
+            col_orbit = max(col_orbit, 150.0 + max_vr)
+        return blocks, col_orbit, max_vr
+
+    def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> tuple[float, float]:
+        """Лист в центре, столбцы по кругу, значения — спутники своего столбца."""
+        col_blocks, col_orbit, val_r = excel_rings(sheet_lid)
+        n_cols = max(len(col_blocks), 1)
         sheet_zid = luhmann_to_id.get(sheet_lid)
-        grid_w = cols_per_row * col_w
         if sheet_zid:
-            pos[sheet_zid] = (origin_x + grid_w / 2 - col_w / 2, origin_y)
+            pos[sheet_zid] = (origin_x, origin_y)
         for index, (col, vals) in enumerate(col_blocks):
-            gx = index % cols_per_row
-            gy = index // cols_per_row
-            cx = origin_x + gx * col_w
-            cy = origin_y + 110 + row_y[gy]
+            ang = -math.pi / 2 + (2 * math.pi * index / n_cols)
+            cx = origin_x + col_orbit * math.cos(ang)
+            cy = origin_y + col_orbit * math.sin(ang)
             col_zid = luhmann_to_id.get(col)
             if col_zid:
                 pos[col_zid] = (cx, cy)
+            nv = len(vals)
+            if nv <= 14:
+                arc = min(math.pi * 1.35, max(0.9, nv * 0.36))
+                vr = 118.0 + nv * 6.0
+            else:
+                arc = math.pi * 1.85
+                vr = max(210.0, nv * 9.0)
             for v_index, val in enumerate(vals):
+                t = 0.5 if nv <= 1 else v_index / (nv - 1)
+                vang = ang + (t - 0.5) * arc
                 val_zid = luhmann_to_id.get(val)
                 if val_zid:
-                    pos[val_zid] = (cx, cy + 48 + v_index * val_h)
-        park = (origin_x - 80, origin_y)
+                    pos[val_zid] = (cx + vr * math.cos(vang), cy + vr * math.sin(vang))
         for row in children[sheet_lid]:
             if type_by_lid.get(row) != "excel_row":
                 continue
             row_zid = luhmann_to_id.get(row)
             if row_zid:
-                pos[row_zid] = park
-        span_h = 110 + row_y[-1] + 40
-        return grid_w + 40, span_h
+                pos[row_zid] = (origin_x - 80, origin_y)
+        span = 2.0 * (col_orbit + val_r) + 160.0
+        return span, span
 
     depth_memo: dict[str, int] = {}
 
@@ -218,20 +230,20 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     excel_roots = [lid for lid in roots if type_by_lid.get(lid) == "excel_sheet"]
     other_roots = [lid for lid in roots if type_by_lid.get(lid) != "excel_sheet"]
 
-    row_limit = 3200
+    row_limit = 5200
     x_cursor = 0.0
     y_cursor = 0.0
     row_h = 0.0
     for sheet in excel_roots:
-        n_cols = max(len([c for c in children[sheet] if type_by_lid.get(c) == "excel_column"]), 1)
-        span_w = min(4, n_cols) * 300 + 40
+        _blocks, _orbit, _vr = excel_rings(sheet)
+        span_w = 2.0 * (_orbit + _vr) + 160.0
         if x_cursor > 0 and x_cursor + span_w > row_limit:
             x_cursor = 0.0
             y_cursor += row_h + 280
             row_h = 0.0
-        _w, span_h = place_excel_sheet(sheet, x_cursor, y_cursor)
-        x_cursor += _w + 160
-        row_h = max(row_h, span_h)
+        place_excel_sheet(sheet, x_cursor + span_w / 2, y_cursor + span_w / 2)
+        x_cursor += span_w + 220
+        row_h = max(row_h, span_w)
 
     for root in other_roots:
         width = leaf_count(root, set()) * x_unit
@@ -292,7 +304,7 @@ def _excel_label(thought_type: str, topic: str, content: str) -> str:
     text = " ".join((topic or content or "").split())
     if not text:
         return ""
-    limit = 48 if thought_type == "excel_column" else 36
+    limit = 42 if thought_type == "excel_column" else 22
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
@@ -310,15 +322,14 @@ def _excel_node_style(
     if thought_type == "excel_row":
         return 2, 11, 7
     if thought_type == "excel_sheet":
-        return 0, 76, color_index.get(root, 0)
+        return 0, 64, color_index.get(root, 0)
     if thought_type in {"excel_column", "excel_value"}:
         source = luhmann_id if thought_type == "excel_column" else (parent_by_luhmann.get(luhmann_id) or luhmann_id)
         parts = [p for p in (source or "").split(".") if p.isdigit()]
         color = int(parts[-1]) % len(_BRANCH_PALETTE) if parts else 1
         if thought_type == "excel_column":
-            return 0, 48, color
-        radius = 16 + min(30, int(7 * math.log1p(max(value_degree, 0))))
-        return 0, radius, color
+            return 0, 34, color
+        return 0, 18, color
     return 0, _thought_size(depth), color_index[root]
 
 
@@ -455,7 +466,49 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             continue
         edge_set.add(key)
         edges.append([a, b, kind.get(edge["rel_type"], 0)])
+    _append_excel_bridges(graph_data, id_index, edges)
     return nodes, edges, meta, len(graph_data["zettels"]), len(graph_data["entities"]), len(edges)
+
+
+def _bridge_key(text: str) -> str:
+    return " ".join((text or "").lower().replace("ё", "е").split())
+
+
+def _append_excel_bridges(graph_data: Dict[str, Any], id_index: dict, edges: list) -> None:
+    """Одинаковые столбцы и значения разных листов связаны постоянно. Строки сюда не входят."""
+    topic_by_lid = {z["luhmann_id"]: (z.get("topic") or "") for z in graph_data["zettels"]}
+    columns: dict[str, list[int]] = defaultdict(list)
+    values: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for z in graph_data["zettels"]:
+        idx = id_index.get(z["zettel_id"])
+        if idx is None:
+            continue
+        name = _bridge_key(z.get("topic") or "")
+        if not name:
+            continue
+        thought = z.get("thought_type") or ""
+        if thought == "excel_column":
+            columns[name].append(idx)
+        elif thought == "excel_value":
+            column_name = _bridge_key(topic_by_lid.get(z.get("parent_luhmann") or "", ""))
+            if column_name:
+                values[(column_name, name)].append(idx)
+
+    def link(members: list[int], limit: int) -> int:
+        if len(members) < 2 or len(members) > limit:
+            return 0
+        hub = members[0]
+        for other in members[1:]:
+            edges.append([hub, other, 3])
+        return len(members) - 1
+
+    for members in columns.values():
+        link(members, 8)
+    budget = 70
+    for members in values.values():
+        if budget <= 0:
+            break
+        budget -= link(members, 4)
 
 
 def encode_graph_html(html: str, accept_encoding: str = "") -> tuple[bytes, dict]:
@@ -557,19 +610,95 @@ function sx(x) { return (x - camX) * zoom + W / 2; }
 function sy(y) { return (y - camY) * zoom + H / 2; }
 function wx(x) { return (x - W / 2) / zoom + camX; }
 function wy(y) { return (y - H / 2) / zoom + camY; }
+let revealedMark = null;
+let revealedRows = [];
 function nodeVisible(i) {
   if (G[i] === 1 && !(tagsOn && zoom >= 0.32)) return 0;
-  if (G[i] === 2) return selected === i ? 1 : 0;
+  if (G[i] === 2) return revealedMark && revealedMark[i] ? 1 : 0;
   if (visMask && visMask[i] === 0) return 0;
   return 1;
 }
+function hideRevealedRows() {
+  for (let i = 0; i < revealedRows.length; i++) {
+    const id = revealedRows[i];
+    const oldX = X[id], oldY = Y[id];
+    X[id] = -100000;
+    Y[id] = -100000;
+    reindexNode(id, oldX, oldY);
+  }
+  revealedRows = [];
+  revealedMark = null;
+}
+function outwardOf(idx) {
+  const start = adjOff[idx], end = adjOff[idx + 1];
+  for (let p = start; p < end; p++) {
+    if (adjK[p] !== 0 || adjFrom[p] !== idx) continue;
+    const parent = adjTo[p];
+    if (G[parent] === 2) continue;
+    const dx = X[idx] - X[parent], dy = Y[idx] - Y[parent];
+    const len = Math.hypot(dx, dy) || 1;
+    return [dx / len, dy / len];
+  }
+  return [0, -1];
+}
+function placeNode(id, x, y) {
+  const oldX = X[id], oldY = Y[id];
+  X[id] = x;
+  Y[id] = y;
+  reindexNode(id, oldX, oldY);
+}
+function revealExcelRows(idx) {
+  hideRevealedRows();
+  if (idx < 0 || !adjOff) return;
+  const tt = String((META[idx] || [])[3] || '');
+  if (tt !== 'excel_value' && G[idx] !== 2) return;
+  revealedMark = new Uint8Array(N);
+  if (G[idx] === 2) {
+    revealedMark[idx] = 1;
+    revealedRows = [idx];
+    const vals = [];
+    const start = adjOff[idx], end = adjOff[idx + 1];
+    for (let p = start; p < end; p++) {
+      if (adjK[p] === 2 && G[adjTo[p]] !== 2) vals.push(adjTo[p]);
+    }
+    if (!vals.length) {
+      placeNode(idx, camX + 160, camY);
+      return;
+    }
+    let ax = 0, ay = 0;
+    for (let i = 0; i < vals.length; i++) { ax += X[vals[i]]; ay += Y[vals[i]]; }
+    placeNode(idx, ax / vals.length, ay / vals.length - 72);
+    return;
+  }
+  const rows = [];
+  const start = adjOff[idx], end = adjOff[idx + 1];
+  for (let p = start; p < end; p++) {
+    if (G[adjTo[p]] === 2) rows.push(adjTo[p]);
+  }
+  const use = rows.slice(0, 12);
+  revealedRows = use;
+  const dir = outwardOf(idx);
+  const px = -dir[1], py = dir[0];
+  for (let i = 0; i < use.length; i++) {
+    const id = use[i];
+    revealedMark[id] = 1;
+    const side = (i - (use.length - 1) / 2) * 54;
+    const along = 168 + (i % 2) * 28;
+    placeNode(id, X[idx] + dir[0] * along + px * side, Y[idx] + dir[1] * along + py * side);
+  }
+}
 function isHot(i) { return !hot || hot[i] > 0; }
 function setHot(idx) {
-  if (idx < 0) { hot = null; return; }
+  if (idx < 0) {
+    hot = null;
+    hideRevealedRows();
+    return;
+  }
   hot = new Uint8Array(N);
   hot[idx] = 2;
   const start = adjOff[idx], end = adjOff[idx + 1];
   for (let p = start; p < end; p++) hot[adjTo[p]] = 1;
+  revealExcelRows(idx);
 }
 function setHotMany(ids) {
   if (!ids || !ids.length) { hot = null; return; }
@@ -744,13 +873,23 @@ function drawNode(i, alpha, ring) {
 
 function drawLabel(i, alpha, light) {
   const r = Math.max(3, R[i] * zoom);
-  if (r < 7) return false;
+  const tt = String((META[i] || [])[3] || '');
+  const excelNode = tt.indexOf('excel_') === 0;
+  if (r < 7 && G[i] !== 2 && !excelNode) return false;
+  const excel = tt.indexOf('excel_') === 0 && tt !== 'excel_sheet';
   ctx.globalAlpha = alpha;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
   ctx.font = Math.max(10, Math.min(14, 11 * zoom)) + 'px Arial';
   ctx.fillStyle = light ? '#0f172a' : '#ffffff';
-  ctx.fillText(L[i], sx(X[i]), sy(Y[i]) + r + 4);
+  if (excel) {
+    const dir = outwardOf(i);
+    ctx.textAlign = dir[0] >= 0 ? 'left' : 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(L[i], sx(X[i]) + dir[0] * (r + 10), sy(Y[i]) + dir[1] * (r + 6));
+  } else {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(L[i], sx(X[i]), sy(Y[i]) + r + 4);
+  }
   return true;
 }
 
@@ -773,7 +912,7 @@ function draw() {
   const vis = cellsInView(x0, y0, x1, y1);
   const showTags = tagsOn && zoom >= 0.32;
   const showEdges = zoom >= 0.06;
-  const showLabels = zoom >= 0.42;
+  const showLabels = zoom >= 0.16;
   const dim = hot ? 0.16 : 1;
   const maxE = zoom < 0.14 ? 4500 : 9000;
   const maxN = zoom < 0.2 ? 2800 : 5500;
@@ -809,14 +948,16 @@ function draw() {
       const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
       const rowEdge = G[a] === 2 || G[b] === 2;
       const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
-      if (k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
-      if (rowEdge && selected !== a && selected !== b) continue;
+      const bridge = k === 3;
+      if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
+      if (!bridge && rowEdge && selected !== a && selected !== b) continue;
       if (!nodeVisible(a) || !nodeVisible(b)) continue;
       const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
       if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
-      ctx.globalAlpha = focusEdge ? 1 : dim;
-      ctx.strokeStyle = focusEdge ? '#60a5fa' : (light ? '#9ca3af' : '#9CA3AF');
-      ctx.setLineDash(k === 1 ? [5, 4] : []);
+      ctx.globalAlpha = focusEdge ? 1 : (bridge ? 0.9 : dim);
+      ctx.strokeStyle = focusEdge ? '#60a5fa' : (bridge ? '#e879f9' : (light ? '#9ca3af' : '#9CA3AF'));
+      ctx.lineWidth = bridge ? Math.max(1.5, Math.min(2.6, zoom * 1.6)) : Math.max(0.7, Math.min(2.2, zoom * 1.2));
+      ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
       ctx.beginPath();
       ctx.moveTo(sx(ax), sy(ay));
       ctx.lineTo(sx(bx), sy(by));
@@ -1225,27 +1366,6 @@ document.getElementById('searchInput').addEventListener('input', function() {
   searchTimer = setTimeout(function() { applySearch(v); }, 80);
 });
 
-const tableBtn = document.getElementById('btn-table');
-const graphBtn = document.getElementById('btn-graph');
-if (tableBtn) tableBtn.addEventListener('click', function() { setTableMode(true); });
-if (graphBtn) graphBtn.addEventListener('click', function() { setTableMode(false); requestDraw(); });
-const filterBox = document.getElementById('table-filters');
-if (filterBox) filterBox.addEventListener('click', function(ev) {
-  const btn = ev.target.closest('.xf-val');
-  if (!btn) return;
-  const id = Number(btn.getAttribute('data-v'));
-  if (tablePick.has(id)) tablePick.delete(id);
-  else tablePick.add(id);
-  renderFilters();
-});
-const tableScroll = document.getElementById('table-scroll');
-if (tableScroll) tableScroll.addEventListener('scroll', paintTableRows);
-const tableRowsBox = document.getElementById('table-rows');
-if (tableRowsBox) tableRowsBox.addEventListener('click', function(ev) {
-  const row = ev.target.closest('.xf-row');
-  if (!row) return;
-  showTableRecord(Number(row.getAttribute('data-r')));
-});
 const tagsBtn = document.getElementById('btn-tags');
 tagsBtn.addEventListener('click', function() {
   tagsOn = !tagsOn;
@@ -1287,219 +1407,6 @@ async function inflateB64(b64) {
   throw new Error('Нет DecompressionStream');
 }
 
-let tableCols = [];
-let tableRows = [];
-let tablePick = new Set();
-let tableMatch = [];
-let tableOn = false;
-const TABLE_ROW_H = 56;
-
-function parentIndex(i) {
-  const start = adjOff[i], end = adjOff[i + 1];
-  for (let p = start; p < end; p++) {
-    if (adjK[p] === 0 && adjFrom[p] === i) return adjTo[p];
-  }
-  return -1;
-}
-
-function buildExcelBoard() {
-  tableCols = [];
-  tableRows = [];
-  tablePick = new Set();
-  const valuesByCol = new Map();
-  const rowIds = [];
-  for (let i = 0; i < N; i++) {
-    const tt = String((META[i] || [])[3] || '');
-    if (tt === 'excel_row') rowIds.push(i);
-    if (tt !== 'excel_value') continue;
-    const col = parentIndex(i);
-    if (col < 0) continue;
-    let bucket = valuesByCol.get(col);
-    if (!bucket) { bucket = []; valuesByCol.set(col, bucket); }
-  }
-  const valueRows = new Map();
-  for (let i = 0; i < E; i++) {
-    if (EFLAT[i * 3 + 2] !== 2) continue;
-    const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
-    const row = G[a] === 2 ? a : (G[b] === 2 ? b : -1);
-    const val = row === a ? b : a;
-    if (row < 0) continue;
-    let list = valueRows.get(val);
-    if (!list) { list = []; valueRows.set(val, list); }
-    list.push(row);
-  }
-  const sheets = new Map();
-  valuesByCol.forEach(function(vals, col) {
-    const sheet = parentIndex(col);
-    const sheetName = sheet >= 0 ? (L[sheet] || 'Лист') : 'Таблица';
-    let group = sheets.get(sheetName);
-    if (!group) { group = []; sheets.set(sheetName, group); }
-    const items = [];
-    const start = adjOff[col], end = adjOff[col + 1];
-    for (let p = start; p < end; p++) {
-      const ni = adjTo[p];
-      if (String((META[ni] || [])[3] || '') !== 'excel_value') continue;
-      const rows = valueRows.get(ni) || [];
-      items.push({ i: ni, n: rows.length, rows: Uint32Array.from(rows) });
-    }
-    items.sort(function(a, b) { return b.n - a.n || String(L[a.i]).localeCompare(String(L[b.i]), 'ru'); });
-    group.push({ col: col, name: L[col] || 'Столбец', values: items });
-  });
-  sheets.forEach(function(cols, name) {
-    cols.sort(function(a, b) { return String(a.name).localeCompare(String(b.name), 'ru'); });
-    tableCols.push({ name: name, cols: cols });
-  });
-  tableRows = Uint32Array.from(rowIds);
-  const btnT = document.getElementById('btn-table');
-  const btnG = document.getElementById('btn-graph');
-  const has = tableCols.length > 0;
-  if (btnT) btnT.hidden = !has;
-  if (btnG) btnG.hidden = !has;
-  if (has) setTableMode(true);
-  else setTableMode(false);
-}
-
-function setTableMode(on) {
-  tableOn = !!on && tableCols.length > 0;
-  document.body.classList.toggle('table-mode', tableOn);
-  const btnT = document.getElementById('btn-table');
-  const btnG = document.getElementById('btn-graph');
-  if (btnT) btnT.classList.toggle('on', tableOn);
-  if (btnG) btnG.classList.toggle('on', !tableOn && tableCols.length > 0);
-  if (tableOn) renderFilters();
-}
-
-function renderFilters() {
-  const box = document.getElementById('table-filters');
-  if (!box) return;
-  let html = '';
-  tableCols.forEach(function(sheet) {
-    html += '<div class="xf-sheet">' + esc(sheet.name) + '</div>';
-    sheet.cols.forEach(function(col) {
-      html += '<div class="xf-col">' + esc(col.name) + '</div>';
-      col.values.forEach(function(val) {
-        const on = tablePick.has(val.i) ? ' on' : '';
-        html += '<button type="button" class="xf-val' + on + '" data-v="' + val.i + '">' +
-          esc(L[val.i] || '') + '<span>' + val.n + '</span></button>';
-      });
-    });
-  });
-  box.innerHTML = html;
-  refreshMatch();
-}
-
-function selectedByColumn() {
-  const groups = new Map();
-  tablePick.forEach(function(id) {
-    const col = parentIndex(id);
-    let g = groups.get(col);
-    if (!g) { g = []; groups.set(col, g); }
-    g.push(id);
-  });
-  return groups;
-}
-
-function rowsOfValue(id) {
-  for (let s = 0; s < tableCols.length; s++) {
-    const cols = tableCols[s].cols;
-    for (let c = 0; c < cols.length; c++) {
-      const vals = cols[c].values;
-      for (let v = 0; v < vals.length; v++) {
-        if (vals[v].i === id) return vals[v].rows;
-      }
-    }
-  }
-  return new Uint32Array(0);
-}
-
-function refreshMatch() {
-  const groups = selectedByColumn();
-  if (!groups.size) {
-    tableMatch = Array.from(tableRows);
-  } else {
-    let current = null;
-    groups.forEach(function(ids) {
-      const mark = new Uint8Array(N);
-      ids.forEach(function(id) {
-        const rows = rowsOfValue(id);
-        for (let i = 0; i < rows.length; i++) mark[rows[i]] = 1;
-      });
-      if (!current) current = mark;
-      else {
-        for (let i = 0; i < N; i++) if (current[i] && !mark[i]) current[i] = 0;
-      }
-    });
-    const found = [];
-    for (let i = 0; i < tableRows.length; i++) {
-      const id = tableRows[i];
-      if (current[id]) found.push(id);
-    }
-    tableMatch = found;
-  }
-  const head = document.getElementById('table-head');
-  if (head) {
-    const extra = tablePick.size ? ' · фильтров: ' + tablePick.size : '';
-    head.innerHTML = 'Записи: ' + tableMatch.length + extra +
-      (tablePick.size ? ' <button type="button" id="btn-clear-filters">Сбросить</button>' : '');
-    const clear = document.getElementById('btn-clear-filters');
-    if (clear) clear.addEventListener('click', function() {
-      tablePick.clear();
-      renderFilters();
-    });
-  }
-  const sc = document.getElementById('table-scroll');
-  if (sc) sc.scrollTop = 0;
-  paintTableRows();
-}
-
-function rowChips(i) {
-  const start = adjOff[i], end = adjOff[i + 1];
-  const parts = [];
-  const seen = new Uint8Array(N);
-  for (let p = start; p < end && parts.length < 6; p++) {
-    const ni = adjTo[p];
-    if (seen[ni] || adjK[p] !== 2) continue;
-    if (String((META[ni] || [])[3] || '') !== 'excel_value') continue;
-    seen[ni] = 1;
-    parts.push(L[ni] || '');
-  }
-  return parts.join(' · ');
-}
-
-function paintTableRows() {
-  const sc = document.getElementById('table-scroll');
-  const box = document.getElementById('table-rows');
-  if (!sc || !box) return;
-  const total = tableMatch.length;
-  box.style.height = (total * TABLE_ROW_H) + 'px';
-  const start = Math.max(0, Math.floor(sc.scrollTop / TABLE_ROW_H) - 6);
-  const end = Math.min(total, Math.ceil((sc.scrollTop + sc.clientHeight) / TABLE_ROW_H) + 8);
-  let html = '';
-  for (let i = start; i < end; i++) {
-    const id = tableMatch[i];
-    html += '<div class="xf-row" style="top:' + (i * TABLE_ROW_H) + 'px" data-r="' + id + '">' +
-      '<b>' + esc(L[id] || ('Строка ' + (i + 1))) + '</b><em>' + esc(rowChips(id)) + '</em></div>';
-  }
-  box.innerHTML = html;
-}
-
-function showTableRecord(idx) {
-  const m = META[idx] || [];
-  const panel = document.getElementById('detail-panel');
-  const content = document.getElementById('detail-content');
-  const lines = String(m[5] || '').split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
-  let html = '<h2>' + esc(L[idx] || 'Запись') + '</h2>';
-  lines.forEach(function(line, n) {
-    if (n === 0) return;
-    const cut = line.indexOf(':');
-    if (cut < 1) return;
-    html += '<div class="field"><div class="field-label">' + esc(line.slice(0, cut)) +
-      '</div><div class="field-value">' + esc(line.slice(cut + 1).trim()) + '</div></div>';
-  });
-  content.innerHTML = html;
-  panel.style.display = 'block';
-}
-
 function applyPayload(data) {
   N = data.n || 0;
   X = Float32Array.from(data.x || []);
@@ -1513,6 +1420,8 @@ function applyPayload(data) {
   E = (EFLAT.length / 3) | 0;
   hot = null;
   visMask = null;
+  revealedRows = [];
+  revealedMark = null;
   tagsOn = N < 800 && E < 2500;
   rowsOn = false;
   if (tagsOn) tagsBtn.classList.add('active');
@@ -1523,7 +1432,6 @@ function applyPayload(data) {
   document.getElementById('stat-r').textContent = data.tr || 0;
   buildIndex();
   buildClusters();
-  buildExcelBoard();
   clusterHot = -1;
   hideClusterTip();
   resize();
@@ -1616,6 +1524,7 @@ def _build_html(
   #legend h3 {{ margin-bottom: 8px; color: #e2e8f0; font-size: 13px; }}
   .leg-item {{ display: flex; align-items: center; gap: 8px; margin: 4px 0; }}
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
+  .leg-bridge {{ width: 22px; height: 0; border-top: 2px dashed #e879f9; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
   .leg-dot-entity {{ background: #38BDF8; border-color: #FFFFFF; }}
   .leg-dot-column {{ background: #9078C8; border-color: #7058A8; }}
@@ -1662,48 +1571,16 @@ def _build_html(
     padding: 8px 14px; color: #e2e8f0; font-size: 13px; width: 240px; outline: none;
   }}
   #graph-controls {{ display: flex; gap: 6px; }}
-  #graph-hint {{ font-size: 11px; color: #94a3b8; max-width: 260px; line-height: 1.35; }}
-  #table-board {{
-    display: none; position: absolute; inset: 0; z-index: 6;
-    grid-template-columns: minmax(260px, 360px) 1fr; background: #0b1220;
+  #graph-hint {{
+    position: absolute; right: 16px; bottom: 16px; z-index: 8; pointer-events: none;
+    max-width: 340px; font-size: 11px; color: #94a3b8; line-height: 1.35; text-align: right;
   }}
-  body.table-mode #table-board {{ display: grid; }}
-  body.table-mode #graph, body.table-mode #legend, body.table-mode #search-box, body.table-mode #load-hint {{ display: none; }}
-  #btn-table, #btn-graph {{
-    border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
-    border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
-  }}
-  #btn-table.on, #btn-graph.on {{ border-color: #60a5fa; background: #1e3a5f; }}
-  #table-filters, #table-main {{ overflow: auto; }}
-  #table-filters {{ border-right: 1px solid #334155; padding: 12px 12px 24px; }}
-  #table-main {{ display: flex; flex-direction: column; min-width: 0; min-height: 0; }}
-  #table-head {{ padding: 12px 16px; border-bottom: 1px solid #334155; color: #e2e8f0; font-size: 13px; }}
-  #table-head button {{ margin-left: 10px; }}
-  #table-scroll {{ position: relative; flex: 1; overflow: auto; }}
-  #table-rows {{ position: relative; }}
-  .xf-sheet {{ font-size: 12px; color: #94a3b8; margin: 14px 0 6px; }}
-  .xf-col {{ font-size: 13px; font-weight: 600; color: #e2e8f0; margin: 8px 0 4px; }}
-  .xf-val {{
-    display: flex; justify-content: space-between; gap: 8px; width: 100%;
-    text-align: left; border: 1px solid transparent; background: transparent;
-    color: #e2e8f0; border-radius: 8px; padding: 6px 8px; cursor: pointer; font-size: 13px;
-  }}
-  .xf-val span {{ color: #94a3b8; }}
-  .xf-val.on {{ background: #1e3a5f; border-color: #60a5fa; }}
-  .xf-row {{
-    position: absolute; left: 12px; right: 12px; height: 52px; box-sizing: border-box;
-    border-bottom: 1px solid #1e293b; padding: 6px 4px; cursor: pointer;
-  }}
-  .xf-row b {{ display: block; font-size: 13px; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .xf-row em {{ display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .xf-row.on {{ background: rgba(59,130,246,0.15); }}
   body.light-theme {{ background: #f8fafc; color: #1f2937; }}
   body.light-theme #header {{ background: #ffffff; border-bottom: 1px solid #e5e7eb; }}
   body.light-theme #header h1 {{ color: #1f2937; }}
   body.light-theme #graph-back {{ color: #2563eb; }}
   body.light-theme #stats {{ color: #6b7280; }}
   body.light-theme #stats span {{ color: #374151; }}
-  body.light-theme #btn-table, body.light-theme #btn-graph,
   body.light-theme #theme-toggle, body.light-theme #graph-controls button {{
     border: 1px solid #d1d5db; background: #ffffff; color: #374151;
   }}
@@ -1718,13 +1595,6 @@ def _build_html(
   body.light-theme #search-box input {{ background: #ffffff; border: 1px solid #d1d5db; color: #374151; }}
   body.light-theme #cluster-tip {{ background: rgba(255,255,255,0.98); border: 1px solid #d1d5db; color: #374151; }}
   body.light-theme #cluster-tip .ct-title {{ color: #111827; }}
-  body.light-theme #table-board {{ background: #f8fafc; }}
-  body.light-theme #table-filters {{ border-right-color: #e5e7eb; }}
-  body.light-theme #table-head {{ border-bottom-color: #e5e7eb; color: #111827; }}
-  body.light-theme .xf-col, body.light-theme .xf-val, body.light-theme .xf-row b {{ color: #111827; }}
-  body.light-theme .xf-val.on {{ background: #eff6ff; border-color: #3b82f6; }}
-  body.light-theme .xf-row {{ border-bottom-color: #e5e7eb; }}
-  body.light-theme .xf-row em, body.light-theme .xf-val span, body.light-theme .xf-sheet {{ color: #6b7280; }}
 </style>
 </head>
 <body class="light-theme">
@@ -1735,8 +1605,6 @@ def _build_html(
   </div>
   <div id="header-right">
     <div id="stats">Карточки: <span id="stat-z">{total_z}</span> &nbsp;|&nbsp; Теги: <span id="stat-e">{total_e}</span> &nbsp;|&nbsp; Связи: <span id="stat-r">{total_r}</span></div>
-    <button type="button" id="btn-table" hidden>Таблица</button>
-    <button type="button" id="btn-graph" hidden>Граф</button>
     <button id="theme-toggle" type="button">Темная тема</button>
   </div>
 </div>
@@ -1745,19 +1613,12 @@ def _build_html(
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
   </div>
-  <div id="graph-hint">Каждый столбец — колонка таблицы, под ним значения. Клик по значению открывает список записей справа.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
+  <div id="graph-hint">Лист в центре, столбцы вокруг него. Пунктир — тот же столбец или значение на другом листе. Строки видны только по клику на значение.</div>
   <div id="load-hint">Загрузка графа…</div>
   <div id="cluster-tip"></div>
-  <div id="table-board">
-    <aside id="table-filters"></aside>
-    <section id="table-main">
-      <div id="table-head"></div>
-      <div id="table-scroll"><div id="table-rows"></div></div>
-    </section>
-  </div>
 </div>
 <div id="legend">
   <h3>Легенда</h3>
@@ -1766,6 +1627,7 @@ def _build_html(
   <div class="leg-item"><div class="leg-dot leg-dot-value"></div> Значение</div>
   <div class="leg-item"><div class="leg-dot leg-dot-row"></div> Строка</div>
   <div class="leg-item"><div class="leg-dot leg-dot-entity"></div> Тег</div>
+  <div class="leg-item"><div class="leg-bridge"></div> То же на другом листе</div>
 </div>
 <div id="detail-panel">
   <span class="close-btn" onclick="closeDetail()">&times;</span>
