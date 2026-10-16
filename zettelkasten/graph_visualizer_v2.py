@@ -1225,6 +1225,27 @@ document.getElementById('searchInput').addEventListener('input', function() {
   searchTimer = setTimeout(function() { applySearch(v); }, 80);
 });
 
+const tableBtn = document.getElementById('btn-table');
+const graphBtn = document.getElementById('btn-graph');
+if (tableBtn) tableBtn.addEventListener('click', function() { setTableMode(true); });
+if (graphBtn) graphBtn.addEventListener('click', function() { setTableMode(false); requestDraw(); });
+const filterBox = document.getElementById('table-filters');
+if (filterBox) filterBox.addEventListener('click', function(ev) {
+  const btn = ev.target.closest('.xf-val');
+  if (!btn) return;
+  const id = Number(btn.getAttribute('data-v'));
+  if (tablePick.has(id)) tablePick.delete(id);
+  else tablePick.add(id);
+  renderFilters();
+});
+const tableScroll = document.getElementById('table-scroll');
+if (tableScroll) tableScroll.addEventListener('scroll', paintTableRows);
+const tableRowsBox = document.getElementById('table-rows');
+if (tableRowsBox) tableRowsBox.addEventListener('click', function(ev) {
+  const row = ev.target.closest('.xf-row');
+  if (!row) return;
+  showTableRecord(Number(row.getAttribute('data-r')));
+});
 const tagsBtn = document.getElementById('btn-tags');
 tagsBtn.addEventListener('click', function() {
   tagsOn = !tagsOn;
@@ -1266,6 +1287,219 @@ async function inflateB64(b64) {
   throw new Error('Нет DecompressionStream');
 }
 
+let tableCols = [];
+let tableRows = [];
+let tablePick = new Set();
+let tableMatch = [];
+let tableOn = false;
+const TABLE_ROW_H = 56;
+
+function parentIndex(i) {
+  const start = adjOff[i], end = adjOff[i + 1];
+  for (let p = start; p < end; p++) {
+    if (adjK[p] === 0 && adjFrom[p] === i) return adjTo[p];
+  }
+  return -1;
+}
+
+function buildExcelBoard() {
+  tableCols = [];
+  tableRows = [];
+  tablePick = new Set();
+  const valuesByCol = new Map();
+  const rowIds = [];
+  for (let i = 0; i < N; i++) {
+    const tt = String((META[i] || [])[3] || '');
+    if (tt === 'excel_row') rowIds.push(i);
+    if (tt !== 'excel_value') continue;
+    const col = parentIndex(i);
+    if (col < 0) continue;
+    let bucket = valuesByCol.get(col);
+    if (!bucket) { bucket = []; valuesByCol.set(col, bucket); }
+  }
+  const valueRows = new Map();
+  for (let i = 0; i < E; i++) {
+    if (EFLAT[i * 3 + 2] !== 2) continue;
+    const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
+    const row = G[a] === 2 ? a : (G[b] === 2 ? b : -1);
+    const val = row === a ? b : a;
+    if (row < 0) continue;
+    let list = valueRows.get(val);
+    if (!list) { list = []; valueRows.set(val, list); }
+    list.push(row);
+  }
+  const sheets = new Map();
+  valuesByCol.forEach(function(vals, col) {
+    const sheet = parentIndex(col);
+    const sheetName = sheet >= 0 ? (L[sheet] || 'Лист') : 'Таблица';
+    let group = sheets.get(sheetName);
+    if (!group) { group = []; sheets.set(sheetName, group); }
+    const items = [];
+    const start = adjOff[col], end = adjOff[col + 1];
+    for (let p = start; p < end; p++) {
+      const ni = adjTo[p];
+      if (String((META[ni] || [])[3] || '') !== 'excel_value') continue;
+      const rows = valueRows.get(ni) || [];
+      items.push({ i: ni, n: rows.length, rows: Uint32Array.from(rows) });
+    }
+    items.sort(function(a, b) { return b.n - a.n || String(L[a.i]).localeCompare(String(L[b.i]), 'ru'); });
+    group.push({ col: col, name: L[col] || 'Столбец', values: items });
+  });
+  sheets.forEach(function(cols, name) {
+    cols.sort(function(a, b) { return String(a.name).localeCompare(String(b.name), 'ru'); });
+    tableCols.push({ name: name, cols: cols });
+  });
+  tableRows = Uint32Array.from(rowIds);
+  const btnT = document.getElementById('btn-table');
+  const btnG = document.getElementById('btn-graph');
+  const has = tableCols.length > 0;
+  if (btnT) btnT.hidden = !has;
+  if (btnG) btnG.hidden = !has;
+  if (has) setTableMode(true);
+  else setTableMode(false);
+}
+
+function setTableMode(on) {
+  tableOn = !!on && tableCols.length > 0;
+  document.body.classList.toggle('table-mode', tableOn);
+  const btnT = document.getElementById('btn-table');
+  const btnG = document.getElementById('btn-graph');
+  if (btnT) btnT.classList.toggle('on', tableOn);
+  if (btnG) btnG.classList.toggle('on', !tableOn && tableCols.length > 0);
+  if (tableOn) renderFilters();
+}
+
+function renderFilters() {
+  const box = document.getElementById('table-filters');
+  if (!box) return;
+  let html = '';
+  tableCols.forEach(function(sheet) {
+    html += '<div class="xf-sheet">' + esc(sheet.name) + '</div>';
+    sheet.cols.forEach(function(col) {
+      html += '<div class="xf-col">' + esc(col.name) + '</div>';
+      col.values.forEach(function(val) {
+        const on = tablePick.has(val.i) ? ' on' : '';
+        html += '<button type="button" class="xf-val' + on + '" data-v="' + val.i + '">' +
+          esc(L[val.i] || '') + '<span>' + val.n + '</span></button>';
+      });
+    });
+  });
+  box.innerHTML = html;
+  refreshMatch();
+}
+
+function selectedByColumn() {
+  const groups = new Map();
+  tablePick.forEach(function(id) {
+    const col = parentIndex(id);
+    let g = groups.get(col);
+    if (!g) { g = []; groups.set(col, g); }
+    g.push(id);
+  });
+  return groups;
+}
+
+function rowsOfValue(id) {
+  for (let s = 0; s < tableCols.length; s++) {
+    const cols = tableCols[s].cols;
+    for (let c = 0; c < cols.length; c++) {
+      const vals = cols[c].values;
+      for (let v = 0; v < vals.length; v++) {
+        if (vals[v].i === id) return vals[v].rows;
+      }
+    }
+  }
+  return new Uint32Array(0);
+}
+
+function refreshMatch() {
+  const groups = selectedByColumn();
+  if (!groups.size) {
+    tableMatch = Array.from(tableRows);
+  } else {
+    let current = null;
+    groups.forEach(function(ids) {
+      const mark = new Uint8Array(N);
+      ids.forEach(function(id) {
+        const rows = rowsOfValue(id);
+        for (let i = 0; i < rows.length; i++) mark[rows[i]] = 1;
+      });
+      if (!current) current = mark;
+      else {
+        for (let i = 0; i < N; i++) if (current[i] && !mark[i]) current[i] = 0;
+      }
+    });
+    const found = [];
+    for (let i = 0; i < tableRows.length; i++) {
+      const id = tableRows[i];
+      if (current[id]) found.push(id);
+    }
+    tableMatch = found;
+  }
+  const head = document.getElementById('table-head');
+  if (head) {
+    const extra = tablePick.size ? ' · фильтров: ' + tablePick.size : '';
+    head.innerHTML = 'Записи: ' + tableMatch.length + extra +
+      (tablePick.size ? ' <button type="button" id="btn-clear-filters">Сбросить</button>' : '');
+    const clear = document.getElementById('btn-clear-filters');
+    if (clear) clear.addEventListener('click', function() {
+      tablePick.clear();
+      renderFilters();
+    });
+  }
+  const sc = document.getElementById('table-scroll');
+  if (sc) sc.scrollTop = 0;
+  paintTableRows();
+}
+
+function rowChips(i) {
+  const start = adjOff[i], end = adjOff[i + 1];
+  const parts = [];
+  const seen = new Uint8Array(N);
+  for (let p = start; p < end && parts.length < 6; p++) {
+    const ni = adjTo[p];
+    if (seen[ni] || adjK[p] !== 2) continue;
+    if (String((META[ni] || [])[3] || '') !== 'excel_value') continue;
+    seen[ni] = 1;
+    parts.push(L[ni] || '');
+  }
+  return parts.join(' · ');
+}
+
+function paintTableRows() {
+  const sc = document.getElementById('table-scroll');
+  const box = document.getElementById('table-rows');
+  if (!sc || !box) return;
+  const total = tableMatch.length;
+  box.style.height = (total * TABLE_ROW_H) + 'px';
+  const start = Math.max(0, Math.floor(sc.scrollTop / TABLE_ROW_H) - 6);
+  const end = Math.min(total, Math.ceil((sc.scrollTop + sc.clientHeight) / TABLE_ROW_H) + 8);
+  let html = '';
+  for (let i = start; i < end; i++) {
+    const id = tableMatch[i];
+    html += '<div class="xf-row" style="top:' + (i * TABLE_ROW_H) + 'px" data-r="' + id + '">' +
+      '<b>' + esc(L[id] || ('Строка ' + (i + 1))) + '</b><em>' + esc(rowChips(id)) + '</em></div>';
+  }
+  box.innerHTML = html;
+}
+
+function showTableRecord(idx) {
+  const m = META[idx] || [];
+  const panel = document.getElementById('detail-panel');
+  const content = document.getElementById('detail-content');
+  const lines = String(m[5] || '').split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+  let html = '<h2>' + esc(L[idx] || 'Запись') + '</h2>';
+  lines.forEach(function(line, n) {
+    if (n === 0) return;
+    const cut = line.indexOf(':');
+    if (cut < 1) return;
+    html += '<div class="field"><div class="field-label">' + esc(line.slice(0, cut)) +
+      '</div><div class="field-value">' + esc(line.slice(cut + 1).trim()) + '</div></div>';
+  });
+  content.innerHTML = html;
+  panel.style.display = 'block';
+}
+
 function applyPayload(data) {
   N = data.n || 0;
   X = Float32Array.from(data.x || []);
@@ -1289,6 +1523,7 @@ function applyPayload(data) {
   document.getElementById('stat-r').textContent = data.tr || 0;
   buildIndex();
   buildClusters();
+  buildExcelBoard();
   clusterHot = -1;
   hideClusterTip();
   resize();
@@ -1428,12 +1663,47 @@ def _build_html(
   }}
   #graph-controls {{ display: flex; gap: 6px; }}
   #graph-hint {{ font-size: 11px; color: #94a3b8; max-width: 260px; line-height: 1.35; }}
+  #table-board {{
+    display: none; position: absolute; inset: 0; z-index: 6;
+    grid-template-columns: minmax(260px, 360px) 1fr; background: #0b1220;
+  }}
+  body.table-mode #table-board {{ display: grid; }}
+  body.table-mode #graph, body.table-mode #legend, body.table-mode #search-box, body.table-mode #load-hint {{ display: none; }}
+  #btn-table, #btn-graph {{
+    border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+  }}
+  #btn-table.on, #btn-graph.on {{ border-color: #60a5fa; background: #1e3a5f; }}
+  #table-filters, #table-main {{ overflow: auto; }}
+  #table-filters {{ border-right: 1px solid #334155; padding: 12px 12px 24px; }}
+  #table-main {{ display: flex; flex-direction: column; min-width: 0; min-height: 0; }}
+  #table-head {{ padding: 12px 16px; border-bottom: 1px solid #334155; color: #e2e8f0; font-size: 13px; }}
+  #table-head button {{ margin-left: 10px; }}
+  #table-scroll {{ position: relative; flex: 1; overflow: auto; }}
+  #table-rows {{ position: relative; }}
+  .xf-sheet {{ font-size: 12px; color: #94a3b8; margin: 14px 0 6px; }}
+  .xf-col {{ font-size: 13px; font-weight: 600; color: #e2e8f0; margin: 8px 0 4px; }}
+  .xf-val {{
+    display: flex; justify-content: space-between; gap: 8px; width: 100%;
+    text-align: left; border: 1px solid transparent; background: transparent;
+    color: #e2e8f0; border-radius: 8px; padding: 6px 8px; cursor: pointer; font-size: 13px;
+  }}
+  .xf-val span {{ color: #94a3b8; }}
+  .xf-val.on {{ background: #1e3a5f; border-color: #60a5fa; }}
+  .xf-row {{
+    position: absolute; left: 12px; right: 12px; height: 52px; box-sizing: border-box;
+    border-bottom: 1px solid #1e293b; padding: 6px 4px; cursor: pointer;
+  }}
+  .xf-row b {{ display: block; font-size: 13px; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .xf-row em {{ display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .xf-row.on {{ background: rgba(59,130,246,0.15); }}
   body.light-theme {{ background: #f8fafc; color: #1f2937; }}
   body.light-theme #header {{ background: #ffffff; border-bottom: 1px solid #e5e7eb; }}
   body.light-theme #header h1 {{ color: #1f2937; }}
   body.light-theme #graph-back {{ color: #2563eb; }}
   body.light-theme #stats {{ color: #6b7280; }}
   body.light-theme #stats span {{ color: #374151; }}
+  body.light-theme #btn-table, body.light-theme #btn-graph,
   body.light-theme #theme-toggle, body.light-theme #graph-controls button {{
     border: 1px solid #d1d5db; background: #ffffff; color: #374151;
   }}
@@ -1448,6 +1718,13 @@ def _build_html(
   body.light-theme #search-box input {{ background: #ffffff; border: 1px solid #d1d5db; color: #374151; }}
   body.light-theme #cluster-tip {{ background: rgba(255,255,255,0.98); border: 1px solid #d1d5db; color: #374151; }}
   body.light-theme #cluster-tip .ct-title {{ color: #111827; }}
+  body.light-theme #table-board {{ background: #f8fafc; }}
+  body.light-theme #table-filters {{ border-right-color: #e5e7eb; }}
+  body.light-theme #table-head {{ border-bottom-color: #e5e7eb; color: #111827; }}
+  body.light-theme .xf-col, body.light-theme .xf-val, body.light-theme .xf-row b {{ color: #111827; }}
+  body.light-theme .xf-val.on {{ background: #eff6ff; border-color: #3b82f6; }}
+  body.light-theme .xf-row {{ border-bottom-color: #e5e7eb; }}
+  body.light-theme .xf-row em, body.light-theme .xf-val span, body.light-theme .xf-sheet {{ color: #6b7280; }}
 </style>
 </head>
 <body class="light-theme">
@@ -1458,6 +1735,8 @@ def _build_html(
   </div>
   <div id="header-right">
     <div id="stats">Карточки: <span id="stat-z">{total_z}</span> &nbsp;|&nbsp; Теги: <span id="stat-e">{total_e}</span> &nbsp;|&nbsp; Связи: <span id="stat-r">{total_r}</span></div>
+    <button type="button" id="btn-table" hidden>Таблица</button>
+    <button type="button" id="btn-graph" hidden>Граф</button>
     <button id="theme-toggle" type="button">Темная тема</button>
   </div>
 </div>
@@ -1472,6 +1751,13 @@ def _build_html(
   <canvas id="graph"></canvas>
   <div id="load-hint">Загрузка графа…</div>
   <div id="cluster-tip"></div>
+  <div id="table-board">
+    <aside id="table-filters"></aside>
+    <section id="table-main">
+      <div id="table-head"></div>
+      <div id="table-scroll"><div id="table-rows"></div></div>
+    </section>
+  </div>
 </div>
 <div id="legend">
   <h3>Легенда</h3>
