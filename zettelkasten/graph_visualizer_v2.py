@@ -69,6 +69,32 @@ def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
 
 
 _EXCEL_TYPES = frozenset({"excel_sheet", "excel_column", "excel_value", "excel_row"})
+_EXCEL_FAN_ARC = 1.05
+
+
+def _excel_value_fan(count: int) -> tuple[float, list[tuple[float, float]]]:
+    """Веер значений наружу от столбца. Смещения в локальных координатах, ось X — наружу."""
+    if count <= 0:
+        return 70.0, []
+    spacing = 54.0
+    arc = _EXCEL_FAN_ARC
+    offsets: list[tuple[float, float]] = []
+    outer = 72.0
+    placed = 0
+    ring = 0
+    while placed < count and ring < 16:
+        vr = 70.0 + ring * spacing
+        cap = max(1, int((vr * arc) / spacing))
+        take = min(cap, count - placed)
+        spread = arc if take > 1 else 0.0
+        for index in range(take):
+            t = 0.5 if take == 1 else index / (take - 1)
+            vang = (t - 0.5) * spread
+            offsets.append((vr * math.cos(vang), vr * math.sin(vang)))
+        outer = vr + 16.0
+        placed += take
+        ring += 1
+    return outer, offsets
 
 
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
@@ -161,23 +187,23 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     def excel_rings(sheet_lid: str) -> tuple[list[tuple[str, list[str]]], float, float]:
         cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
         blocks: list[tuple[str, list[str]]] = []
-        max_vr = 140.0
+        max_outer = 80.0
         for col in cols:
             vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
-            nv = len(vals)
-            vr = 118.0 + nv * 6.0 if nv <= 14 else max(210.0, nv * 9.0)
-            max_vr = max(max_vr, vr)
+            outer, _offsets = _excel_value_fan(len(vals))
+            max_outer = max(max_outer, outer)
             blocks.append((col, vals))
         n_cols = max(len(blocks), 1)
+        half = max_outer * math.sin(_EXCEL_FAN_ARC / 2) + 14.0
         if n_cols <= 1:
-            col_orbit = 180.0 + max_vr
+            col_orbit = 130.0 + max_outer * 0.35
         else:
-            col_orbit = (2.0 * max_vr + 130.0) / (2.0 * math.sin(math.pi / n_cols))
-            col_orbit = max(col_orbit, 150.0 + max_vr)
-        return blocks, col_orbit, max_vr
+            col_orbit = (2.0 * half) / (2.0 * math.sin(math.pi / n_cols))
+            col_orbit = max(col_orbit, 90.0 + max_outer * 0.42)
+        return blocks, col_orbit, max_outer
 
     def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> tuple[float, float]:
-        """Лист в центре, столбцы по кругу, значения — спутники своего столбца."""
+        """Лист в центре, столбцы по кругу, значения — плотный веер наружу."""
         col_blocks, col_orbit, val_r = excel_rings(sheet_lid)
         n_cols = max(len(col_blocks), 1)
         sheet_zid = luhmann_to_id.get(sheet_lid)
@@ -190,26 +216,25 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             col_zid = luhmann_to_id.get(col)
             if col_zid:
                 pos[col_zid] = (cx, cy)
-            nv = len(vals)
-            if nv <= 14:
-                arc = min(math.pi * 1.35, max(0.9, nv * 0.36))
-                vr = 118.0 + nv * 6.0
-            else:
-                arc = math.pi * 1.85
-                vr = max(210.0, nv * 9.0)
+            _outer, offsets = _excel_value_fan(len(vals))
+            cos_a, sin_a = math.cos(ang), math.sin(ang)
             for v_index, val in enumerate(vals):
-                t = 0.5 if nv <= 1 else v_index / (nv - 1)
-                vang = ang + (t - 0.5) * arc
+                if v_index >= len(offsets):
+                    break
+                dx, dy = offsets[v_index]
                 val_zid = luhmann_to_id.get(val)
                 if val_zid:
-                    pos[val_zid] = (cx + vr * math.cos(vang), cy + vr * math.sin(vang))
+                    pos[val_zid] = (
+                        cx + dx * cos_a - dy * sin_a,
+                        cy + dx * sin_a + dy * cos_a,
+                    )
         for row in children[sheet_lid]:
             if type_by_lid.get(row) != "excel_row":
                 continue
             row_zid = luhmann_to_id.get(row)
             if row_zid:
                 pos[row_zid] = (origin_x - 80, origin_y)
-        span = 2.0 * (col_orbit + val_r) + 160.0
+        span = 2.0 * (col_orbit + val_r) + 36.0
         return span, span
 
     depth_memo: dict[str, int] = {}
@@ -236,13 +261,13 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     row_h = 0.0
     for sheet in excel_roots:
         _blocks, _orbit, _vr = excel_rings(sheet)
-        span_w = 2.0 * (_orbit + _vr) + 160.0
+        span_w = 2.0 * (_orbit + _vr) + 36.0
         if x_cursor > 0 and x_cursor + span_w > row_limit:
             x_cursor = 0.0
-            y_cursor += row_h + 280
+            y_cursor += row_h + 56
             row_h = 0.0
         place_excel_sheet(sheet, x_cursor + span_w / 2, y_cursor + span_w / 2)
-        x_cursor += span_w + 220
+        x_cursor += span_w + 40
         row_h = max(row_h, span_w)
 
     for root in other_roots:
@@ -322,14 +347,14 @@ def _excel_node_style(
     if thought_type == "excel_row":
         return 2, 11, 7
     if thought_type == "excel_sheet":
-        return 0, 64, color_index.get(root, 0)
+        return 0, 96, color_index.get(root, 0)
     if thought_type in {"excel_column", "excel_value"}:
         source = luhmann_id if thought_type == "excel_column" else (parent_by_luhmann.get(luhmann_id) or luhmann_id)
         parts = [p for p in (source or "").split(".") if p.isdigit()]
         color = int(parts[-1]) % len(_BRANCH_PALETTE) if parts else 1
         if thought_type == "excel_column":
-            return 0, 34, color
-        return 0, 18, color
+            return 0, 52, color
+        return 0, 32, color
     return 0, _thought_size(depth), color_index[root]
 
 
@@ -871,25 +896,59 @@ function drawNode(i, alpha, ring) {
   ctx.stroke();
 }
 
+let labelBoxes = [];
+function labelRank(i) {
+  if (hot && hot[i] === 2) return -1;
+  const tt = String((META[i] || [])[3] || '');
+  if (tt === 'excel_sheet') return 0;
+  if (tt === 'excel_column') return 1;
+  if (tt === 'excel_row') return 2;
+  if (tt === 'excel_value') return 3;
+  return 4;
+}
+function reserveLabel(x, y, text, align, baseline) {
+  const w = ctx.measureText(text).width;
+  const h = 12;
+  let left = x;
+  let top = y;
+  if (align === 'center') left = x - w / 2;
+  else if (align === 'right') left = x - w;
+  if (baseline === 'middle') top = y - h / 2;
+  const box = { x: left - 2, y: top - 1, w: w + 4, h: h + 2 };
+  for (let i = 0; i < labelBoxes.length; i++) {
+    const b = labelBoxes[i];
+    if (box.x < b.x + b.w && box.x + box.w > b.x && box.y < b.y + b.h && box.y + box.h > b.y) return false;
+  }
+  labelBoxes.push(box);
+  return true;
+}
 function drawLabel(i, alpha, light) {
-  const r = Math.max(3, R[i] * zoom);
   const tt = String((META[i] || [])[3] || '');
   const excelNode = tt.indexOf('excel_') === 0;
+  const r = Math.max(3, R[i] * zoom);
   if (r < 7 && G[i] !== 2 && !excelNode) return false;
-  const excel = tt.indexOf('excel_') === 0 && tt !== 'excel_sheet';
-  ctx.globalAlpha = alpha;
-  ctx.font = Math.max(10, Math.min(14, 11 * zoom)) + 'px Arial';
-  ctx.fillStyle = light ? '#0f172a' : '#ffffff';
+  if (!L[i]) return false;
+  const excel = excelNode && tt !== 'excel_sheet';
+  ctx.font = Math.max(10, Math.min(13, 11 * zoom)) + 'px Arial';
+  let tx, ty, align, baseline;
   if (excel) {
     const dir = outwardOf(i);
-    ctx.textAlign = dir[0] >= 0 ? 'left' : 'right';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(L[i], sx(X[i]) + dir[0] * (r + 10), sy(Y[i]) + dir[1] * (r + 6));
+    align = dir[0] >= 0 ? 'left' : 'right';
+    baseline = 'middle';
+    tx = sx(X[i]) + dir[0] * (r + 8);
+    ty = sy(Y[i]) + dir[1] * (r + 4);
   } else {
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-    ctx.fillText(L[i], sx(X[i]), sy(Y[i]) + r + 4);
+    align = 'center';
+    baseline = 'top';
+    tx = sx(X[i]);
+    ty = sy(Y[i]) + r + 3;
   }
+  if (!reserveLabel(tx, ty, L[i], align, baseline)) return false;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = light ? '#0f172a' : '#ffffff';
+  ctx.textAlign = align;
+  ctx.textBaseline = baseline;
+  ctx.fillText(L[i], tx, ty);
   return true;
 }
 
@@ -983,12 +1042,18 @@ function draw() {
     }
   }
   if (showLabels) {
-    let drawnL = 0;
-    for (let v = 0; v < vis.length && drawnL < 260; v++) {
+    labelBoxes = [];
+    const ids = [];
+    for (let v = 0; v < vis.length; v++) {
       const i = vis[v];
       if (!nodeVisible(i)) continue;
       if (hot && !isHot(i)) continue;
-      if (drawLabel(i, hot ? 1 : dim, light)) drawnL++;
+      ids.push(i);
+    }
+    ids.sort(function(a, b) { return labelRank(a) - labelRank(b) || R[b] - R[a]; });
+    let drawnL = 0;
+    for (let k = 0; k < ids.length && drawnL < 320; k++) {
+      if (drawLabel(ids[k], hot ? 1 : dim, light)) drawnL++;
     }
   }
   ctx.globalAlpha = 1;
