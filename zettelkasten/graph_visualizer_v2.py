@@ -194,11 +194,10 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             if not row_zid:
                 continue
             value_ids = related_values.get(row_zid) or []
-            pts = [pos[vid] for vid in value_ids if vid in pos]
-            if pts:
-                ax = sum(pt[0] for pt in pts) / len(pts)
-                ay = sum(pt[1] for pt in pts) / len(pts)
-                key = value_ids[0]
+            anchor = next((vid for vid in value_ids if vid in pos), None)
+            if anchor:
+                ax, ay = pos[anchor]
+                key = anchor
             else:
                 ax = origin_x
                 ay = origin_y + col_radius + max_val_r + 90
@@ -306,16 +305,20 @@ def _excel_node_style(
     color_index: dict,
     root: str,
     depth: int,
+    value_degree: int = 0,
 ) -> tuple[int, int, int]:
     if thought_type == "excel_row":
-        return 2, 12, 7
+        return 2, 11, 7
     if thought_type == "excel_sheet":
-        return 0, 70, color_index.get(root, 0)
+        return 0, 76, color_index.get(root, 0)
     if thought_type in {"excel_column", "excel_value"}:
         source = luhmann_id if thought_type == "excel_column" else (parent_by_luhmann.get(luhmann_id) or luhmann_id)
         parts = [p for p in (source or "").split(".") if p.isdigit()]
         color = int(parts[-1]) % len(_BRANCH_PALETTE) if parts else 1
-        return 0, 44 if thought_type == "excel_column" else 26, color
+        if thought_type == "excel_column":
+            return 0, 48, color
+        radius = 16 + min(30, int(7 * math.log1p(max(value_degree, 0))))
+        return 0, radius, color
     return 0, _thought_size(depth), color_index[root]
 
 
@@ -356,6 +359,14 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
     branch_colors = _assign_branch_colors(graph_data["zettels"], parent_by_luhmann)
     color_index = {root: i % len(_BRANCH_PALETTE) for i, root in enumerate(branch_colors)}
     positions = _compute_node_positions(graph_data)
+    type_by_zid = {z["zettel_id"]: z.get("thought_type") or "" for z in graph_data["zettels"]}
+    value_degree: dict[str, int] = defaultdict(int)
+    for edge in graph_data.get("edges") or []:
+        if edge.get("rel_type") != "RELATED_TO":
+            continue
+        for zid in (edge.get("from_id"), edge.get("to_id")):
+            if type_by_zid.get(zid) == "excel_value":
+                value_degree[zid] += 1
 
     nodes = []
     meta = []
@@ -373,7 +384,9 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         xy = positions.get(nid, (0.0, 0.0))
         root = _find_root_luhmann(z["luhmann_id"], parent_by_luhmann)
         id_index[nid] = len(nodes)
-        group, radius, color = _excel_node_style(tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth)
+        group, radius, color = _excel_node_style(
+            tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth, value_degree.get(nid, 0),
+        )
         nodes.append({
             "x": round(xy[0], 1),
             "y": round(xy[1], 1),
@@ -433,6 +446,11 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         a = id_index.get(edge["from_id"])
         b = id_index.get(edge["to_id"])
         if a is None or b is None:
+            continue
+        if edge["rel_type"] == "CHILD_OF" and (
+            type_by_zid.get(edge["from_id"]) == "excel_row"
+            or type_by_zid.get(edge["to_id"]) == "excel_row"
+        ):
             continue
         edge_set.add(key)
         edges.append([a, b, kind.get(edge["rel_type"], 0)])
@@ -540,7 +558,7 @@ function wx(x) { return (x - W / 2) / zoom + camX; }
 function wy(y) { return (y - H / 2) / zoom + camY; }
 function nodeVisible(i) {
   if (G[i] === 1 && !(tagsOn && zoom >= 0.32)) return 0;
-  if (G[i] === 2 && !rowsOn) return 0;
+  if (G[i] === 2 && !rowsOn && !(hot && hot[i])) return 0;
   if (visMask && visMask[i] === 0) return 0;
   return 1;
 }
@@ -786,13 +804,16 @@ function draw() {
       const k = EFLAT[i * 3 + 2];
       if (k === 1 && !showTags) continue;
       const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
+      const rowEdge = G[a] === 2 || G[b] === 2;
+      const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
+      if (k === 2 && !focusEdge) continue;
+      if (rowEdge && !focusEdge) continue;
       if (!nodeVisible(a) || !nodeVisible(b)) continue;
       const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
       if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
-      const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
       ctx.globalAlpha = focusEdge ? 1 : dim;
-      ctx.strokeStyle = focusEdge ? '#60a5fa' : (k === 2 ? '#D1D5DB' : (light ? '#9ca3af' : '#9CA3AF'));
-      ctx.setLineDash(k ? [5, 4] : []);
+      ctx.strokeStyle = focusEdge ? '#60a5fa' : (light ? '#9ca3af' : '#9CA3AF');
+      ctx.setLineDash(k === 1 ? [5, 4] : []);
       ctx.beginPath();
       ctx.moveTo(sx(ax), sy(ay));
       ctx.lineTo(sx(bx), sy(by));
@@ -1431,7 +1452,7 @@ def _build_html(
     <button type="button" id="btn-tags">Теги</button>
     <button type="button" id="btn-rows">Строки таблицы</button>
   </div>
-  <div id="graph-hint">Таблица: в центре лист, вокруг столбцы и их значения. Строки по умолчанию скрыты — включаются кнопкой.</div>
+  <div id="graph-hint">Клик по значению показывает связанные строки. Все строки сразу лучше не включать — связи станут непрозрачными.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
