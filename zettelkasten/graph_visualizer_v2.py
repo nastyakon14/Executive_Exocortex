@@ -158,56 +158,47 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             cursor += child_w
         stack.remove(lid)
 
-    def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> float:
-        sheet_zid = luhmann_to_id.get(sheet_lid)
-        if sheet_zid:
-            pos[sheet_zid] = (origin_x, origin_y)
+    def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> tuple[float, float]:
         cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
         n_cols = max(len(cols), 1)
-        col_radius = 260 + max(0, n_cols - 6) * 24
-        max_val_r = 70
-        for index, col in enumerate(cols):
-            angle = -math.pi / 2 + (2 * math.pi * index) / n_cols
-            cx = origin_x + col_radius * math.cos(angle)
-            cy = origin_y + col_radius * math.sin(angle)
+        cols_per_row = min(4, n_cols)
+        col_w, val_h = 300.0, 34.0
+        col_blocks: list[tuple[str, list[str]]] = []
+        for col in cols:
+            vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
+            col_blocks.append((col, vals))
+        row_heights: dict[int, float] = defaultdict(float)
+        for index, (_col, vals) in enumerate(col_blocks):
+            gy = index // cols_per_row
+            row_heights[gy] = max(row_heights[gy], 56 + max(len(vals), 1) * val_h)
+        row_y = [0.0]
+        for gy in range(max(row_heights, default=-1) + 1):
+            row_y.append(row_y[-1] + row_heights.get(gy, 160) + 48)
+        sheet_zid = luhmann_to_id.get(sheet_lid)
+        grid_w = cols_per_row * col_w
+        if sheet_zid:
+            pos[sheet_zid] = (origin_x + grid_w / 2 - col_w / 2, origin_y)
+        for index, (col, vals) in enumerate(col_blocks):
+            gx = index % cols_per_row
+            gy = index // cols_per_row
+            cx = origin_x + gx * col_w
+            cy = origin_y + 110 + row_y[gy]
             col_zid = luhmann_to_id.get(col)
             if col_zid:
                 pos[col_zid] = (cx, cy)
-            vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
-            n_vals = max(len(vals), 1)
-            val_r = 58 + min(n_vals, 18) * 8
-            max_val_r = max(max_val_r, val_r)
             for v_index, val in enumerate(vals):
-                val_angle = (2 * math.pi * v_index) / n_vals
                 val_zid = luhmann_to_id.get(val)
                 if val_zid:
-                    pos[val_zid] = (
-                        cx + val_r * math.cos(val_angle),
-                        cy + val_r * math.sin(val_angle),
-                    )
-        golden = math.pi * (3 - math.sqrt(5))
-        buckets: dict[str, int] = defaultdict(int)
+                    pos[val_zid] = (cx, cy + 48 + v_index * val_h)
+        park = (origin_x - 80, origin_y)
         for row in children[sheet_lid]:
             if type_by_lid.get(row) != "excel_row":
                 continue
             row_zid = luhmann_to_id.get(row)
-            if not row_zid:
-                continue
-            value_ids = related_values.get(row_zid) or []
-            anchor = next((vid for vid in value_ids if vid in pos), None)
-            if anchor:
-                ax, ay = pos[anchor]
-                key = anchor
-            else:
-                ax = origin_x
-                ay = origin_y + col_radius + max_val_r + 90
-                key = "_none"
-            k = buckets[key]
-            buckets[key] += 1
-            rad = 16 + 6.2 * math.sqrt(k)
-            spin = k * golden
-            pos[row_zid] = (ax + rad * math.cos(spin), ay + rad * math.sin(spin))
-        return 2 * (col_radius + max_val_r + 120)
+            if row_zid:
+                pos[row_zid] = park
+        span_h = 110 + row_y[-1] + 40
+        return grid_w + 40, span_h
 
     depth_memo: dict[str, int] = {}
 
@@ -233,15 +224,14 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     row_h = 0.0
     for sheet in excel_roots:
         n_cols = max(len([c for c in children[sheet] if type_by_lid.get(c) == "excel_column"]), 1)
-        col_radius = 260 + max(0, n_cols - 6) * 24
-        span = 2 * (col_radius + 220)
-        if x_cursor > 0 and x_cursor + span > row_limit:
+        span_w = min(4, n_cols) * 300 + 40
+        if x_cursor > 0 and x_cursor + span_w > row_limit:
             x_cursor = 0.0
             y_cursor += row_h + 280
             row_h = 0.0
-        place_excel_sheet(sheet, x_cursor + span / 2, y_cursor + span / 2)
-        x_cursor += span + 160
-        row_h = max(row_h, span)
+        _w, span_h = place_excel_sheet(sheet, x_cursor, y_cursor)
+        x_cursor += _w + 160
+        row_h = max(row_h, span_h)
 
     for root in other_roots:
         width = leaf_count(root, set()) * x_unit
@@ -296,6 +286,16 @@ def _node_label(text: str) -> str:
     if len(words) <= take:
         return " ".join(words)
     return " ".join(words[:take]) + "…"
+
+
+def _excel_label(thought_type: str, topic: str, content: str) -> str:
+    text = " ".join((topic or content or "").split())
+    if not text:
+        return ""
+    limit = 48 if thought_type == "excel_column" else 36
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _excel_node_style(
@@ -387,13 +387,14 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         group, radius, color = _excel_node_style(
             tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth, value_degree.get(nid, 0),
         )
+        label = _excel_label(tt, topic, content) if tt in _EXCEL_TYPES else _node_label(display)
         nodes.append({
             "x": round(xy[0], 1),
             "y": round(xy[1], 1),
             "r": radius,
             "g": group,
             "c": color,
-            "l": _node_label(display),
+            "l": label,
         })
         preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
         meta.append([
@@ -558,7 +559,7 @@ function wx(x) { return (x - W / 2) / zoom + camX; }
 function wy(y) { return (y - H / 2) / zoom + camY; }
 function nodeVisible(i) {
   if (G[i] === 1 && !(tagsOn && zoom >= 0.32)) return 0;
-  if (G[i] === 2 && !rowsOn && !(hot && hot[i])) return 0;
+  if (G[i] === 2) return selected === i ? 1 : 0;
   if (visMask && visMask[i] === 0) return 0;
   return 1;
 }
@@ -627,6 +628,8 @@ function buildClusters() {
   const grouped = new Map();
   for (let i = 0; i < N; i++) {
     if (G[i] === 1 || G[i] === 2) continue;
+    const tt = String((META[i] || [])[3] || '');
+    if (tt.indexOf('excel_') === 0) continue;
     const key = C[i] | 0;
     let g = grouped.get(key);
     if (!g) {
@@ -806,8 +809,8 @@ function draw() {
       const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
       const rowEdge = G[a] === 2 || G[b] === 2;
       const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
-      if (k === 2 && !focusEdge) continue;
-      if (rowEdge && !focusEdge) continue;
+      if (k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
+      if (rowEdge && selected !== a && selected !== b) continue;
       if (!nodeVisible(a) || !nodeVisible(b)) continue;
       const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
       if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
@@ -971,13 +974,17 @@ function showDetail(idx) {
   const nbrCount = end - start;
   if (nbrCount) {
     const entityNeighbors = [];
+    const rowNeighbors = [];
     const thoughtNeighbors = [];
-    const limit = Math.min(nbrCount, 40);
-    for (let i = 0; i < limit; i++) {
-      const p = start + i;
-      const ni = adjTo[p];
-      const k = adjK[p];
-      const from = adjFrom[p];
+    const seen = new Uint8Array(N);
+    for (let i = 0; i < nbrCount; i++) {
+      const ni = adjTo[start + i];
+      if (seen[ni]) continue;
+      seen[ni] = 1;
+      const k = adjK[start + i];
+      const from = adjFrom[start + i];
+      const pm = META[ni] || [];
+      const tt = String(pm[3] || '');
       let arrow = '';
       if (G[ni] !== 1) {
         if (k === 0) {
@@ -987,15 +994,23 @@ function showDetail(idx) {
           arrow = from === idx ? '→ ' : '← ';
         }
       }
-      const pm = META[ni] || [];
       const item = '<div class="neighbor-item" onclick="focusNode(' + ni + ')">' +
         arrow + '<b>' + esc(pm[6] || L[ni]) + '</b></div>';
       if (G[ni] === 1) entityNeighbors.push(item);
+      else if (G[ni] === 2 || tt === 'excel_row') rowNeighbors.push(item);
       else thoughtNeighbors.push(item);
     }
-    html += '<hr/><div class="neighbors"><div class="field-label">Связи (' + nbrCount + ')</div>' +
-      entityNeighbors.join('') + thoughtNeighbors.join('');
-    if (nbrCount > limit) html += '<div class="field-label">ещё ' + (nbrCount - limit) + '</div>';
+    const rowLimit = 80;
+    const shownRows = rowNeighbors.slice(0, rowLimit);
+    html += '<hr/><div class="neighbors">';
+    if (rowNeighbors.length) {
+      html += '<div class="field-label">Записи таблицы (' + rowNeighbors.length + ')</div>' + shownRows.join('');
+      if (rowNeighbors.length > rowLimit) html += '<div class="field-label">ещё ' + (rowNeighbors.length - rowLimit) + '</div>';
+    }
+    if (thoughtNeighbors.length || entityNeighbors.length) {
+      html += '<div class="field-label">Связи (' + (thoughtNeighbors.length + entityNeighbors.length) + ')</div>' +
+        entityNeighbors.join('') + thoughtNeighbors.join('');
+    }
     html += '</div>';
   }
   content.innerHTML = html;
@@ -1024,7 +1039,7 @@ function fit() {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < N; i++) {
     if (!tagsOn && G[i] === 1) continue;
-    if (!rowsOn && G[i] === 2) continue;
+    if (G[i] === 2) continue;
     if (X[i] < minX) minX = X[i];
     if (Y[i] < minY) minY = Y[i];
     if (X[i] > maxX) maxX = X[i];
@@ -1450,9 +1465,8 @@ def _build_html(
   <input type="text" id="searchInput" placeholder="🔍 Найти карточку или тег..."/>
   <div id="graph-controls">
     <button type="button" id="btn-tags">Теги</button>
-    <button type="button" id="btn-rows">Строки таблицы</button>
   </div>
-  <div id="graph-hint">Клик по значению показывает связанные строки. Все строки сразу лучше не включать — связи станут непрозрачными.</div>
+  <div id="graph-hint">Каждый столбец — колонка таблицы, под ним значения. Клик по значению открывает список записей справа.</div>
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
