@@ -298,6 +298,7 @@ async def btn_search_context(callback: types.CallbackQuery, state: FSMContext):
     except TelegramBadRequest:
         pass
     await state.set_state(BotStates.waiting_for_search)
+    await state.update_data(search_history=[])
     await callback.message.answer(
         'Введите ваш запрос для поиска по базе знаний:\n\n<i>Можете делать несколько запросов подряд.</i>',
         reply_markup=cancel_kb,
@@ -308,7 +309,11 @@ async def btn_search_context(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_search, F.text)
 async def process_search_query(message: Message, state: FSMContext):
     user_id = build_user_id(message.from_user.id)
-    response = graphrag.query(user_id, message.text)
+    data = await state.get_data()
+    history = [str(item) for item in (data.get("search_history") or [])][-2:]
+    response = graphrag.query(user_id, message.text, history=history)
+    remembered = (history + [message.text.strip()])[-3:]
+    await state.update_data(search_history=remembered)
     bot_answer = _format_search_answer(response.answer)
     
     # состояние поиска сохраняем — можно делать несколько запросов подряд
@@ -689,9 +694,11 @@ async def process_clarify_search(callback: types.CallbackQuery, state: FSMContex
     
     # переводим в режим поиска и выполняем graphrag по отложенному тексту
     await state.set_state(BotStates.waiting_for_search)
+    await state.update_data(search_history=[])
     
     user_id = build_user_id(callback.from_user.id)
     response = graphrag.query(user_id, saved_text)
+    await state.update_data(search_history=[saved_text.strip()][-3:])
     bot_answer = _format_search_answer(response.answer)
     await _answer_html(callback.message, bot_answer, reply_markup=cancel_kb)
     

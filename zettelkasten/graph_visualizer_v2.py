@@ -69,32 +69,78 @@ def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
 
 
 _EXCEL_TYPES = frozenset({"excel_sheet", "excel_column", "excel_value", "excel_row"})
-_EXCEL_FAN_ARC = 1.05
 
 
-def _excel_value_fan(count: int) -> tuple[float, list[tuple[float, float]]]:
-    """Веер значений наружу от столбца. Смещения в локальных координатах, ось X — наружу."""
+def _excel_value_circle(count: int) -> tuple[float, list[tuple[float, float]]]:
+    """Значения по окружности вокруг столбца. Если их много — несколько колец."""
     if count <= 0:
-        return 70.0, []
-    spacing = 54.0
-    arc = _EXCEL_FAN_ARC
+        return 40.0, []
+    spacing = 50.0
+    if count == 1:
+        return 62.0, [(48.0, 0.0)]
+    one_r = max(48.0, spacing * count / (2 * math.pi))
+    if one_r <= 155.0:
+        offsets = [
+            (one_r * math.cos(ang), one_r * math.sin(ang))
+            for ang in (
+                -math.pi / 2 + 2 * math.pi * index / count
+                for index in range(count)
+            )
+        ]
+        return one_r + 14.0, offsets
     offsets: list[tuple[float, float]] = []
-    outer = 72.0
     placed = 0
     ring = 0
-    while placed < count and ring < 16:
-        vr = 70.0 + ring * spacing
-        cap = max(1, int((vr * arc) / spacing))
+    outer = 48.0
+    while placed < count and ring < 18:
+        vr = 56.0 + ring * spacing
+        cap = max(6, int(2 * math.pi * vr / spacing))
         take = min(cap, count - placed)
-        spread = arc if take > 1 else 0.0
+        phase = (math.pi / take) if ring % 2 else 0.0
         for index in range(take):
-            t = 0.5 if take == 1 else index / (take - 1)
-            vang = (t - 0.5) * spread
-            offsets.append((vr * math.cos(vang), vr * math.sin(vang)))
-        outer = vr + 16.0
+            ang = phase - math.pi / 2 + 2 * math.pi * index / take
+            offsets.append((vr * math.cos(ang), vr * math.sin(ang)))
+        outer = vr + 14.0
         placed += take
         ring += 1
     return outer, offsets
+
+
+def _column_orbits(outers: list[float]) -> list[float]:
+    """Маленькие круги ближе к листу, большие чуть дальше. Соседи не пересекаются."""
+    n = len(outers)
+    if n == 0:
+        return []
+    if n == 1:
+        return [max(120.0, outers[0] + 72.0)]
+    radii = [outer + 72.0 for outer in outers]
+    theta = 2 * math.pi / n
+    for _ in range(n * 6):
+        moved = False
+        for index in range(n):
+            for nxt in range(index + 1, n):
+                steps = min(abs(index - nxt), n - abs(index - nxt))
+                ang = steps * theta
+                dist = math.sqrt(
+                    radii[index] ** 2
+                    + radii[nxt] ** 2
+                    - 2 * radii[index] * radii[nxt] * math.cos(ang)
+                )
+                need = outers[index] + outers[nxt] + 18.0
+                if dist + 0.5 >= need:
+                    continue
+                deficit = need - dist
+                weight_i = outers[index] + 24.0
+                weight_j = outers[nxt] + 24.0
+                radii[index] += deficit * weight_i / (weight_i + weight_j) * 0.9
+                radii[nxt] += deficit * weight_j / (weight_i + weight_j) * 0.9
+                moved = True
+        if not moved:
+            break
+    if outers and max(outers) <= min(outers) * 1.35:
+        peak = max(radii)
+        return [peak for _ in radii]
+    return radii
 
 
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
@@ -184,57 +230,53 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             cursor += child_w
         stack.remove(lid)
 
-    def excel_rings(sheet_lid: str) -> tuple[list[tuple[str, list[str]]], float, float]:
+    def excel_layout(sheet_lid: str) -> tuple[list[tuple[str, list[str], float, list[tuple[float, float]]]], float]:
         cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
-        blocks: list[tuple[str, list[str]]] = []
-        max_outer = 80.0
+        prepared: list[tuple[str, list[str], float, list[tuple[float, float]]]] = []
+        outers: list[float] = []
         for col in cols:
             vals = [v for v in children[col] if type_by_lid.get(v) == "excel_value"]
-            outer, _offsets = _excel_value_fan(len(vals))
-            max_outer = max(max_outer, outer)
-            blocks.append((col, vals))
-        n_cols = max(len(blocks), 1)
-        half = max_outer * math.sin(_EXCEL_FAN_ARC / 2) + 14.0
-        if n_cols <= 1:
-            col_orbit = 130.0 + max_outer * 0.35
-        else:
-            col_orbit = (2.0 * half) / (2.0 * math.sin(math.pi / n_cols))
-            col_orbit = max(col_orbit, 90.0 + max_outer * 0.42)
-        return blocks, col_orbit, max_outer
+            outer, offsets = _excel_value_circle(len(vals))
+            prepared.append((col, vals, outer, offsets))
+            outers.append(outer)
+        orbits = _column_orbits(outers)
+        clusters = [
+            (col, vals, orbits[index], offsets)
+            for index, (col, vals, _outer, offsets) in enumerate(prepared)
+        ]
+        bound = 80.0
+        for index, outer in enumerate(outers):
+            bound = max(bound, orbits[index] + outer)
+        return clusters, bound
 
     def place_excel_sheet(sheet_lid: str, origin_x: float, origin_y: float) -> tuple[float, float]:
-        """Лист в центре, столбцы по кругу, значения — плотный веер наружу."""
-        col_blocks, col_orbit, val_r = excel_rings(sheet_lid)
-        n_cols = max(len(col_blocks), 1)
+        """Лист в центре. Столбцы по кругу, значения — кольцом вокруг своего столбца."""
+        clusters, bound = excel_layout(sheet_lid)
+        n_cols = max(len(clusters), 1)
         sheet_zid = luhmann_to_id.get(sheet_lid)
         if sheet_zid:
             pos[sheet_zid] = (origin_x, origin_y)
-        for index, (col, vals) in enumerate(col_blocks):
+        for index, (col, vals, radius, offsets) in enumerate(clusters):
             ang = -math.pi / 2 + (2 * math.pi * index / n_cols)
-            cx = origin_x + col_orbit * math.cos(ang)
-            cy = origin_y + col_orbit * math.sin(ang)
+            cx = origin_x + radius * math.cos(ang)
+            cy = origin_y + radius * math.sin(ang)
             col_zid = luhmann_to_id.get(col)
             if col_zid:
                 pos[col_zid] = (cx, cy)
-            _outer, offsets = _excel_value_fan(len(vals))
-            cos_a, sin_a = math.cos(ang), math.sin(ang)
             for v_index, val in enumerate(vals):
                 if v_index >= len(offsets):
                     break
                 dx, dy = offsets[v_index]
                 val_zid = luhmann_to_id.get(val)
                 if val_zid:
-                    pos[val_zid] = (
-                        cx + dx * cos_a - dy * sin_a,
-                        cy + dx * sin_a + dy * cos_a,
-                    )
+                    pos[val_zid] = (cx + dx, cy + dy)
         for row in children[sheet_lid]:
             if type_by_lid.get(row) != "excel_row":
                 continue
             row_zid = luhmann_to_id.get(row)
             if row_zid:
                 pos[row_zid] = (origin_x - 80, origin_y)
-        span = 2.0 * (col_orbit + val_r) + 36.0
+        span = 2.0 * bound + 36.0
         return span, span
 
     depth_memo: dict[str, int] = {}
@@ -260,8 +302,8 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     y_cursor = 0.0
     row_h = 0.0
     for sheet in excel_roots:
-        _blocks, _orbit, _vr = excel_rings(sheet)
-        span_w = 2.0 * (_orbit + _vr) + 36.0
+        _clusters, bound = excel_layout(sheet)
+        span_w = 2.0 * bound + 36.0
         if x_cursor > 0 and x_cursor + span_w > row_limit:
             x_cursor = 0.0
             y_cursor += row_h + 56

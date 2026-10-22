@@ -27,19 +27,48 @@ ATOMIZER_PRIOR_THOUGHTS = 16
 ATOMIZER_PRIOR_CHARS = 4000
 
 
+_TAG_WORD = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+_TAG_VOWELS = set("аеёиоуыэюяaeiouy")
+_OBLIQUE_TAG = (
+    "ого", "его", "ому", "ему", "ами", "ями", "ыми", "ими",
+    "ою", "ею", "ах", "ях", "ом", "ем", "ём", "ым", "им",
+    "ой", "ей", "ую", "юю", "ам", "ям",
+)
+_SURNAME_TAG = ("ова", "ева", "ина", "ына", "ов", "ев", "ёв", "ин", "ын", "ской", "скому")
+
+
+def _tag_is_noise(tag: str) -> bool:
+    """Отсекает обрывки, фамилии в падеже и слишком дробные ярлыки."""
+    words = [word.casefold() for word in _TAG_WORD.findall(tag)]
+    if not words or len(words) > 3:
+        return True
+    if any(len(word) < 3 for word in words):
+        return True
+    letters = "".join(ch for word in words for ch in word if ch.isalpha())
+    if len(letters) < 4 or not any(ch in _TAG_VOWELS for ch in letters):
+        return True
+    if len(words) == 1 and re.fullmatch(r"[а-яё]+", words[0]):
+        word = words[0]
+        if len(word) >= 6 and word.endswith(_OBLIQUE_TAG + ("у", "ю")):
+            return True
+        if len(word) >= 5 and word.endswith(_SURNAME_TAG):
+            return True
+    return False
+
+
 def normalize_tags(tags: list[str] | None) -> list[str]:
-    """Нижний регистр, подчёркивания заменяются пробелом: финансовая_оценка → финансовая оценка."""
+    """Нижний регистр и тематические теги: без фамилий, обрывков и одиночных букв."""
     normalized: list[str] = []
     seen: set[str] = set()
     for raw in tags or []:
         tag = " ".join(str(raw or "").replace("_", " ").lower().split())
         tag = tag.strip(".,;:!?\"'«»()[]{}#")
         tag = " ".join(tag.split())
-        if not tag or tag in seen:
+        if not tag or tag in seen or _tag_is_noise(tag):
             continue
         seen.add(tag)
         normalized.append(tag)
-        if len(normalized) >= 5:
+        if len(normalized) >= 3:
             break
     return normalized
 
@@ -100,11 +129,9 @@ class AtomicThought(BaseModel):
     )
     tags: list[str] = Field(
         description=(
-            "Ключевые теги — сущности: имена людей, проекты, организации, технологии. "
-            "Нижний регистр, слова через пробел, без символа _. На языке оригинала. От 1 до 5 тегов."
-            "Теги должны быть связаны с содержанием мысли и помогать найти её в базе знаний."
-            "Теги должны быть на языке оригинала."
-            "Теги должны быть уникальными."
+            "1–3 тематических тега для фильтрации: проект, процесс, система или документ. "
+            "Именительный падеж, нижний регистр, слова через пробел, без _. "
+            "Не фамилии, не имена, не косвенный падеж, не обрывки и не отдельные буквы."
         )
     )
     parent_hint: Optional[str] = Field(
@@ -168,7 +195,7 @@ class ZettelCard(BaseModel):
     topic: str = Field(description="Краткая тема мысли (1-3 слова)")  # тема мысли для отображения на графе
     content: str = Field(description="Контент карточки")    # одно краткое самодостаточное атомарное утверждение (1-2 предложения)
     thought_type: ThoughtType = Field(description="Тип мысли")   # тип мысли: факт, решение, задача, риск, идея, контекст, вопрос, ответ, объяснение, комментарий, заметка, память, напоминание, побуждение к действию, другое
-    tags: list[str] = Field(description="Теги карточки")         # ключевые теги — сущности: имена людей, проекты, организации, технологии. нижний регистр, слова через пробел, без _. От 1 до 5 тегов.
+    tags: list[str] = Field(description="Теги карточки")         # 1–3 тематических тега: проект, процесс, система. без фамилий и обрывков.
     parent_hint: Optional[str] = Field(default=None, description="Точная цитата другой мысли из этого же списка, которую данная мысль уточняет или объясняет") # точная цитата другой мысли из этого же списка, которую данная мысль уточняет или объясняет None если мысль самостоятельна
     is_root_topic: bool = Field(description="True если эта мысль открывает новую независимую тему") # True если эта мысль открывает новую независимую тему False если она развивает,раскрывает или уточняет другую мысль из этого текста преложенную раньше.
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Дата время создания карточки") # дата время создания карточки

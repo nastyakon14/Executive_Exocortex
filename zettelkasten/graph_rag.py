@@ -45,6 +45,53 @@ def make_chat_openai(model_name, temperature, streaming=False):
     )
 
 
+# В промпте три последних вопроса пользователя: текущий и два предыдущих.
+DIALOGUE_TURNS = 3
+_LUHMANN_MARK = re.compile(
+    r"[ \t]*\[(?:\d{1,3}|\d+[a-z][0-9a-z.]*|\d+(?:\.[0-9a-z]+)+)\]",
+    re.IGNORECASE,
+)
+_FOLLOWUP = re.compile(
+    r"^(?:а|и|уточни|подробнее)\b|\b(?:уточни|подробнее)\b|"
+    r"\b(?:это|этот|эта|эти|этого|этом|этой|он|она|они|его|её|ее|им|них|там|того)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_luhmann_marks(text: str) -> str:
+    """Убирает коды карточек вроде [1.2] и [1h34ab54g]. Плейсхолдеры [ИМЯ_1] оставляет."""
+    cleaned = _LUHMANN_MARK.sub("", text or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" +([.,;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def recent_user_queries(history: list[str] | None, current: str, limit: int = DIALOGUE_TURNS) -> list[str]:
+    """Предыдущие вопросы диалога, без текущего. Вместе с ним в контексте не больше limit."""
+    current_text = " ".join((current or "").split())
+    found: list[str] = []
+    for item in history or []:
+        text = " ".join(str(item or "").split())
+        if not text or text == current_text:
+            continue
+        if not found or found[-1] != text:
+            found.append(text[:500])
+    keep = max(0, limit - 1)
+    return found[-keep:]
+
+
+def dialogue_search_query(query: str, history: list[str] | None) -> str:
+    """Уточнение ищет вместе с предыдущим вопросом. Самостоятельный вопрос не разбавляется."""
+    current = " ".join((query or "").split())
+    previous = recent_user_queries(history, current)
+    if not previous:
+        return current
+    if len(current) <= 40 or _FOLLOWUP.search(current):
+        return f"{previous[-1]} {current}".strip()
+    return current
+
+
 # структуры данных контекста и ответа
 
 @dataclass
@@ -79,8 +126,8 @@ class RetrievedContext:
             lines.append(f"\n## {thought_type.upper()}")
             for node in nodes:
                 project = self.project_labels.get(node.user_id or "", "")
-                source = f" | проект: {project}" if project else ""
-                lines.append(f"• [{node.luhmann_id}]{source} {node.content}")
+                source = f"проект: {project}. " if project else ""
+                lines.append(f"• {source}{node.content}")
                 quote = (getattr(node, "source_quote", None) or "").strip()
                 if quote and quote != node.content:
                     lines.append(f"  цитата: «{quote}»")
@@ -89,11 +136,6 @@ class RetrievedContext:
             lines.append("\n## СВЯЗАННЫЕ СУЩНОСТИ")
             for ent in self.entities[:10]:
                 lines.append(f"• {ent.display_name} ({ent.entity_type}, упоминаний: {ent.mention_count})")
-        
-        if self.paths:
-            lines.append("\n## СВЯЗИ МЕЖДУ МЫСЛЯМИ")
-            for path in self.paths[:5]:
-                lines.append(f"• {path}")
         
         return "\n".join(lines)
 
@@ -382,7 +424,7 @@ class RAGGenerator:
         self.model_name = model_name
         self.llm = make_chat_openai(model_name, temperature, streaming=True)
     
-    def generate(self, query: str, context: RetrievedContext) -> str:
+    def generate(self, query: str, context: RetrievedContext, history: list[str] | None = None) -> str:
         """Генерирует ответ на основе контекста."""
         
         if not context.all_nodes:
@@ -400,9 +442,17 @@ class RAGGenerator:
             )
         user_prompt += (
             "\nОпирайся только на мысли, которые нужны для ответа. "
-            "После каждой такой мысли ставь её номер в квадратных скобках, например [1.2]. "
-            "Не ссылайся на мысли, которые не использовал."
+            "Не пиши номера карточек, коды Луманна и любые идентификаторы в квадратных скобках."
         )
+        prior = recent_user_queries(history, query)
+        if prior:
+            numbered = "\n".join(f"{index}. {text}" for index, text in enumerate(prior, 1))
+            user_prompt += (
+                "\n\nПредыдущие вопросы этого диалога, от старого к новому. "
+                "Они нужны только чтобы понять местоимения и уточнение. "
+                "Отвечай на последний вопрос. Не пересказывай предыдущие ответы и не расширяй тему.\n"
+                f"{numbered}"
+            )
 
         entity_map = None
         if self._privacy_anonymizer:
@@ -420,7 +470,7 @@ class RAGGenerator:
 
         if entity_map:
             response = entity_map.unmask(response)
-        return response
+        return strip_luhmann_marks(response)
 
 
 # фасад graphrag: retrieval + generation
@@ -464,6 +514,7 @@ class GraphRAG:
         similarity_threshold: float | None = None,
         user_ids: list[str] | None = None,
         project_labels: dict[str, str] | None = None,
+        history: list[str] | None = None,
     ) -> RAGResponse:
         """Отвечает на вопрос, используя граф пользователя или все проекты."""
         import time
@@ -474,10 +525,11 @@ class GraphRAG:
             if similarity_threshold is None
             else similarity_threshold
         )
-        context = self.retriever.retrieve(user_id, user_query, threshold, user_ids=user_ids)
+        search_text = dialogue_search_query(user_query, history)
+        context = self.retriever.retrieve(user_id, search_text, threshold, user_ids=user_ids)
         if project_labels:
             context.project_labels = project_labels
-        answer = self.generator.generate(user_query, context)
+        answer = self.generator.generate(user_query, context, history=history)
         
         elapsed_ms = int((time.time() - start) * 1000)
         

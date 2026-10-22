@@ -61,7 +61,7 @@ from app.handlers.folders_mac import (
 )
 from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
 from zettelkasten.atomizer import NoteAtomizer
-from zettelkasten.graph_rag import GraphRAG
+from zettelkasten.graph_rag import GraphRAG, strip_luhmann_marks
 from zettelkasten.graph_visualizer_v2 import (
     encode_graph_html,
     encode_graph_payload,
@@ -366,6 +366,9 @@ def note_live(slug: str, key: str, title: str, sub: str = "", batch: dict | None
         ctrl["stage_sub"] = sub or ""
         if ctrl.get("state") == "running":
             ctrl["sub"] = sub or title
+        hint = (sub or "").strip().strip("«»").strip()
+        if hint:
+            ctrl["current_source"] = hint
         if batch is not None:
             ctrl["batch"] = batch
 
@@ -377,6 +380,8 @@ def note_batch(slug: str, index: int, total: int, name: str, completed: int | No
         if not ctrl:
             return
         ctrl["batch"] = {"index": index, "total": total, "name": name, "completed": done}
+        if (name or "").strip():
+            ctrl["current_source"] = name.strip()
 
 
 def _bind_manifest(slug: str, kind: str, root: str, graph_id: str, watch: bool, items: list) -> None:
@@ -1308,12 +1313,32 @@ def resolve_contour_slugs(slugs: list[str]) -> tuple[list[dict], str]:
     return selected, ""
 
 
-def rag_search_payload(query: str, graph_ids: list[str], labels: dict[str, str], log_key: str) -> dict:
+def _chat_history(data: dict) -> list[str]:
+    """До двух предыдущих вопросов. Вместе с текущим в промпте их три."""
+    raw = data.get("history") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    found = []
+    for item in raw[-2:]:
+        text = " ".join(str(item or "").split())
+        if text:
+            found.append(text[:500])
+    return found
+
+
+def rag_search_payload(
+    query: str,
+    graph_ids: list[str],
+    labels: dict[str, str],
+    log_key: str,
+    history: list[str] | None = None,
+) -> dict:
     resp = graphrag.query(
         "__all__",
         query,
         user_ids=graph_ids,
         project_labels=labels or None,
+        history=history,
     )
     log_event(log_key, query, "search_query", resp.answer)
     used = resp.context.used_source_nodes(resp.answer)
@@ -1606,7 +1631,8 @@ def collect_input_sources(nodes, project_labels: dict | None = None) -> list[dic
         item["quote"] = (getattr(node, "source_quote", None) or "").strip()
         item["content"] = (getattr(node, "content", None) or "").strip()
         item["thought_type"] = getattr(node, "thought_type", "") or ""
-        item["tags"] = list(getattr(node, "tags", None) or [])
+        from zettelkasten.atomizer import normalize_tags
+        item["tags"] = normalize_tags(getattr(node, "tags", None) or [])
         item["created_at"] = _format_created_at(getattr(node, "created_at", None))
         if project_labels:
             item["project"] = project_labels.get(getattr(node, "user_id", None) or "", "")
@@ -1633,6 +1659,7 @@ def project_nav(scope: dict) -> str:
 
 def format_llm_response(text: str) -> str:
     """Format LLM response - supports both HTML and markdown."""
+    text = strip_luhmann_marks(text)
     
     # Check if text already contains HTML tags
     has_html = bool(re.search(r'<(b|i|strong|em|p|br|ul|ol|li|h[1-6]|code|pre|a|span|div)\b', text, re.IGNORECASE))
@@ -1650,9 +1677,6 @@ def format_llm_response(text: str) -> str:
         text = re.sub(r'</b>', '</strong>', text, flags=re.IGNORECASE)
         text = re.sub(r'<i\b([^>]*)>', r'<em\1>', text, flags=re.IGNORECASE)
         text = re.sub(r'</i>', '</em>', text, flags=re.IGNORECASE)
-        
-        # Handle [number] references - make them smaller/styled
-        text = re.sub(r'\[(\d+(?:\.\d+)?)\]', r'<sup class="ref">[\1]</sup>', text)
         
         # Ensure line breaks are preserved
         text = text.replace('\n\n', '</p><p>')
@@ -1688,9 +1712,6 @@ def format_llm_response(text: str) -> str:
         
         # Wrap consecutive <li> in <ul>
         text = re.sub(r'((?:<li>.+?</li>\n?)+)', r'<ul>\1</ul>', text)
-        
-        # Handle [number] references
-        text = re.sub(r'\[(\d+(?:\.\d+)?)\]', r'<sup class="ref">[\1]</sup>', text)
         
         # Line breaks
         text = text.replace('\n\n', '</p><p>')
@@ -1819,9 +1840,13 @@ body {
 .project-card .sources-open { display: inline-flex; flex-direction: column; align-items: flex-start; margin: 0 18px 14px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card2); max-width: calc(100% - 36px); }
 .project-card .sources-open .menu-hint { max-width: 240px; }
 .src-board { margin-top: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 6px 8px 12px; }
-.src-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 6px; padding: 10px 12px 10px 14px; border-bottom: 1px solid var(--border); }
-.src-head-label { font-size: 12px; color: var(--muted); }
-.src-watch-title { width: 188px; text-align: center; font-size: 12px; line-height: 1.3; color: var(--muted); }
+.src-head { display: flex; align-items: center; gap: 10px; margin: 0 0 6px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.src-head-label { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
+.src-cols, .tree-watch {
+  flex: 0 0 248px; width: 248px;
+  display: grid; grid-template-columns: 76px 120px 36px;
+  align-items: center; justify-items: center;
+}
 .src-tree, .src-tree ul { list-style: none; margin: 0; padding: 0; }
 .tree-row { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 2px 8px; border-radius: 10px; }
 .tree-row:hover { background: var(--card2); }
@@ -1839,7 +1864,9 @@ a.tree-path { color: var(--muted); text-decoration: none; }
 a.tree-path:hover { text-decoration: underline; color: var(--accent); }
 .tree-leaf { padding: 1px 0; }
 .src-tree > .tree-leaf > .tree-name { display: flex; align-items: center; min-height: 36px; padding: 0 8px; }
-.tree-watch { flex: 0 0 188px; width: 188px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.src-col { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 28px; font-size: 12px; line-height: 1.2; color: var(--muted); white-space: nowrap; }
+.src-state { width: 28px; flex: 0 0 28px; text-align: center; font-size: 16px; line-height: 1; }
+.src-state-idle { opacity: 0.4; }
 .src-tree .tree-check { position: relative; margin: 0; flex: 0 0 18px; width: 18px; height: 18px; }
 .tree-trash {
   width: 28px; height: 28px; border: 1px solid transparent; border-radius: 8px;
@@ -2267,7 +2294,7 @@ function appendRagSources(container, inputSources) {
         if (src.topic) {
             const topic = document.createElement('span');
             topic.className = 'src-label';
-            topic.textContent = (src.luhmann_id ? '[' + src.luhmann_id + '] ' : '') + src.topic;
+            topic.textContent = src.topic;
             li.appendChild(topic);
         }
         if (src.quote) {
@@ -2303,7 +2330,7 @@ function appendRagSources(container, inputSources) {
 function showSourceCard(raw) {
     const src = raw || {};
     document.getElementById('sourceModalKind').textContent = src.title || 'Источник';
-    setSourceField('sourceModalId', src.luhmann_id ? '[' + src.luhmann_id + ']' : '');
+    setSourceField('sourceModalId', '');
     setSourceField('sourceModalTopic', src.topic || '');
     setSourceField('sourceModalType', src.thought_type || '');
     setSourceField('sourceModalProject', src.project || '');
@@ -3177,8 +3204,16 @@ def _trash_box(kind: str, root: str, item: str, title: str, whole: bool = False)
     )
 
 
-def _item_actions(kind: str, root: str, item: str, watched: bool, title: str, whole: bool = False) -> str:
-    return _watch_box(kind, root, item, watched) + _trash_box(kind, root, item, title, whole=whole)
+def _action_cells(badge: str, watch: str, trash: str) -> str:
+    return (
+        f'<span class="src-col">{badge}</span>'
+        f'<span class="src-col">{watch}</span>'
+        f'<span class="src-col">{trash}</span>'
+    )
+
+
+def _item_actions(kind: str, root: str, item: str, watched: bool, title: str, whole: bool = False, badge: str = "") -> str:
+    return _action_cells(badge, _watch_box(kind, root, item, watched), _trash_box(kind, root, item, title, whole=whole))
 
 
 def _tree_row(main: str, check: str, depth: int) -> str:
@@ -3204,9 +3239,20 @@ def _nest_files(root: str, paths: list[str]) -> dict:
     return tree
 
 
-def _file_row(title: str, kind: str, root: str, path: str, watched: bool, icon: str = "📄", depth: int = 0) -> str:
+def _file_row(
+    title: str,
+    kind: str,
+    root: str,
+    path: str,
+    watched: bool,
+    icon: str = "📄",
+    depth: int = 0,
+    statuses: dict | None = None,
+) -> str:
     main = '<span class="tree-caret-spacer"></span>' + _source_name(title, icon, path)
-    return '<li class="tree-leaf">' + _tree_row(main, _item_actions(kind, root, path, watched, title), depth) + "</li>"
+    badge = _status_badge(path, statuses or {})
+    actions = _item_actions(kind, root, path, watched, title, badge=badge)
+    return '<li class="tree-leaf">' + _tree_row(main, actions, depth) + "</li>"
 
 
 def _render_file_tree(
@@ -3219,21 +3265,29 @@ def _render_file_tree(
     title: str,
     depth: int = 0,
     dir_path: str | None = None,
+    statuses: dict | None = None,
 ) -> str:
+    statuses = statuses or {}
     folder = dir_path or root
     chunks = []
     for dirname in sorted(node["dirs"], key=str.lower):
         child_path = os.path.join(folder, dirname)
         chunks.append(_render_file_tree(
-            node["dirs"][dirname], kind, root, excluded, parent_watch, False, dirname, depth + 1, child_path,
+            node["dirs"][dirname], kind, root, excluded, parent_watch, False, dirname,
+            depth + 1, child_path, statuses,
         ))
     for fname, path in sorted(node["files"], key=lambda item: item[0].lower()):
-        chunks.append(_file_row(fname, kind, root, path, parent_watch and path not in excluded, depth=depth + 1))
+        chunks.append(_file_row(
+            fname, kind, root, path, parent_watch and path not in excluded,
+            depth=depth + 1, statuses=statuses,
+        ))
     inner = "".join(chunks) or '<li class="tree-empty">В директории нет файлов</li>'
     hidden = "" if open_now else " hidden"
     path_bit = _source_path_html(folder) if open_now else ""
     main = _tree_toggle(open_now) + _source_name(title, "📁", folder) + path_bit
-    actions = _trash_box(kind, root, root, title, whole=True) if depth == 0 else ""
+    actions = ""
+    if depth == 0:
+        actions = _action_cells(_status_badge(folder, statuses), "", _trash_box(kind, root, root, title, whole=True))
     return (
         '<li class="tree-dir">'
         + _tree_row(main, actions, depth)
@@ -3241,19 +3295,29 @@ def _render_file_tree(
     )
 
 
-def _render_page_tree(node: dict, root: str, excluded: set, parent_watch: bool, open_now: bool, depth: int = 0) -> str:
+def _render_page_tree(
+    node: dict,
+    root: str,
+    excluded: set,
+    parent_watch: bool,
+    open_now: bool,
+    depth: int = 0,
+    statuses: dict | None = None,
+) -> str:
+    statuses = statuses or {}
     source = node.get("source_input") or ""
     title = node.get("title") or _page_label(source)
     children = node.get("children") or []
     watched = parent_watch and source not in excluded
-    actions = _item_actions("confluence", root, source, watched, title, whole=(depth == 0))
+    badge = _status_badge(source, statuses)
+    actions = _item_actions("confluence", root, source, watched, title, whole=(depth == 0), badge=badge)
     name = _source_name(title, "🌐", source)
     if not children:
         main = '<span class="tree-caret-spacer"></span>' + name
         return '<li class="tree-leaf">' + _tree_row(main, actions, depth) + "</li>"
     hidden = "" if open_now else " hidden"
     inner = "".join(
-        _render_page_tree(child, root, excluded, parent_watch, False, depth + 1)
+        _render_page_tree(child, root, excluded, parent_watch, False, depth + 1, statuses)
         for child in children
     )
     main = _tree_toggle(open_now) + name
@@ -3391,6 +3455,151 @@ def _confluence_nodes(row: dict) -> tuple[dict, str | None]:
     return live, None
 
 
+_source_item_errors: dict[str, dict[str, str]] = {}
+_STATUS_VIEW = {
+    "ready": ("✅", "Загружен"),
+    "error": ("❌", "Ошибка обработки"),
+    "progress": ("⏳", "Идёт обработка"),
+    "idle": ("—", "Ещё не загружен"),
+}
+
+
+def _status_key(item: str) -> str:
+    text = (item or "").strip()
+    if not text or text == "text":
+        return ""
+    if text.lower().startswith(("http://", "https://")):
+        return text
+    try:
+        return os.path.abspath(os.path.expanduser(text))
+    except Exception:
+        return text
+
+
+def _remember_source_error(slug: str, item: str, message: str) -> None:
+    key = _status_key(item)
+    if not slug or not key:
+        return
+    with _state_lock:
+        bucket = _source_item_errors.setdefault(slug, {})
+        text = " ".join(str(message or "").split())
+        if text:
+            bucket[key] = text[:240]
+        else:
+            bucket.pop(key, None)
+
+
+def _status_view(status: str, title: str = "") -> dict:
+    mark, default = _STATUS_VIEW.get(status, _STATUS_VIEW["idle"])
+    return {"status": status, "mark": mark, "title": title or default}
+
+
+def _rollup_status(items: list[str], statuses: dict[str, dict]) -> dict:
+    infos = []
+    for item in items:
+        key = _status_key(item)
+        if key and key in statuses:
+            infos.append(statuses[key])
+    for status in ("error", "progress", "ready"):
+        for info in infos:
+            if info.get("status") == status:
+                return info
+    return _status_view("idle")
+
+
+def _source_keys_for(hint: str, keys: list[str]) -> list[str]:
+    text = (hint or "").strip().strip("«»").strip()
+    if not text:
+        return []
+    direct = _status_key(text)
+    if direct in keys:
+        return [direct]
+    base = os.path.basename(text.rstrip("\\/"))
+    if not base:
+        return []
+    return [key for key in keys if os.path.basename(key.rstrip("\\/")) == base or key == text]
+
+
+def _collect_source_statuses(scope: dict) -> dict[str, dict]:
+    """Статус каждого источника: загружен, ошибка или идёт обработка."""
+    slug = scope.get("slug") or ""
+    graph_id = scope.get("graph_id") or ""
+    statuses: dict[str, dict] = {}
+    ingested = []
+    rows = []
+    try:
+        ingested = _project_source_inputs(graph_id) if graph_id else []
+    except Exception as e:
+        print(f"web_app source status warning: {e}")
+    try:
+        rows = list_watch_sources(watch_only=False, graph_id=graph_id) if graph_id else []
+    except Exception as e:
+        print(f"web_app source status warning: {e}")
+    for item in ingested:
+        key = _status_key(item)
+        if key:
+            statuses[key] = _status_view("ready")
+    with _state_lock:
+        errors = dict(_source_item_errors.get(slug) or {})
+        ctrl = _ingest_ctrl.get(slug) or {}
+        phase = _ingest_phase.get(slug) or ""
+        if not phase and slug in _ingest_snapshot:
+            phase = _ingest_snapshot[slug][0]
+        jobs = _ingest_jobs.get(slug, 0)
+        state = ctrl.get("state") or ""
+        active = bool(ctrl.get("active")) and state in {"running", "paused", "pausing"}
+        busy = active or jobs > 0 or phase in _BUSY_STATUSES
+        current_hint = (ctrl.get("current_source") or ctrl.get("stage_sub") or ctrl.get("sub") or "").strip()
+        batch_name = ((ctrl.get("batch") or {}).get("name") or "").strip()
+        manifest = ctrl.get("manifest") or {}
+        pending = []
+        if busy:
+            done = {_status_key(key) for key in (manifest.get("done") or {})}
+            for item in manifest.get("items") or []:
+                key = _status_key(str(item))
+                if key and key not in done:
+                    pending.append(key)
+    for row in rows:
+        root = _status_key(row.get("source_path") or "")
+        err = " ".join(str(row.get("last_error") or "").split())
+        if root and err:
+            errors.setdefault(root, err[:240])
+    for key, message in errors.items():
+        if key:
+            statuses[key] = _status_view("error", message)
+    known = list(dict.fromkeys([*statuses.keys(), *pending, *[_status_key(row.get("source_path") or "") for row in rows]]))
+    known = [key for key in known if key]
+    progress_title = "Обработка на паузе" if phase in {"paused", "pausing"} else "Идёт обработка"
+    current_keys = _source_keys_for(current_hint, known) or _source_keys_for(batch_name, known)
+    if busy and not current_keys and pending:
+        current_keys = pending[:1]
+    if busy and not current_keys and phase in {"checking", "refreshing"}:
+        current_keys = [_status_key(row.get("source_path") or "") for row in rows if row.get("watch")]
+        current_keys = [key for key in current_keys if key]
+    if busy:
+        for key in current_keys:
+            statuses[key] = _status_view("progress", progress_title)
+    for row in rows:
+        if row.get("source_kind") != "folder":
+            root = _status_key(row.get("source_path") or "")
+            if root and root not in statuses:
+                statuses[root] = _status_view("idle")
+            continue
+        root = row.get("source_path") or ""
+        files = _folder_files(row, ingested)
+        statuses[_status_key(root)] = _rollup_status([root, *files], statuses)
+    return statuses
+
+
+def _status_badge(item: str, statuses: dict[str, dict]) -> str:
+    key = _status_key(item)
+    info = statuses.get(key) or _status_view("idle")
+    return (
+        f'<span class="src-state src-state-{escape(info["status"])}" '
+        f'data-status-for="{escape(key)}" title="{escape(info["title"])}">{info["mark"]}</span>'
+    )
+
+
 def _tracked(row: dict | None, item: str) -> bool:
     if not row or not row.get("watch"):
         return False
@@ -3406,6 +3615,7 @@ def _sources_tree_html(scope: dict) -> str:
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
     ingested = _project_source_inputs(graph_id)
+    statuses = _collect_source_statuses(scope)
     folders = [row for row in rows if row.get("source_kind") == "folder"]
     pages = [row for row in rows if row.get("source_kind") == "confluence"]
     lone = [row for row in rows if row.get("source_kind") == "file"]
@@ -3424,7 +3634,9 @@ def _sources_tree_html(scope: dict) -> str:
             excluded = _excluded_items(row, "folder")
             tree = _nest_files(root, files)
             title = os.path.basename(root.rstrip("\\/")) or root
-            chunks.append(_render_file_tree(tree, "folder", root, excluded, bool(row.get("watch")), True, title))
+            chunks.append(_render_file_tree(
+                tree, "folder", root, excluded, bool(row.get("watch")), True, title, statuses=statuses,
+            ))
         chunks.append("</ul>")
 
     if pages:
@@ -3438,7 +3650,7 @@ def _sources_tree_html(scope: dict) -> str:
                 notes.append(note)
             excluded = _excluded_items(row, "confluence")
             claimed_pages.update(_flatten_pages(node))
-            trees.append(_render_page_tree(node, root, excluded, bool(row.get("watch")), True))
+            trees.append(_render_page_tree(node, root, excluded, bool(row.get("watch")), True, statuses=statuses))
         if notes:
             chunks.append('<p class="sources-warn">' + escape(notes[0]) + "</p>")
         chunks.append('<ul class="src-tree">' + "".join(trees) + "</ul>")
@@ -3471,16 +3683,16 @@ def _sources_tree_html(scope: dict) -> str:
             if not path or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch"))))
+            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch")), statuses=statuses))
         for kind, path in loose_files:
             if kind != "file" or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False))
+            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False, statuses=statuses))
         for kind, url in loose_files:
             if kind != "confluence-orphan":
                 continue
-            chunks.append(_file_row(url, "confluence", url, url, False, "🌐"))
+            chunks.append(_file_row(url, "confluence", url, url, False, "🌐", statuses=statuses))
         chunks.append("</ul>")
 
     if texts:
@@ -3492,7 +3704,8 @@ def _sources_tree_html(scope: dict) -> str:
         return '<p class="sources-empty">В проекте пока нет загруженных файлов, директорий и страниц.</p>'
     return (
         '<div class="src-board">'
-        '<div class="src-head"><span class="src-head-label">Источник</span><div class="src-watch-title">Отслеживать</div></div>'
+        '<div class="src-head"><span class="src-head-label">Источник</span>'
+        '<div class="src-cols"><span class="src-col">Статус</span><span class="src-col">Отслеживать</span><span class="src-col"></span></div></div>'
         + "".join(chunks)
         + "</div>"
     )
@@ -3808,8 +4021,45 @@ async def project_sources(slug: str):
     }
     const confirmBtn = document.getElementById('confirmDeleteSource');
     if (confirmBtn) confirmBtn.addEventListener('click', confirmDeleteSource);
-    """ % (json.dumps(slug), json.dumps(slug))
+    let statusTimer = 0;
+    function paintSourceStatus(items) {
+        document.querySelectorAll('[data-status-for]').forEach(function(el) {
+            const row = items[el.getAttribute('data-status-for')];
+            if (!row) return;
+            el.textContent = row.mark;
+            el.title = row.title || '';
+            el.className = 'src-state src-state-' + (row.status || 'idle');
+        });
+    }
+    function scheduleSourceStatus() {
+        clearTimeout(statusTimer);
+        if (document.hidden) return;
+        statusTimer = setTimeout(refreshSourceStatus, 2000);
+    }
+    async function refreshSourceStatus() {
+        try {
+            const resp = await fetch('/p/' + encodeURIComponent(%s) + '/sources/status');
+            const data = await resp.json();
+            if (data && data.items) paintSourceStatus(data.items);
+        } catch (e) {}
+        scheduleSourceStatus();
+    }
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) refreshSourceStatus();
+    });
+    scheduleSourceStatus();
+    """ % (json.dumps(slug), json.dumps(slug), json.dumps(slug))
     return HTMLResponse(html_page("Источники", body, js))
+
+
+@app.get("/p/{slug}/sources/status")
+async def project_source_status(slug: str):
+    scope, err = _writable_scope(slug)
+    if err:
+        return JSONResponse({"ok": False, "error": "Проект недоступен"}, status_code=403)
+    items = _collect_source_statuses(scope)
+    busy = any(row.get("status") == "progress" for row in items.values())
+    return JSONResponse({"ok": True, "busy": busy, "items": items})
 
 
 @app.post("/p/{slug}/sources/watch")
@@ -4714,8 +4964,10 @@ async def add_folder(
                     gc.collect()
                 if ok:
                     ok_n += 1
+                    _remember_source_error(slug, abs_path, "")
                 else:
                     fail_n += 1
+                    _remember_source_error(slug, abs_path, ans)
                     log_event(slug, f"[{name}]", "folder", ans)
                 note_batch(slug, i, total, name, i)
                 q.put({"type": "file", "name": name, "ok": bool(ok), "message": ans, "index": i, "total": total})
@@ -4824,6 +5076,7 @@ async def add_confluence(
             )
             if skip_msg:
                 ok_n += 1
+                _remember_source_error(slug, source_input, "")
                 prev = get_ingest_digest(scope["graph_id"], _canonical_source(source_input))
                 if prev:
                     _mark_manifest_done(slug, source_input, prev)
@@ -4834,6 +5087,7 @@ async def add_confluence(
             if _is_confluence_fetch_error(text):
                 fail_n += 1
                 last_err = text.strip()
+                _remember_source_error(slug, source_input, last_err)
                 log_event(slug, source_input, "confluence", last_err)
                 continue
             ok, ans = run_ingest(
@@ -4848,11 +5102,13 @@ async def add_confluence(
             )
             if ok:
                 ok_n += 1
+                _remember_source_error(slug, source_input, "")
                 digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 _mark_manifest_done(slug, source_input, digest)
             else:
                 fail_n += 1
                 last_err = ans
+                _remember_source_error(slug, source_input, ans)
         if watch:
             _save_manifest_finished(slug)
         if ok_n == 0:
@@ -4978,6 +5234,7 @@ async def contour_page(request: Request):
     const chatMessages = document.getElementById('chatMessages');
     const queryInput = document.getElementById('queryInput');
     const sendBtn = document.getElementById('sendBtn');
+    const asked = [];
 
     function bySlug(slug) {{
         return PROJECTS.find(function(p) {{ return p.slug === slug; }});
@@ -5097,6 +5354,9 @@ async def contour_page(request: Request):
         const query = queryInput.value.trim();
         if (!query) {{ queryInput.focus(); return false; }}
         addMessage(query, 'user');
+        const history = asked.slice(-2);
+        asked.push(query);
+        if (asked.length > 3) asked.splice(0, asked.length - 3);
         queryInput.value = '';
         queryInput.style.height = 'auto';
         const loadingId = 'loading-' + Date.now();
@@ -5112,7 +5372,7 @@ async def contour_page(request: Request):
             const resp = await fetch('/contour/api/search', {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{ q: query, projects: selectedList().map(function(p) {{ return p.slug; }}) }})
+                body: JSON.stringify({{ q: query, history: history, projects: selectedList().map(function(p) {{ return p.slug; }}) }})
             }});
             const data = await resp.json();
             document.getElementById(loadingId).remove();
@@ -5179,7 +5439,7 @@ async def contour_api_search(request: Request):
         return JSONResponse({"error": err}, status_code=400)
     graph_ids = [p["graph_id"] for p in selected]
     labels = {p["graph_id"]: (p.get("name") or p["slug"]) for p in selected}
-    return JSONResponse(rag_search_payload(query, graph_ids, labels, "contour"))
+    return JSONResponse(rag_search_payload(query, graph_ids, labels, "contour", _chat_history(data)))
 
 
 # ========== SEARCH (Chat style with formatting) ==========
@@ -5222,6 +5482,7 @@ async def search_page(slug: str):
     const queryInput = document.getElementById('queryInput');
     const sendBtn = document.getElementById('sendBtn');
     const searchUrl = '/p/{slug}/api/search';
+    const asked = [];
     
     queryInput.addEventListener('input', function() {{
         this.style.height = 'auto';
@@ -5244,6 +5505,9 @@ async def search_page(slug: str):
         }}
         
         addMessage(query, 'user');
+        const history = asked.slice(-2);
+        asked.push(query);
+        if (asked.length > 3) asked.splice(0, asked.length - 3);
         queryInput.value = '';
         queryInput.style.height = 'auto';
         
@@ -5261,7 +5525,7 @@ async def search_page(slug: str):
             const resp = await fetch(searchUrl, {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{q: query}})
+                body: JSON.stringify({{q: query, history: history}})
             }});
             const data = await resp.json();
             
@@ -5335,12 +5599,13 @@ async def api_search(slug: str, request: Request):
         return JSONResponse({"error": "Введите запрос"}, status_code=400)
 
     labels = scope.get("project_labels") or {}
+    history = _chat_history(data)
     if scope["readonly"]:
-        payload = rag_search_payload(query, scope["graph_ids"], labels, slug)
+        payload = rag_search_payload(query, scope["graph_ids"], labels, slug, history)
         return JSONResponse(payload)
 
     graph_key = scope["graph_id"]
-    resp = graphrag.query(graph_key, query)
+    resp = graphrag.query(graph_key, query, history=history)
     log_event(slug, query, "search_query", resp.answer)
     formatted = format_llm_response(resp.answer)
     used = resp.context.used_source_nodes(resp.answer)
