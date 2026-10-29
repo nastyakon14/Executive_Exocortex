@@ -3014,7 +3014,9 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     ingest_busy = scope.get("ingest_status") in {"indexed", "linking", "checking", "refreshing"}
     watch_n = 0
     try:
-        watch_n = len(list_watch_sources(watch_only=True, project_slug=slug))
+        watched_rows = list_watch_sources(watch_only=True, project_slug=slug)
+        _release_file_watches(watched_rows)
+        watch_n = sum(1 for row in watched_rows if row.get("watch") and row.get("source_kind") != "file")
     except Exception:
         watch_n = 0
     refresh_disabled = " disabled" if ingest_busy else ""
@@ -3130,9 +3132,25 @@ def _sources_link_html(slug: str) -> str:
     return (
         f'<a class="status-open sources-open has-hint" href="/p/{escape(slug)}/sources">'
         '<span class="menu-title">Посмотреть источники</span>'
-        '<span class="menu-hint">Файлы, папки и страницы. Здесь включается отслеживание изменений.</span>'
+        '<span class="menu-hint">Файлы, папки и страницы. Отслеживание изменений включается у директории и страницы Confluence.</span>'
         "</a>"
     )
+
+
+def _release_file_watches(rows: list[dict]) -> None:
+    """Загруженный файл не перечитывается: снимаем с него отслеживание."""
+    for row in rows:
+        if row.get("source_kind") != "file" or not row.get("watch"):
+            continue
+        watch_id = row.get("id")
+        if watch_id is None:
+            continue
+        try:
+            set_watch_source_state(watch_id, False)
+        except Exception as e:
+            print(f"web_app file watch off warning: {e}")
+            continue
+        row["watch"] = False
 
 
 def _project_source_inputs(graph_id: str) -> list[str]:
@@ -3248,10 +3266,12 @@ def _file_row(
     icon: str = "📄",
     depth: int = 0,
     statuses: dict | None = None,
+    show_watch: bool = True,
 ) -> str:
     main = '<span class="tree-caret-spacer"></span>' + _source_name(title, icon, path)
     badge = _status_badge(path, statuses or {})
-    actions = _item_actions(kind, root, path, watched, title, badge=badge)
+    watch = _watch_box(kind, root, path, watched) if show_watch else ""
+    actions = _action_cells(badge, watch, _trash_box(kind, root, path, title))
     return '<li class="tree-leaf">' + _tree_row(main, actions, depth) + "</li>"
 
 
@@ -3278,8 +3298,8 @@ def _render_file_tree(
         ))
     for fname, path in sorted(node["files"], key=lambda item: item[0].lower()):
         chunks.append(_file_row(
-            fname, kind, root, path, parent_watch and path not in excluded,
-            depth=depth + 1, statuses=statuses,
+            fname, kind, root, path, False,
+            depth=depth + 1, statuses=statuses, show_watch=False,
         ))
     inner = "".join(chunks) or '<li class="tree-empty">В директории нет файлов</li>'
     hidden = "" if open_now else " hidden"
@@ -3287,7 +3307,11 @@ def _render_file_tree(
     main = _tree_toggle(open_now) + _source_name(title, "📁", folder) + path_bit
     actions = ""
     if depth == 0:
-        actions = _action_cells(_status_badge(folder, statuses), "", _trash_box(kind, root, root, title, whole=True))
+        actions = _action_cells(
+            _status_badge(folder, statuses),
+            _watch_box(kind, root, root, parent_watch),
+            _trash_box(kind, root, root, title, whole=True),
+        )
     return (
         '<li class="tree-dir">'
         + _tree_row(main, actions, depth)
@@ -3614,6 +3638,7 @@ def _sources_tree_html(scope: dict) -> str:
         rows = list_watch_sources(watch_only=False, graph_id=graph_id)
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
+    _release_file_watches(rows)
     ingested = _project_source_inputs(graph_id)
     statuses = _collect_source_statuses(scope)
     folders = [row for row in rows if row.get("source_kind") == "folder"]
@@ -3683,12 +3708,16 @@ def _sources_tree_html(scope: dict) -> str:
             if not path or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch")), statuses=statuses))
+            chunks.append(_file_row(
+                os.path.basename(path), "file", path, path, False, statuses=statuses, show_watch=False,
+            ))
         for kind, path in loose_files:
             if kind != "file" or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False, statuses=statuses))
+            chunks.append(_file_row(
+                os.path.basename(path) or path, "file", path, path, False, statuses=statuses, show_watch=False,
+            ))
         for kind, url in loose_files:
             if kind != "confluence-orphan":
                 continue
@@ -3731,9 +3760,25 @@ def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool)
     row = _find_watch_row(rows, kind, root_key)
     extract_child = bool(row.get("extract_child")) if row else False
     stored_root = (row.get("source_path") if row else root) or root
-    whole = kind == "file" or (
-        kind == "confluence" and item_key == root_key and not extract_child
-    )
+    if kind == "folder" and item_key == root_key:
+        if row is None:
+            upsert_watch_source(
+                graph_id=graph_id,
+                project_slug=scope["slug"],
+                source_kind="folder",
+                source_path=stored_root,
+                watch=watched,
+                extract_child=False,
+            )
+            return {item: watched}
+        content = None
+        if watched:
+            state = parse_watch_state(row.get("content_hash"), root=stored_root)
+            if state["excluded"]:
+                content = dump_watch_state(state["files"], state["pending"], [], root=stored_root)
+        set_watch_source_state(row["id"], watched, content)
+        return {item: watched}
+    whole = kind == "confluence" and item_key == root_key and not extract_child
     if whole:
         upsert_watch_source(
             graph_id=graph_id,
@@ -3927,7 +3972,7 @@ async def project_sources(slug: str):
         <div class="header">
             <h1>Источники</h1>
         </div>
-        <p class="sources-note">Галочка включает ночное и ручное обновление только для отмеченных файлов и страниц. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
+        <p class="sources-note">Галочка включает ночное и ручное обновление у директории и страницы Confluence. Файлы внутри директории обновляются вместе с ней. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
         {_sources_tree_html(scope)}
     </div>
     <div class="modal-overlay" id="deleteSourceModal">
@@ -4078,6 +4123,11 @@ async def project_source_watch(
     item = (item or "").strip()
     if kind not in {"folder", "confluence", "file"} or not root or not item:
         return JSONResponse({"ok": False, "error": "Не указан источник"}, status_code=400)
+    if kind == "file":
+        return JSONResponse(
+            {"ok": False, "error": "Отдельный файл не отслеживается. Галочка доступна у директории и страницы Confluence."},
+            status_code=400,
+        )
     try:
         flags = _set_item_watch(scope, kind, root, item, watched == "1")
     except Exception as e:

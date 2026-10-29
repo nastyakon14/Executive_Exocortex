@@ -87,7 +87,7 @@ def dialogue_search_query(query: str, history: list[str] | None) -> str:
     previous = recent_user_queries(history, current)
     if not previous:
         return current
-    if len(current) <= 40 or _FOLLOWUP.search(current):
+    if len(current) <= 70 or _FOLLOWUP.search(current):
         return f"{previous[-1]} {current}".strip()
     return current
 

@@ -20,6 +20,7 @@ from storage.postgres.db_connect import (
     get_ingest_digest,
     list_watch_sources,
     mark_watch_synced,
+    set_watch_source_state,
     upsert_ingest_digest,
 )
 
@@ -519,6 +520,19 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
     from web_app import begin_ingest, end_ingest
 
     sources = list_watch_sources(watch_only=True, project_slug=slug)
+    kept = []
+    for src in sources:
+        if src.get("source_kind") != "file":
+            kept.append(src)
+            continue
+        watch_id = src.get("id")
+        if watch_id is None:
+            continue
+        try:
+            set_watch_source_state(watch_id, False)
+        except Exception as e:
+            print(f"[auto_refresh] не удалось снять отслеживание файла: {e}")
+    sources = kept
     if not sources:
         return {"ok": True, "updated": 0, "skipped": 0, "failed": 0, "message": "Нет источников с отслеживанием изменений"}
 
