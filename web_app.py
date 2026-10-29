@@ -2654,17 +2654,38 @@ document.addEventListener('keydown', function(e) {
 
 
 def _documentation_pdf_path() -> Path:
-    raw = (settings.pdf_documentation_path or "").strip()
-    path = Path(raw).expanduser()
+    """Путь читается с диска при каждом открытии, без перезапуска сервера."""
+    import importlib
+    import config.settings as settings_mod
+    try:
+        importlib.reload(settings_mod)
+        raw = settings_mod.settings.pdf_documentation_path
+    except Exception as e:
+        print(f"web_app documentation path warning: {e}")
+        raw = settings.pdf_documentation_path
+    path = Path((raw or "").strip()).expanduser()
     if not path.is_absolute():
         path = Path(__file__).resolve().parent / path
     return path
 
 
+def _documentation_href() -> str:
+    path = _documentation_pdf_path()
+    stamp = "0"
+    try:
+        if path.is_file():
+            stat = path.stat()
+            stamp = f"{stat.st_mtime_ns}-{stat.st_size}"
+    except OSError:
+        stamp = "0"
+    token = hashlib.sha1(f"{path}|{stamp}".encode()).hexdigest()[:12]
+    return f"/documentation.pdf?v={token}"
+
+
 def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool = True, show_docs: bool = False) -> str:
     theme_btn = '<button class="theme-toggle" onclick="toggleTheme()">🌙</button>' if show_theme_toggle else ''
     docs_btn = (
-        '<a class="docs-open" href="/documentation.pdf" target="_blank" rel="noopener noreferrer">Посмотреть документацию</a>'
+        f'<a class="docs-open" href="{escape(_documentation_href())}" target="_blank" rel="noopener noreferrer">Посмотреть документацию</a>'
         if show_docs else ''
     )
     if docs_btn and theme_btn:
@@ -2751,12 +2772,14 @@ async def documentation_pdf():
                 '<div class="container"><p class="sources-empty">Файл документации не найден.</p></div>',
             ),
             status_code=404,
+            headers={"Cache-Control": "no-store"},
         )
     return FileResponse(
         path,
         media_type="application/pdf",
         filename=path.name,
         content_disposition_type="inline",
+        headers={"Cache-Control": "no-store"},
     )
 
 
