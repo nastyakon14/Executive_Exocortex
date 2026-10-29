@@ -40,6 +40,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+
+    # path to pdf documentation
+    pdf_documentation_path: str = "docs/pdf/documentation.pdf"
     # vlm images
     image_vlm_model: str = "kimi-k2-instruct"
 

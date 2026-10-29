@@ -19,7 +19,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse, Response, StreamingResponse
 import uvicorn
 
 from config.settings import settings
@@ -74,7 +74,7 @@ from zettelkasten.source_quote import find_source_quote
 
 load_dotenv()
 
-app = FastAPI(title="BVA Exocortex Web App")
+app = FastAPI(title="BVA MindMap Web App")
 
 create_database()
 create_tables()
@@ -1923,6 +1923,10 @@ button.tree-dir-name { border: none; background: transparent; padding: 0; cursor
 /* Theme toggle */
 .theme-toggle { position: fixed; top: 16px; right: 16px; z-index: 100; background: var(--card); border: 1px solid var(--border); border-radius: 50%; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 20px; transition: all 0.2s; }
 .theme-toggle:hover { transform: scale(1.1); }
+.corner-tools { position: fixed; top: 16px; right: 16px; z-index: 100; display: flex; align-items: center; gap: 10px; }
+.corner-tools .theme-toggle { position: static; }
+.docs-open { height: 44px; display: flex; align-items: center; padding: 0 14px; background: var(--card); border: 1px solid var(--border); border-radius: 999px; color: var(--text); font-size: 13px; font-weight: 500; text-decoration: none; white-space: nowrap; }
+.docs-open:hover { border-color: var(--accent); color: var(--text); }
 
 /* Auth */
 .auth-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
@@ -2649,8 +2653,24 @@ document.addEventListener('keydown', function(e) {
 """
 
 
-def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool = True) -> str:
+def _documentation_pdf_path() -> Path:
+    raw = (settings.pdf_documentation_path or "").strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool = True, show_docs: bool = False) -> str:
     theme_btn = '<button class="theme-toggle" onclick="toggleTheme()">🌙</button>' if show_theme_toggle else ''
+    docs_btn = (
+        '<a class="docs-open" href="/documentation.pdf" target="_blank" rel="noopener noreferrer">Посмотреть документацию</a>'
+        if show_docs else ''
+    )
+    if docs_btn and theme_btn:
+        theme_btn = f'<div class="corner-tools">{docs_btn}{theme_btn}</div>'
+    elif docs_btn:
+        theme_btn = f'<div class="corner-tools">{docs_btn}</div>'
     return f"""<!DOCTYPE html>
 <html lang="ru" data-theme="light">
 <head>
@@ -2719,6 +2739,25 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 @app.get("/favicon.svg")
 async def favicon():
     return Response(content=EXOCORTEX_LOGO_SVG, media_type="image/svg+xml")
+
+
+@app.get("/documentation.pdf")
+async def documentation_pdf():
+    path = _documentation_pdf_path()
+    if not path.is_file():
+        return HTMLResponse(
+            html_page(
+                "Документация",
+                '<div class="container"><p class="sources-empty">Файл документации не найден.</p></div>',
+            ),
+            status_code=404,
+        )
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=path.name,
+        content_disposition_type="inline",
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2790,7 +2829,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
     <div class="container hub">
         <div class="hub-hero">
             <div class="hub-logo">{EXOCORTEX_LOGO_SVG}</div>
-            <h1>BVA Exocortex</h1>
+            <h1>BVA MindMap</h1>
             <p>Пространство проектов: у каждого свой граф знаний, общий слой собирает всё вместе.</p>
         </div>
         {alert}
@@ -2890,7 +2929,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
         });
     });
     """
-    return HTMLResponse(html_page("Проекты — BVA Exocortex", body, js))
+    return HTMLResponse(html_page("Проекты — BVA MindMap", body, js, show_docs=True))
 
 
 @app.post("/projects/create")
@@ -3014,9 +3053,7 @@ async def project_home(slug: str, msg: str = "", st: str = ""):
     ingest_busy = scope.get("ingest_status") in {"indexed", "linking", "checking", "refreshing"}
     watch_n = 0
     try:
-        watched_rows = list_watch_sources(watch_only=True, project_slug=slug)
-        _release_file_watches(watched_rows)
-        watch_n = sum(1 for row in watched_rows if row.get("watch") and row.get("source_kind") != "file")
+        watch_n = len(list_watch_sources(watch_only=True, project_slug=slug))
     except Exception:
         watch_n = 0
     refresh_disabled = " disabled" if ingest_busy else ""
@@ -3132,25 +3169,9 @@ def _sources_link_html(slug: str) -> str:
     return (
         f'<a class="status-open sources-open has-hint" href="/p/{escape(slug)}/sources">'
         '<span class="menu-title">Посмотреть источники</span>'
-        '<span class="menu-hint">Файлы, папки и страницы. Отслеживание изменений включается у директории и страницы Confluence.</span>'
+        '<span class="menu-hint">Файлы, папки и страницы. Здесь включается отслеживание изменений.</span>'
         "</a>"
     )
-
-
-def _release_file_watches(rows: list[dict]) -> None:
-    """Загруженный файл не перечитывается: снимаем с него отслеживание."""
-    for row in rows:
-        if row.get("source_kind") != "file" or not row.get("watch"):
-            continue
-        watch_id = row.get("id")
-        if watch_id is None:
-            continue
-        try:
-            set_watch_source_state(watch_id, False)
-        except Exception as e:
-            print(f"web_app file watch off warning: {e}")
-            continue
-        row["watch"] = False
 
 
 def _project_source_inputs(graph_id: str) -> list[str]:
@@ -3266,12 +3287,10 @@ def _file_row(
     icon: str = "📄",
     depth: int = 0,
     statuses: dict | None = None,
-    show_watch: bool = True,
 ) -> str:
     main = '<span class="tree-caret-spacer"></span>' + _source_name(title, icon, path)
     badge = _status_badge(path, statuses or {})
-    watch = _watch_box(kind, root, path, watched) if show_watch else ""
-    actions = _action_cells(badge, watch, _trash_box(kind, root, path, title))
+    actions = _item_actions(kind, root, path, watched, title, badge=badge)
     return '<li class="tree-leaf">' + _tree_row(main, actions, depth) + "</li>"
 
 
@@ -3298,8 +3317,8 @@ def _render_file_tree(
         ))
     for fname, path in sorted(node["files"], key=lambda item: item[0].lower()):
         chunks.append(_file_row(
-            fname, kind, root, path, False,
-            depth=depth + 1, statuses=statuses, show_watch=False,
+            fname, kind, root, path, parent_watch and path not in excluded,
+            depth=depth + 1, statuses=statuses,
         ))
     inner = "".join(chunks) or '<li class="tree-empty">В директории нет файлов</li>'
     hidden = "" if open_now else " hidden"
@@ -3307,11 +3326,7 @@ def _render_file_tree(
     main = _tree_toggle(open_now) + _source_name(title, "📁", folder) + path_bit
     actions = ""
     if depth == 0:
-        actions = _action_cells(
-            _status_badge(folder, statuses),
-            _watch_box(kind, root, root, parent_watch),
-            _trash_box(kind, root, root, title, whole=True),
-        )
+        actions = _action_cells(_status_badge(folder, statuses), "", _trash_box(kind, root, root, title, whole=True))
     return (
         '<li class="tree-dir">'
         + _tree_row(main, actions, depth)
@@ -3638,7 +3653,6 @@ def _sources_tree_html(scope: dict) -> str:
         rows = list_watch_sources(watch_only=False, graph_id=graph_id)
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
-    _release_file_watches(rows)
     ingested = _project_source_inputs(graph_id)
     statuses = _collect_source_statuses(scope)
     folders = [row for row in rows if row.get("source_kind") == "folder"]
@@ -3708,16 +3722,12 @@ def _sources_tree_html(scope: dict) -> str:
             if not path or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(
-                os.path.basename(path), "file", path, path, False, statuses=statuses, show_watch=False,
-            ))
+            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch")), statuses=statuses))
         for kind, path in loose_files:
             if kind != "file" or path in seen:
                 continue
             seen.add(path)
-            chunks.append(_file_row(
-                os.path.basename(path) or path, "file", path, path, False, statuses=statuses, show_watch=False,
-            ))
+            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False, statuses=statuses))
         for kind, url in loose_files:
             if kind != "confluence-orphan":
                 continue
@@ -3760,25 +3770,9 @@ def _set_item_watch(scope: dict, kind: str, root: str, item: str, watched: bool)
     row = _find_watch_row(rows, kind, root_key)
     extract_child = bool(row.get("extract_child")) if row else False
     stored_root = (row.get("source_path") if row else root) or root
-    if kind == "folder" and item_key == root_key:
-        if row is None:
-            upsert_watch_source(
-                graph_id=graph_id,
-                project_slug=scope["slug"],
-                source_kind="folder",
-                source_path=stored_root,
-                watch=watched,
-                extract_child=False,
-            )
-            return {item: watched}
-        content = None
-        if watched:
-            state = parse_watch_state(row.get("content_hash"), root=stored_root)
-            if state["excluded"]:
-                content = dump_watch_state(state["files"], state["pending"], [], root=stored_root)
-        set_watch_source_state(row["id"], watched, content)
-        return {item: watched}
-    whole = kind == "confluence" and item_key == root_key and not extract_child
+    whole = kind == "file" or (
+        kind == "confluence" and item_key == root_key and not extract_child
+    )
     if whole:
         upsert_watch_source(
             graph_id=graph_id,
@@ -3972,7 +3966,7 @@ async def project_sources(slug: str):
         <div class="header">
             <h1>Источники</h1>
         </div>
-        <p class="sources-note">Галочка включает ночное и ручное обновление у директории и страницы Confluence. Файлы внутри директории обновляются вместе с ней. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
+        <p class="sources-note">Галочка включает ночное и ручное обновление только для отмеченных файлов и страниц. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
         {_sources_tree_html(scope)}
     </div>
     <div class="modal-overlay" id="deleteSourceModal">
@@ -4123,11 +4117,6 @@ async def project_source_watch(
     item = (item or "").strip()
     if kind not in {"folder", "confluence", "file"} or not root or not item:
         return JSONResponse({"ok": False, "error": "Не указан источник"}, status_code=400)
-    if kind == "file":
-        return JSONResponse(
-            {"ok": False, "error": "Отдельный файл не отслеживается. Галочка доступна у директории и страницы Confluence."},
-            status_code=400,
-        )
     try:
         flags = _set_item_watch(scope, kind, root, item, watched == "1")
     except Exception as e:
