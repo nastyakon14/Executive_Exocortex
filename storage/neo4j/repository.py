@@ -1202,13 +1202,13 @@ class ZettelRepository:
         RETURN z.user_id AS user_id,
                z.zettel_id AS zettel_id,
                z.luhmann_id AS luhmann_id,
-               z.topic AS topic,
-               z.content AS content,
+               left(coalesce(z.topic, ''), 200) AS topic,
+               left(coalesce(z.content, ''), 700) AS content,
                z.thought_type AS thought_type,
                z.tags AS tags,
                z.is_root_topic AS is_root_topic,
                z.source_input AS source_input,
-               z.source_quote AS source_quote,
+               left(coalesce(z.source_quote, ''), 400) AS source_quote,
                parent.luhmann_id AS parent_luhmann
         """
         edges_query = """

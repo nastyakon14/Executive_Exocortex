@@ -400,6 +400,7 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         if to_id.startswith("entity:") and from_id:
             neighbors[to_id].append(from_id)
 
+    loose: list[tuple[int, str]] = []
     for i, entity in enumerate(entities):
         eid = f"entity:{entity['name']}"
         linked = neighbors.get(eid, [])
@@ -411,7 +412,10 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             ay = sum(p[1] for p in pts) / len(pts)
             pos[eid] = (ax + 34 * math.cos(i * 1.7), ay + 72 + 34 * math.sin(i * 1.7))
         else:
-            floor = max((point[1] for point in pos.values()), default=0.0)
+            loose.append((i, eid))
+    if loose:
+        floor = max((point[1] for point in pos.values()), default=0.0)
+        for i, eid in loose:
             pos[eid] = (i * 88.0, floor + 180)
     return pos
 
@@ -465,7 +469,7 @@ def _excel_node_style(
         if thought_type == "excel_column":
             return 0, 52, color
         return 0, 32, color
-    return 0, _thought_size(depth), color_index[root]
+    return 0, _thought_size(depth), color_index.get(root, 0)
 
 
 def _thought_size(depth: int) -> int:
@@ -500,6 +504,11 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
     nodes = []
     meta = []
     id_index: dict[str, int] = {}
+    card_count = len(graph_data["zettels"])
+    if card_count >= 8000:
+        lim_topic, lim_content, lim_quote, lim_preview = 90, 160, 80, 60
+    else:
+        lim_topic, lim_content, lim_quote, lim_preview = 180, 480, 360, 120
     for z in graph_data["zettels"]:
         nid = z["zettel_id"]
         if nid in id_index:
@@ -528,28 +537,20 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "c": color,
             "l": label,
         })
-        preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
+        preview = f"{topic}: {_short_text(content, lim_preview)}" if topic else _short_text(content, lim_preview)
         quote = z.get("source_quote") or ""
         source = z.get("source_input") or ""
         meta.append([
             z["luhmann_id"],
             z.get("parent_luhmann") or "",
-            _short_text(topic, 180),
+            _short_text(topic, lim_topic),
             tt,
             ", ".join(tags[:8]),
-            _short_text(content, 480),
+            _short_text(content, lim_content),
             preview,
-            " ".join([
-                z["luhmann_id"],
-                topic,
-                _short_text(content, 160),
-                " ".join(tags[:8]),
-                tt,
-                _short_text(source, 80),
-                _short_text(quote, 80),
-            ]).lower(),
+            "",
             _public_source_url(source or "text"),
-            _short_text(quote, 360),
+            _short_text(quote, lim_quote),
             project,
         ])
 
@@ -692,7 +693,8 @@ def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[byte
         "x-graph-size": str(len(raw)),
     }
     if "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
-        return gzip.compress(raw, compresslevel=4), {
+        level = 1 if len(raw) > 1_500_000 else 4
+        return gzip.compress(raw, compresslevel=level), {
             **headers,
             "content-encoding": "gzip",
             "vary": "Accept-Encoding",
@@ -734,6 +736,7 @@ let fitted = false;
 let clusters = [];
 let groupByProject = false;
 let clusterHot = -1;
+let hoverNode = -2;
 let hoverX = 0, hoverY = 0;
 
 function fillOf(i) {
@@ -891,7 +894,7 @@ function buildIndex() {
   hay = new Array(N);
   for (let i = 0; i < N; i++) {
     const m = META[i] || [];
-    hay[i] = ((m[7] || '') + ' ' + (L[i] || '')).toLowerCase();
+    hay[i] = [m[0], m[2], m[4], m[5], m[7], m[10], L[i]].join(' ').toLowerCase();
   }
 }
 
@@ -1018,6 +1021,9 @@ function cellsInView(x0, y0, x1, y1) {
   }
   return out;
 }
+function nodeAlpha(i, base) {
+  return G[i] === 1 ? base * 0.68 : base;
+}
 function screenRadius(i) {
   const raw = R[i] * zoom;
   const minR = zoom < 0.18 ? 3.2 : (zoom < 0.45 ? 4.5 : 6);
@@ -1048,7 +1054,7 @@ function requestDraw() {
 function drawNode(i, alpha, ring) {
   const x = sx(X[i]), y = sy(Y[i]);
   const r = screenRadius(i);
-  ctx.globalAlpha = alpha;
+  ctx.globalAlpha = nodeAlpha(i, alpha);
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fillStyle = fillOf(i);
@@ -1059,6 +1065,15 @@ function drawNode(i, alpha, ring) {
 }
 
 let labelBoxes = [];
+let hitLabels = [];
+function pushHitLabel(i, tx, ty, align, baseline) {
+  const tw = ctx.measureText(L[i] || '').width;
+  let left = tx, top = ty;
+  if (align === 'center') left = tx - tw / 2;
+  else if (align === 'right') left = tx - tw;
+  if (baseline === 'middle') top = ty - 8;
+  hitLabels.push({ i: i, x: left - 6, y: top - 3, w: tw + 12, h: 20 });
+}
 function labelRank(i) {
   if (hot && hot[i] === 2) return -1;
   const tt = String((META[i] || [])[3] || '');
@@ -1113,6 +1128,7 @@ function drawLabel(i, alpha, light) {
     ty = sy(Y[i]) + r + 3;
   }
   if (!reserveLabel(tx, ty, L[i], align, baseline)) return false;
+  pushHitLabel(i, tx, ty, align, baseline);
   ctx.globalAlpha = Math.max(alpha, 0.92);
   ctx.textAlign = align;
   ctx.textBaseline = baseline;
@@ -1198,6 +1214,7 @@ function drawHubs(light) {
     if (!L[i]) continue;
     const ty = y + r + 3;
     if (!reserveLabel(x, ty, L[i], 'center', 'top')) continue;
+    pushHitLabel(i, x, ty, 'center', 'top');
     const tw = ctx.measureText(L[i]).width;
     ctx.fillStyle = light ? 'rgba(248,250,252,0.94)' : 'rgba(15,23,42,0.9)';
     roundBox(x - tw / 2 - 4, ty - 1, tw + 8, 16, 4);
@@ -1233,7 +1250,7 @@ function drawOverview(x0, y0, x1, y1, light) {
     const i = best[id];
     if (i < 0) continue;
     const bx = id % cols, by = (id / cols) | 0;
-    ctx.globalAlpha = 0.9;
+    ctx.globalAlpha = nodeAlpha(i, 0.9);
     ctx.beginPath();
     ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, 4.5, 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
@@ -1247,6 +1264,7 @@ function drawOverview(x0, y0, x1, y1, light) {
 }
 
 function draw() {
+  hitLabels = [];
   const light = isLight();
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.globalAlpha = 1;
@@ -1346,9 +1364,9 @@ function draw() {
         const ra = screenRadius(a) / zoom, rb = screenRadius(b) / zoom;
         if ((len - ra - rb) * zoom < 3) continue;
         const ux = dx / len, uy = dy / len;
-        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.28 : (bridge ? 0.9 : Math.max(dim, 0.72)));
-        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#cbd5e1' : '#64748b') : (bridge ? '#c026d3' : (light ? '#475569' : '#94a3b8')));
-        ctx.lineWidth = tagEdge ? 1 : (bridge ? 2.2 : 1.35);
+        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.55 : (bridge ? 0.9 : Math.max(dim, 0.72)));
+        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#94a3b8' : '#cbd5e1') : (bridge ? '#c026d3' : (light ? '#475569' : '#94a3b8')));
+        ctx.lineWidth = tagEdge ? 1.25 : (bridge ? 2.2 : 1.35);
         ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
         ctx.beginPath();
         ctx.moveTo(sx(ax + ux * ra), sy(ay + uy * ra));
@@ -1396,56 +1414,44 @@ function draw() {
   ctx.globalAlpha = 1;
 }
 
-function considerHit(best, i, r, cx, cy, px, py, force) {
-  if (i < 0 || (!force && !nodeVisible(i))) return best;
-  const dx = cx - px, dy = cy - py;
-  const d2 = dx * dx + dy * dy;
-  const lim = r + 6;
-  let inside = d2 <= lim * lim;
-  let score = d2;
-  if (!inside && L[i] && py >= cy + r - 2 && py <= cy + r + 18 && Math.abs(px - cx) <= 78) {
-    inside = true;
-    score = d2 + 20;
-  }
-  if (!inside) return best;
-  const rank = r * 100000 + score;
-  if (!best || rank < best.rank) return { i: i, rank: rank };
-  return best;
-}
 function hit(px, py) {
-  let best = null;
-  if (dotPick) {
-    for (let h = 0; h < hubs.length; h++) {
-      const i = hubs[h];
-      best = considerHit(best, i, hubRadius(i), sx(X[i]), sy(Y[i]), px, py, true);
-    }
-    if (best) return best.i;
-    const bin = dotBin;
-    const bx = (px / bin) | 0, by = (py / bin) | 0;
-    for (let oy = -1; oy <= 1; oy++) {
-      for (let ox = -1; ox <= 1; ox++) {
-        const cx = bx + ox, cy = by + oy;
-        if (cx < 0 || cy < 0 || cx >= dotCols) continue;
-        const id = cx + cy * dotCols;
-        if (id < 0 || id >= dotPick.length) continue;
-        const i = dotPick[id];
-        if (i < 0) continue;
-        const dx = cx * bin + bin / 2 - px;
-        const dy = cy * bin + bin / 2 - py;
-        if (dx * dx + dy * dy > 81) continue;
-        best = considerHit(best, i, 8, cx * bin + bin / 2, cy * bin + bin / 2, px, py, true);
-      }
-    }
-    return best ? best.i : -1;
+  for (let k = hitLabels.length - 1; k >= 0; k--) {
+    const b = hitLabels[k];
+    if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return b.i;
   }
-  const reach = 48 / Math.max(zoom, 0.08);
+  const reach = 64 / Math.max(zoom, 0.04);
   const x = wx(px), y = wy(py);
   const cand = cellsInView(x - reach, y - reach, x + reach, y + reach);
+  let best = -1, bestD = 1e12;
   for (let c = 0; c < cand.length; c++) {
     const i = cand[c];
-    best = considerHit(best, i, screenRadius(i), sx(X[i]), sy(Y[i]), px, py);
+    const hub = dotPick && hubMark && hubMark[i];
+    if (!nodeVisible(i) && !hub) continue;
+    const cx = sx(X[i]), cy = sy(Y[i]);
+    const dx = cx - px, dy = cy - py;
+    const d2 = dx * dx + dy * dy;
+    const r = hub ? hubRadius(i) : Math.max(screenRadius(i), 11);
+    if (d2 <= (r + 8) * (r + 8) && d2 < bestD) { best = i; bestD = d2; }
   }
-  return best ? best.i : -1;
+  if (best >= 0) return best;
+  if (!dotPick) return -1;
+  const bin = dotBin;
+  const bx = (px / bin) | 0, by = (py / bin) | 0;
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      const cx = bx + ox, cy = by + oy;
+      if (cx < 0 || cy < 0 || cx >= dotCols) continue;
+      const id = cx + cy * dotCols;
+      if (id < 0 || id >= dotPick.length) continue;
+      const i = dotPick[id];
+      if (i < 0) continue;
+      const dx = cx * bin + bin / 2 - px;
+      const dy = cy * bin + bin / 2 - py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= 144 && d2 < bestD) { best = i; bestD = d2; }
+    }
+  }
+  return best;
 }
 function drawHotMarks() {
   if (!hot) return;
@@ -1455,7 +1461,7 @@ function drawHotMarks() {
     const x = sx(X[i]), y = sy(Y[i]);
     if (x < -30 || y < -30 || x > W + 30 || y > H + 30) continue;
     const r = Math.max(hot[i] === 2 ? 10 : 6, Math.min(18, screenRadius(i)));
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = nodeAlpha(i, 1);
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
@@ -1680,32 +1686,24 @@ window.addEventListener('mousemove', function(e) {
     const ly = e.clientY - rect.top;
     hoverX = lx; hoverY = ly;
     const ni = hit(lx, ly);
+    let nextCluster = -1;
     if (ni >= 0) {
-      if (G[ni] === 0) {
-        clusterHot = clusterByColor(C[ni]);
-        if (clusterHot >= 0) showClusterTip(clusterHot, lx, ly);
-        else hideClusterTip();
-      } else {
-        clusterHot = -1;
-        hideClusterTip();
-      }
+      if (G[ni] === 0) nextCluster = clusterByColor(C[ni]);
       wrap.style.cursor = 'pointer';
     } else {
-      const ci = hitCluster(lx, ly);
-      clusterHot = ci;
-      if (ci >= 0) {
-        showClusterTip(ci, lx, ly);
-        wrap.style.cursor = 'help';
-      } else {
-        hideClusterTip();
-        wrap.style.cursor = 'grab';
-      }
+      nextCluster = hitCluster(lx, ly);
+      wrap.style.cursor = nextCluster >= 0 ? 'help' : 'grab';
     }
+    if (ni === hoverNode && nextCluster === clusterHot) return;
+    hoverNode = ni;
+    clusterHot = nextCluster;
+    if (clusterHot >= 0) showClusterTip(clusterHot, lx, ly);
+    else hideClusterTip();
     requestDraw();
     return;
   }
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
-  if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+  if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
   lastX = e.clientX; lastY = e.clientY;
   if (nodeDrag >= 0 && moved) {
     const oldX = X[nodeDrag], oldY = Y[nodeDrag];
@@ -1905,12 +1903,15 @@ function applyPayload(data) {
   document.getElementById('stat-e').textContent = data.te || 0;
   document.getElementById('stat-r').textContent = data.tr || 0;
   buildIndex();
-  buildClusters();
   clusterHot = -1;
   hideClusterTip();
   fitted = false;
   resize();
   requestDraw();
+  setTimeout(function() {
+    buildClusters();
+    requestDraw();
+  }, 0);
 }
 
 function setLoad(pct, caption) {
@@ -2056,7 +2057,7 @@ def _build_html(
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
   .leg-bridge {{ width: 22px; height: 0; border-top: 2px dashed #e879f9; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
-  .leg-dot-entity {{ background: #e2e8f0; border-color: #94a3b8; }}
+  .leg-dot-entity {{ background: #e2e8f0; border-color: #94a3b8; opacity: 0.72; }}
   .leg-dot-column {{ background: #9078C8; border-color: #7058A8; }}
   .leg-dot-value {{ background: #72B862; border-color: #529842; }}
   .leg-dot-row {{ background: #64748B; border-color: #94A3B8; }}
