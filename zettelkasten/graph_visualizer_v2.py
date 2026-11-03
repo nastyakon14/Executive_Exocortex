@@ -51,20 +51,128 @@ def _public_source_url(url: str) -> str:
         return text
 
 
-def _find_root_luhmann(luhmann_id: str, parent_by_luhmann: dict) -> str:
-    current = luhmann_id
-    seen = set()
-    while parent_by_luhmann.get(current) and current not in seen:
-        seen.add(current)
-        current = parent_by_luhmann[current]
-    return current
+def _root_lookup(parent_by_luhmann: dict):
+    """Корень каждой ветки за один проход по цепочке, без рекурсии."""
+    memo: dict[str, str] = {}
+
+    def root_of(luhmann_id: str) -> str:
+        cached = memo.get(luhmann_id)
+        if cached:
+            return cached
+        chain: list[str] = []
+        seen: set[str] = set()
+        current = luhmann_id
+        while current and current not in memo and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            current = parent_by_luhmann.get(current)
+        if current in memo:
+            found = memo[current]
+        elif chain:
+            found = chain[-1]
+        else:
+            found = luhmann_id
+        for node in chain:
+            memo[node] = found
+        return found
+
+    return root_of
+
+
+def _node_depths(parent_by_luhmann: dict, ids: list[str]) -> dict[str, int]:
+    depth: dict[str, int] = {}
+    for lid in ids:
+        if lid in depth:
+            continue
+        chain: list[str] = []
+        seen: set[str] = set()
+        current = lid
+        while current and current not in depth and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            current = parent_by_luhmann.get(current)
+        if current in depth and current not in seen:
+            base = depth[current] + 1
+        else:
+            base = 0
+        for node in reversed(chain):
+            depth[node] = base
+            base += 1
+    return depth
+
+
+def _tree_metrics(order: list[str], kids_of) -> tuple[dict[str, int], dict[str, int]]:
+    """Число листьев и глубина дерева. Явный стек, чтобы длинная ветка не падала по рекурсии."""
+    leaves: dict[str, int] = {}
+    depths: dict[str, int] = {}
+    color: dict[str, int] = {}
+    for start in order:
+        if color.get(start) == 2:
+            continue
+        stack: list[tuple[str, bool]] = [(start, False)]
+        while stack:
+            lid, expanded = stack.pop()
+            if expanded:
+                children = kids_of(lid)
+                if children:
+                    leaves[lid] = max(sum(leaves.get(child, 1) for child in children), 1)
+                    depths[lid] = 1 + max(depths.get(child, 0) for child in children)
+                else:
+                    leaves[lid] = 1
+                    depths[lid] = 1
+                color[lid] = 2
+                continue
+            if color.get(lid) == 2:
+                continue
+            if color.get(lid) == 1:
+                leaves[lid] = 1
+                depths[lid] = 1
+                color[lid] = 2
+                continue
+            color[lid] = 1
+            stack.append((lid, True))
+            for child in reversed(kids_of(lid)):
+                state = color.get(child, 0)
+                if state == 0:
+                    stack.append((child, False))
+    return leaves, depths
+
+
+def _place_tree(
+    root: str,
+    x_left: float,
+    y: float,
+    kids_of,
+    leaves: dict[str, int],
+    x_unit: float,
+    y_gap: float,
+    luhmann_to_id: dict[str, str],
+    pos: dict,
+) -> None:
+    stack: list[tuple[str, float, float]] = [(root, x_left, y)]
+    guard: set[str] = set()
+    while stack:
+        lid, left, row_y = stack.pop()
+        if lid in guard:
+            continue
+        guard.add(lid)
+        width = leaves.get(lid, 1) * x_unit
+        zid = luhmann_to_id.get(lid)
+        if zid:
+            pos[zid] = (left + width / 2, row_y)
+        cursor = left
+        frames: list[tuple[str, float, float]] = []
+        for child in kids_of(lid):
+            child_w = leaves.get(child, 1) * x_unit
+            frames.append((child, cursor, row_y + y_gap))
+            cursor += child_w
+        for frame in reversed(frames):
+            stack.append(frame)
 
 
 def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
-    roots = sorted(
-        {_find_root_luhmann(z["luhmann_id"], parent_by_luhmann) for z in zettels},
-        key=_luhmann_sort_key,
-    )
+    root_of = _root_lookup(parent_by_luhmann)
+    roots = sorted({root_of(z["luhmann_id"]) for z in zettels}, key=_luhmann_sort_key)
     return {root: _BRANCH_PALETTE[i % len(_BRANCH_PALETTE)] for i, root in enumerate(roots)}
 
 
@@ -107,37 +215,19 @@ def _excel_value_circle(count: int) -> tuple[float, list[tuple[float, float]]]:
 
 
 def _column_orbits(outers: list[float]) -> list[float]:
-    """Маленькие круги ближе к листу, большие чуть дальше. Соседи не пересекаются."""
+    """Радиус столбца за один проход: соседние круги не пересекаются."""
     n = len(outers)
     if n == 0:
         return []
     if n == 1:
         return [max(120.0, outers[0] + 72.0)]
-    radii = [outer + 72.0 for outer in outers]
-    theta = 2 * math.pi / n
-    for _ in range(n * 6):
-        moved = False
-        for index in range(n):
-            for nxt in range(index + 1, n):
-                steps = min(abs(index - nxt), n - abs(index - nxt))
-                ang = steps * theta
-                dist = math.sqrt(
-                    radii[index] ** 2
-                    + radii[nxt] ** 2
-                    - 2 * radii[index] * radii[nxt] * math.cos(ang)
-                )
-                need = outers[index] + outers[nxt] + 18.0
-                if dist + 0.5 >= need:
-                    continue
-                deficit = need - dist
-                weight_i = outers[index] + 24.0
-                weight_j = outers[nxt] + 24.0
-                radii[index] += deficit * weight_i / (weight_i + weight_j) * 0.9
-                radii[nxt] += deficit * weight_j / (weight_i + weight_j) * 0.9
-                moved = True
-        if not moved:
-            break
-    if outers and max(outers) <= min(outers) * 1.35:
+    sin_half = math.sin(math.pi / n) or 1e-6
+    radii = []
+    for index, outer in enumerate(outers):
+        nxt = outers[(index + 1) % n]
+        need = (outer + nxt + 18.0) / (2 * sin_half)
+        radii.append(max(outer + 72.0, need))
+    if max(outers) <= min(outers) * 1.35:
         peak = max(radii)
         return [peak for _ in radii]
     return radii
@@ -192,7 +282,6 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
 
     x_unit = 150
     y_gap = 165
-    leaf_memo: dict[str, int] = {}
 
     def structural_kids(lid: str) -> list[str]:
         return [
@@ -200,35 +289,8 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             if child in known and type_by_lid.get(child) != "excel_row"
         ]
 
-    def leaf_count(lid: str, stack: set[str]) -> int:
-        cached = leaf_memo.get(lid)
-        if cached is not None:
-            return cached
-        if lid in stack:
-            return 1
-        stack.add(lid)
-        kids = structural_kids(lid)
-        total = sum(leaf_count(c, stack) for c in kids) if kids else 1
-        stack.remove(lid)
-        leaf_memo[lid] = max(total, 1)
-        return leaf_memo[lid]
-
+    leaf_memo, depth_memo = _tree_metrics(order, structural_kids)
     pos: Dict[str, Tuple[float, float]] = {}
-
-    def place(lid: str, x_left: float, y: float, stack: set[str]) -> None:
-        if lid in stack:
-            return
-        stack.add(lid)
-        width = leaf_count(lid, set()) * x_unit
-        zid = luhmann_to_id.get(lid)
-        if zid:
-            pos[zid] = (x_left + width / 2, y)
-        cursor = x_left
-        for child in structural_kids(lid):
-            child_w = leaf_count(child, set()) * x_unit
-            place(child, cursor, y + y_gap, stack)
-            cursor += child_w
-        stack.remove(lid)
 
     def excel_layout(sheet_lid: str) -> tuple[list[tuple[str, list[str], float, list[tuple[float, float]]]], float]:
         cols = [c for c in children[sheet_lid] if type_by_lid.get(c) == "excel_column"]
@@ -279,21 +341,6 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         span = 2.0 * bound + 36.0
         return span, span
 
-    depth_memo: dict[str, int] = {}
-
-    def tree_depth(lid: str, stack: set[str]) -> int:
-        cached = depth_memo.get(lid)
-        if cached is not None:
-            return cached
-        if lid in stack:
-            return 0
-        stack.add(lid)
-        kids = structural_kids(lid)
-        depth = 1 + max((tree_depth(c, stack) for c in kids), default=0)
-        stack.remove(lid)
-        depth_memo[lid] = depth
-        return depth
-
     excel_roots = [lid for lid in roots if type_by_lid.get(lid) == "excel_sheet"]
     other_roots = [lid for lid in roots if type_by_lid.get(lid) != "excel_sheet"]
 
@@ -313,13 +360,13 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         row_h = max(row_h, span_w)
 
     for root in other_roots:
-        width = leaf_count(root, set()) * x_unit
-        height = tree_depth(root, set()) * y_gap
+        width = leaf_memo.get(root, 1) * x_unit
+        height = depth_memo.get(root, 1) * y_gap
         if x_cursor > 0 and x_cursor + width > row_limit:
             x_cursor = 0.0
             y_cursor += row_h + 260
             row_h = 0.0
-        place(root, x_cursor, y_cursor, set())
+        _place_tree(root, x_cursor, y_cursor, structural_kids, leaf_memo, x_unit, y_gap, luhmann_to_id, pos)
         x_cursor += width + 110
         row_h = max(row_h, height)
 
@@ -414,25 +461,8 @@ def _thought_size(depth: int) -> int:
 
 def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int, int]:
     parent_by_luhmann = {z["luhmann_id"]: z.get("parent_luhmann") for z in graph_data["zettels"]}
-    depth_by_luhmann: dict[str, int] = {}
-
-    def calc_depth(luhmann_id: str, stack=None) -> int:
-        if luhmann_id in depth_by_luhmann:
-            return depth_by_luhmann[luhmann_id]
-        if stack is None:
-            stack = set()
-        if luhmann_id in stack:
-            depth_by_luhmann[luhmann_id] = 0
-            return 0
-        parent_l = parent_by_luhmann.get(luhmann_id)
-        if not parent_l:
-            depth_by_luhmann[luhmann_id] = 0
-            return 0
-        stack.add(luhmann_id)
-        depth = calc_depth(parent_l, stack) + 1
-        stack.remove(luhmann_id)
-        depth_by_luhmann[luhmann_id] = depth
-        return depth
+    depth_by_luhmann = _node_depths(parent_by_luhmann, [z["luhmann_id"] for z in graph_data["zettels"]])
+    root_of = _root_lookup(parent_by_luhmann)
 
     branch_colors = _assign_branch_colors(graph_data["zettels"], parent_by_luhmann)
     color_index = {root: i % len(_BRANCH_PALETTE) for i, root in enumerate(branch_colors)}
@@ -453,14 +483,14 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         nid = z["zettel_id"]
         if nid in id_index:
             continue
-        depth = calc_depth(z["luhmann_id"])
+        depth = depth_by_luhmann.get(z["luhmann_id"], 0)
         topic = z.get("topic") or ""
         content = z.get("content") or ""
         tags = list(z.get("tags") or [])
         tt = z.get("thought_type") or ""
         display = topic.strip() or content
         xy = positions.get(nid, (0.0, 0.0))
-        root = _find_root_luhmann(z["luhmann_id"], parent_by_luhmann)
+        root = root_of(z["luhmann_id"])
         id_index[nid] = len(nodes)
         group, radius, color = _excel_node_style(
             tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth, value_degree.get(nid, 0),
@@ -475,17 +505,27 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "l": label,
         })
         preview = f"{topic}: {_short_text(content, 100)}" if topic else _short_text(content, 120)
+        quote = z.get("source_quote") or ""
+        source = z.get("source_input") or ""
         meta.append([
             z["luhmann_id"],
             z.get("parent_luhmann") or "",
-            topic,
+            _short_text(topic, 180),
             tt,
-            ", ".join(tags),
-            _short_text(content, 2500),
+            ", ".join(tags[:8]),
+            _short_text(content, 480),
             preview,
-            " ".join([z["luhmann_id"], topic, content[:180], " ".join(tags), tt, z.get("source_input") or "", z.get("source_quote") or ""]).lower(),
-            _public_source_url(z.get("source_input") or "text"),
-            z.get("source_quote") or "",
+            " ".join([
+                z["luhmann_id"],
+                topic,
+                _short_text(content, 160),
+                " ".join(tags[:8]),
+                tt,
+                _short_text(source, 80),
+                _short_text(quote, 80),
+            ]).lower(),
+            _public_source_url(source or "text"),
+            _short_text(quote, 360),
         ])
 
     for e in graph_data["entities"]:
@@ -802,7 +842,7 @@ function buildIndex() {
   hay = new Array(N);
   for (let i = 0; i < N; i++) {
     const m = META[i] || [];
-    hay[i] = ((m[7] || '') + ' ' + (L[i] || '') + ' ' + (m[2] || '') + ' ' + (m[4] || '') + ' ' + (m[5] || '')).toLowerCase();
+    hay[i] = ((m[7] || '') + ' ' + (L[i] || '')).toLowerCase();
   }
 }
 
@@ -890,19 +930,17 @@ function reindexNode(i, oldX, oldY) {
 function cellsInView(x0, y0, x1, y1) {
   const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
   const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
-  const ncells = (cx1 - cx0 + 1) * (cy1 - cy0 + 1);
-  if (ncells > 450) {
-    const out = [];
-    for (let i = 0; i < N; i++) {
-      if (X[i] >= x0 && X[i] <= x1 && Y[i] >= y0 && Y[i] <= y1) out.push(i);
-    }
-    return out;
-  }
+  const ncx = Math.max(1, cx1 - cx0 + 1);
+  const ncy = Math.max(1, cy1 - cy0 + 1);
+  let step = 1;
+  if (ncx * ncy > 700) step = Math.ceil(Math.sqrt((ncx * ncy) / 700));
   const out = [];
-  for (let cx = cx0; cx <= cx1; cx++) {
-    for (let cy = cy0; cy <= cy1; cy++) {
+  for (let cx = cx0; cx <= cx1; cx += step) {
+    for (let cy = cy0; cy <= cy1; cy += step) {
       const b = grid.get(cx + ':' + cy);
-      if (b) for (let i = 0; i < b.length; i++) out.push(b[i]);
+      if (!b) continue;
+      const take = b.length > 80 ? 80 : b.length;
+      for (let i = 0; i < take; i++) out.push(b[i]);
     }
   }
   return out;
@@ -994,6 +1032,42 @@ function drawLabel(i, alpha, light) {
   return true;
 }
 
+function drawOverview(x0, y0, x1, y1) {
+  const bin = 4;
+  const cols = Math.ceil(W / bin) + 2;
+  const rows = Math.ceil(H / bin) + 2;
+  const used = new Uint8Array(cols * rows);
+  const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
+  const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
+  const walkAll = (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > grid.size * 2;
+  function paintNode(i) {
+    if (!nodeVisible(i)) return;
+    const px = sx(X[i]), py = sy(Y[i]);
+    if (px < -bin || py < -bin || px > W + bin || py > H + bin) return;
+    const bx = (px / bin) | 0, by = (py / bin) | 0;
+    if (bx < 0 || by < 0 || bx >= cols || by >= rows) return;
+    const id = bx + by * cols;
+    if (used[id]) return;
+    used[id] = 1;
+    ctx.fillStyle = fillOf(i);
+    ctx.fillRect(bx * bin, by * bin, bin - 1, bin - 1);
+  }
+  if (walkAll) {
+    grid.forEach(function(bucket) {
+      const i = bucket[0];
+      if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) return;
+      paintNode(i);
+    });
+    return;
+  }
+  for (let cx = cx0; cx <= cx1; cx++) {
+    for (let cy = cy0; cy <= cy1; cy++) {
+      const bucket = grid.get(cx + ':' + cy);
+      if (bucket) paintNode(bucket[0]);
+    }
+  }
+}
+
 function draw() {
   const light = isLight();
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1008,15 +1082,21 @@ function draw() {
     ctx.fillText('Граф пуст', W / 2, H / 2);
     return;
   }
-  const pad = 90 / zoom;
+  const pad = 90 / Math.max(zoom, 0.001);
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
+  const overview = zoom < 0.2 && !hot;
+  if (overview) {
+    drawOverview(x0, y0, x1, y1, light);
+    ctx.globalAlpha = 1;
+    return;
+  }
   const vis = cellsInView(x0, y0, x1, y1);
   const showTags = tagsOn && zoom >= 0.32;
-  const showEdges = zoom >= 0.06;
-  const showLabels = zoom >= 0.16;
+  const showEdges = zoom >= 0.2;
+  const showLabels = zoom >= 0.28;
   const dim = hot ? 0.16 : 1;
-  const maxE = zoom < 0.14 ? 4500 : 9000;
-  const maxN = zoom < 0.2 ? 2800 : 5500;
+  const maxE = zoom < 0.45 ? 1800 : 5000;
+  const maxN = vis.length > 6000 ? 4000 : vis.length;
 
   // Показываем облака кластеров только на общем плане, чтобы не шуметь при приближении.
   if (zoom <= 0.85 || clusterHot >= 0) {
@@ -1040,30 +1120,36 @@ function draw() {
     }
   }
 
-  if (showEdges) {
+  if (showEdges && adjOff) {
     let drawn = 0;
     ctx.lineWidth = Math.max(0.7, Math.min(2.2, zoom * 1.2));
-    for (let i = 0; i < E && drawn < maxE; i++) {
-      const k = EFLAT[i * 3 + 2];
-      if (k === 1 && !showTags) continue;
-      const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1];
-      const rowEdge = G[a] === 2 || G[b] === 2;
-      const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
-      const bridge = k === 3;
-      if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
-      if (!bridge && rowEdge && selected !== a && selected !== b) continue;
-      if (!nodeVisible(a) || !nodeVisible(b)) continue;
-      const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
-      if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
-      ctx.globalAlpha = focusEdge ? 1 : (bridge ? 0.9 : dim);
-      ctx.strokeStyle = focusEdge ? '#60a5fa' : (bridge ? '#e879f9' : (light ? '#9ca3af' : '#9CA3AF'));
-      ctx.lineWidth = bridge ? Math.max(1.5, Math.min(2.6, zoom * 1.6)) : Math.max(0.7, Math.min(2.2, zoom * 1.2));
-      ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
-      ctx.beginPath();
-      ctx.moveTo(sx(ax), sy(ay));
-      ctx.lineTo(sx(bx), sy(by));
-      ctx.stroke();
-      drawn++;
+    for (let v = 0; v < vis.length && drawn < maxE; v++) {
+      const a = vis[v];
+      if (!nodeVisible(a)) continue;
+      const start = adjOff[a], end = adjOff[a + 1];
+      for (let p = start; p < end && drawn < maxE; p++) {
+        const b = adjTo[p];
+        if (b < a) continue;
+        const k = adjK[p];
+        if (k === 1 && !showTags) continue;
+        const rowEdge = G[a] === 2 || G[b] === 2;
+        const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
+        const bridge = k === 3;
+        if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
+        if (!bridge && rowEdge && selected !== a && selected !== b) continue;
+        if (!nodeVisible(b)) continue;
+        const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
+        if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
+        ctx.globalAlpha = focusEdge ? 1 : (bridge ? 0.9 : dim);
+        ctx.strokeStyle = focusEdge ? '#60a5fa' : (bridge ? '#e879f9' : (light ? '#9ca3af' : '#9CA3AF'));
+        ctx.lineWidth = bridge ? Math.max(1.5, Math.min(2.6, zoom * 1.6)) : Math.max(0.7, Math.min(2.2, zoom * 1.2));
+        ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
+        ctx.beginPath();
+        ctx.moveTo(sx(ax), sy(ay));
+        ctx.lineTo(sx(bx), sy(by));
+        ctx.stroke();
+        drawn++;
+      }
     }
     ctx.setLineDash([]);
   }
@@ -1298,7 +1384,7 @@ function fit() {
   camY = (minY + maxY) / 2;
   const dx = Math.max(maxX - minX, 200);
   const dy = Math.max(maxY - minY, 200);
-  zoom = Math.max(0.04, Math.min(1.4, Math.min((W - 80) / dx, (H - 80) / dy)));
+  zoom = Math.max(0.001, Math.min(1.4, Math.min((W - 80) / dx, (H - 80) / dy)));
 }
 
 wrap.addEventListener('mousedown', function(e) {
@@ -1370,7 +1456,7 @@ window.addEventListener('mousemove', function(e) {
 function applyZoomAt(mx, my, factor) {
   if (!factor || factor === 1) return;
   const beforeX = wx(mx), beforeY = wy(my);
-  zoom = Math.max(0.03, Math.min(3.5, zoom * factor));
+  zoom = Math.max(0.001, Math.min(3.5, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
   camY = beforeY - (my - H / 2) / zoom;
   requestDraw();
