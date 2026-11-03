@@ -1308,7 +1308,7 @@ function draw() {
   const showEdges = true;
   const showLabels = true;
   const dim = hot ? 0.16 : 1;
-  const maxE = 3500;
+  const maxE = vis.length < 900 ? 24000 : 8000;
   const maxN = vis.length;
 
   // Показываем облака кластеров только на общем плане, чтобы не шуметь при приближении.
@@ -1358,7 +1358,7 @@ function draw() {
       const start = adjOff[a], end = adjOff[a + 1];
       for (let p = start; p < end && drawn < maxE; p++) {
         const b = adjTo[p];
-        if (b < a || !painted[b]) continue;
+        if (painted[b] && b < a) continue;
         const k = adjK[p];
         if (k === 1 && !showTags) continue;
         const rowEdge = G[a] === 2 || G[b] === 2;
@@ -1368,16 +1368,16 @@ function draw() {
         if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
         if (!bridge && rowEdge && selected !== a && selected !== b) continue;
         const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
-        if (ax < x0 || ax > x1 || ay < y0 || ay > y1 || bx < x0 || bx > x1 || by < y0 || by > y1) continue;
+        if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
         const dx = bx - ax, dy = by - ay;
         const len = Math.hypot(dx, dy);
         if (len < 1) continue;
         const ra = screenRadius(a) / zoom, rb = screenRadius(b) / zoom;
-        if ((len - ra - rb) * zoom < 3) continue;
+        if ((len - ra - rb) * zoom < 1) continue;
         const ux = dx / len, uy = dy / len;
-        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.55 : (bridge ? 0.9 : Math.max(dim, 0.72)));
-        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#94a3b8' : '#cbd5e1') : (bridge ? '#c026d3' : (light ? '#475569' : '#94a3b8')));
-        ctx.lineWidth = tagEdge ? 1.25 : (bridge ? 2.2 : 1.35);
+        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.34 : (bridge ? 0.72 : Math.max(dim, 0.5)));
+        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#cbd5e1' : '#64748b') : (bridge ? '#c026d3' : (light ? '#64748b' : '#94a3b8')));
+        ctx.lineWidth = tagEdge ? 1 : (bridge ? 2 : 1.2);
         ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
         ctx.beginPath();
         ctx.moveTo(sx(ax + ux * ra), sy(ay + uy * ra));
@@ -1737,7 +1737,7 @@ window.addEventListener('mousemove', function(e) {
 function applyZoomAt(mx, my, factor) {
   if (!factor || factor === 1) return;
   const beforeX = wx(mx), beforeY = wy(my);
-  zoom = Math.max(0.001, Math.min(3.5, zoom * factor));
+  zoom = Math.max(1e-8, Math.min(3.5, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
   camY = beforeY - (my - H / 2) / zoom;
   requestDraw();
