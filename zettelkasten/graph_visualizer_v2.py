@@ -200,7 +200,7 @@ def _excel_value_circle(count: int) -> tuple[float, list[tuple[float, float]]]:
     placed = 0
     ring = 0
     outer = 48.0
-    while placed < count and ring < 18:
+    while placed < count and ring < 40:
         vr = 86.0 + ring * spacing
         cap = max(6, int(2 * math.pi * vr / spacing))
         take = min(cap, count - placed)
@@ -226,7 +226,7 @@ def _column_orbits(outers: list[float]) -> list[float]:
     for index, outer in enumerate(outers):
         nxt = outers[(index + 1) % n]
         need = (outer + nxt + 18.0) / (2 * sin_half)
-        radii.append(max(outer + 72.0, need))
+        radii.append(min(4800.0, max(outer + 72.0, need)))
     if max(outers) <= min(outers) * 1.35:
         peak = max(radii)
         return [peak for _ in radii]
@@ -389,6 +389,16 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             place_excel_sheet(lid, left + width / 2, top + height / 2)
         else:
             _place_tree(lid, left, top, structural_kids, leaf_memo, x_unit, y_gap, luhmann_to_id, pos)
+
+    missing = [z for z in zettels if z["zettel_id"] not in pos]
+    if missing:
+        placed_x = [point[0] for point in pos.values()] or [0.0]
+        placed_y = [point[1] for point in pos.values()] or [0.0]
+        left = max(placed_x) + 180.0
+        top = min(placed_y)
+        cols = max(1, int(math.sqrt(len(missing))))
+        for index, zettel in enumerate(missing):
+            pos[zettel["zettel_id"]] = (left + (index % cols) * 72.0, top + (index // cols) * 72.0)
 
     excel_zids = {
         z["zettel_id"] for z in zettels if (z.get("thought_type") or "") in _EXCEL_TYPES
@@ -1270,6 +1280,7 @@ function draw() {
   ctx.globalAlpha = 1;
   ctx.fillStyle = light ? '#f8fafc' : '#0b1220';
   ctx.fillRect(0, 0, W, H);
+  if (!fitted) fit();
   if (!N) {
     ctx.fillStyle = light ? '#6b7280' : '#94a3b8';
     ctx.font = '16px Arial';
@@ -1641,21 +1652,27 @@ function focusNode(idx) {
 
 function fit() {
   if (!N || W < 80 || H < 80) return;
+  const useHubs = hubs.length > 2;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (let i = 0; i < N; i++) {
-    if (!tagsOn && G[i] === 1) continue;
-    if (G[i] === 2) continue;
-    if (X[i] < minX) minX = X[i];
-    if (Y[i] < minY) minY = Y[i];
-    if (X[i] > maxX) maxX = X[i];
-    if (Y[i] > maxY) maxY = Y[i];
+  const total = useHubs ? hubs.length : N;
+  for (let k = 0; k < total; k++) {
+    const i = useHubs ? hubs[k] : k;
+    if (!useHubs && !tagsOn && G[i] === 1) continue;
+    if (!useHubs && G[i] === 2) continue;
+    const x = X[i], y = Y[i];
+    if (!isFinite(x) || !isFinite(y)) continue;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
   }
   if (!isFinite(minX)) return;
   camX = (minX + maxX) / 2;
   camY = (minY + maxY) / 2;
   const dx = Math.max(maxX - minX, 200);
   const dy = Math.max(maxY - minY, 200);
-  zoom = Math.max(0.001, Math.min(1.4, Math.min((W - 80) / dx, (H - 80) / dy)));
+  const next = Math.min((W - 80) / dx, (H - 80) / dy);
+  zoom = Math.min(1.4, next > 0 && isFinite(next) ? next : 0.2);
   fitted = true;
 }
 
