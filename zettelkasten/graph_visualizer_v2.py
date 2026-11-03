@@ -642,7 +642,7 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "n": n,
         "x": [float(nodes[i]["x"]) for i in range(n)],
         "y": [float(nodes[i]["y"]) for i in range(n)],
-        "r": [max(8, int(round(nodes[i]["r"] * 0.5))) for i in range(n)],
+        "r": [max(11, int(round(nodes[i]["r"] * 0.66))) for i in range(n)],
         "g": [int(nodes[i]["g"]) for i in range(n)],
         "c": [int(nodes[i]["c"]) for i in range(n)],
         "l": [nodes[i]["l"] for i in range(n)],
@@ -965,13 +965,13 @@ function requestDraw() {
 
 function drawNode(i, alpha, ring) {
   const x = sx(X[i]), y = sy(Y[i]);
-  const r = Math.max(3, R[i] * zoom);
+  const r = Math.max(6, R[i] * zoom);
   ctx.globalAlpha = alpha;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fillStyle = fillOf(i);
   ctx.fill();
-  ctx.lineWidth = G[i] ? 2 : 1.6;
+  ctx.lineWidth = ring ? 2.6 : (G[i] ? 2.2 : 1.8);
   ctx.strokeStyle = ring ? '#60a5fa' : strokeOf(i);
   ctx.stroke();
 }
@@ -1005,8 +1005,8 @@ function reserveLabel(x, y, text, align, baseline) {
 function drawLabel(i, alpha, light) {
   const tt = String((META[i] || [])[3] || '');
   const excelNode = tt.indexOf('excel_') === 0;
-  const r = Math.max(3, R[i] * zoom);
-  if (r < 7 && G[i] !== 2 && !excelNode) return false;
+  const r = Math.max(6, R[i] * zoom);
+  if (r < 8 && G[i] !== 2 && !excelNode) return false;
   if (!L[i]) return false;
   const excel = excelNode && tt !== 'excel_sheet';
   ctx.font = Math.max(10, Math.min(13, 11 * zoom)) + 'px Arial';
@@ -1032,14 +1032,62 @@ function drawLabel(i, alpha, light) {
   return true;
 }
 
-function drawOverview(x0, y0, x1, y1) {
-  const bin = 4;
+function roundBox(x, y, w, h, radius) {
+  const r = Math.min(radius, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function drawBranchCaptions(light) {
+  const items = clusters.slice().sort(function(a, b) { return b.n - a.n; });
+  ctx.font = '600 13px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const taken = [];
+  for (let i = 0; i < items.length; i++) {
+    const c = items[i];
+    const px = sx(c.cx), py = sy(c.cy);
+    if (px < 24 || py < 20 || px > W - 24 || py > H - 20) continue;
+    let crowded = false;
+    for (let k = 0; k < taken.length; k++) {
+      if (Math.abs(taken[k][0] - px) < 130 && Math.abs(taken[k][1] - py) < 34) {
+        crowded = true;
+        break;
+      }
+    }
+    if (crowded) continue;
+    taken.push([px, py]);
+    const raw = (c.topics && c.topics[0]) ? c.topics[0] : 'Ветка';
+    const name = raw.length > 22 ? raw.slice(0, 21) + '…' : raw;
+    const text = name + ' · ' + c.n;
+    const w = Math.min(240, ctx.measureText(text).width + 18);
+    const pal = PAL[c.color % PAL.length];
+    ctx.globalAlpha = 0.94;
+    ctx.fillStyle = light ? 'rgba(255,255,255,0.94)' : 'rgba(15,23,42,0.9)';
+    roundBox(px - w / 2, py - 13, w, 26, 8);
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = pal[1];
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = light ? '#0f172a' : '#f8fafc';
+    ctx.fillText(text, px, py);
+  }
+}
+function drawOverview(x0, y0, x1, y1, light) {
+  const bin = 11;
+  const dot = 5.5;
   const cols = Math.ceil(W / bin) + 2;
   const rows = Math.ceil(H / bin) + 2;
   const used = new Uint8Array(cols * rows);
   const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
   const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
   const walkAll = (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > grid.size * 2;
+  const outline = light ? '#ffffff' : '#0b1220';
   function paintNode(i) {
     if (!nodeVisible(i)) return;
     const px = sx(X[i]), py = sy(Y[i]);
@@ -1049,8 +1097,14 @@ function drawOverview(x0, y0, x1, y1) {
     const id = bx + by * cols;
     if (used[id]) return;
     used[id] = 1;
+    ctx.globalAlpha = 0.95;
+    ctx.beginPath();
+    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, dot, 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
-    ctx.fillRect(bx * bin, by * bin, bin - 1, bin - 1);
+    ctx.fill();
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = outline;
+    ctx.stroke();
   }
   if (walkAll) {
     grid.forEach(function(bucket) {
@@ -1058,14 +1112,15 @@ function drawOverview(x0, y0, x1, y1) {
       if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) return;
       paintNode(i);
     });
-    return;
-  }
-  for (let cx = cx0; cx <= cx1; cx++) {
-    for (let cy = cy0; cy <= cy1; cy++) {
-      const bucket = grid.get(cx + ':' + cy);
-      if (bucket) paintNode(bucket[0]);
+  } else {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      for (let cy = cy0; cy <= cy1; cy++) {
+        const bucket = grid.get(cx + ':' + cy);
+        if (bucket) paintNode(bucket[0]);
+      }
     }
   }
+  drawBranchCaptions(light);
 }
 
 function draw() {
@@ -1093,7 +1148,7 @@ function draw() {
   const vis = cellsInView(x0, y0, x1, y1);
   const showTags = tagsOn && zoom >= 0.32;
   const showEdges = zoom >= 0.2;
-  const showLabels = zoom >= 0.28;
+  const showLabels = zoom >= 0.22;
   const dim = hot ? 0.16 : 1;
   const maxE = zoom < 0.45 ? 1800 : 5000;
   const maxN = vis.length > 6000 ? 4000 : vis.length;
@@ -1108,13 +1163,13 @@ function draw() {
       if (sx0 + sr < -30 || sx0 - sr > W + 30 || sy0 + sr < -30 || sy0 - sr > H + 30) continue;
       const pal = PAL[c.color % PAL.length];
       const active = clusterHot === ci;
-      ctx.globalAlpha = active ? 0.12 : 0.05;
+      ctx.globalAlpha = active ? 0.16 : 0.1;
       ctx.beginPath();
       ctx.arc(sx0, sy0, sr, 0, Math.PI * 2);
       ctx.fillStyle = pal[0];
       ctx.fill();
-      ctx.globalAlpha = active ? 0.45 : 0.16;
-      ctx.lineWidth = active ? 1.8 : 1.0;
+      ctx.globalAlpha = active ? 0.7 : 0.34;
+      ctx.lineWidth = active ? 2.2 : 1.4;
       ctx.strokeStyle = pal[1];
       ctx.stroke();
     }
@@ -1141,8 +1196,8 @@ function draw() {
         const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
         if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
         ctx.globalAlpha = focusEdge ? 1 : (bridge ? 0.9 : dim);
-        ctx.strokeStyle = focusEdge ? '#60a5fa' : (bridge ? '#e879f9' : (light ? '#9ca3af' : '#9CA3AF'));
-        ctx.lineWidth = bridge ? Math.max(1.5, Math.min(2.6, zoom * 1.6)) : Math.max(0.7, Math.min(2.2, zoom * 1.2));
+        ctx.strokeStyle = focusEdge ? '#2563eb' : (bridge ? '#c026d3' : (light ? '#64748b' : '#cbd5e1'));
+        ctx.lineWidth = bridge ? Math.max(1.8, Math.min(2.8, zoom * 1.6)) : Math.max(1.15, Math.min(2.4, zoom * 1.25));
         ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
         ctx.beginPath();
         ctx.moveTo(sx(ax), sy(ay));
@@ -1809,16 +1864,16 @@ def _build_html(
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
-  <div id="graph-hint">Лист в центре, столбцы вокруг него. Пунктир — тот же столбец или значение на другом листе. Строки видны только по клику на значение.</div>
+  <div id="graph-hint">Цвет — одна ветка, подпись показывает тему и число карточек. Приблизьте, чтобы увидеть узлы и связи. Клик открывает карточку. У таблицы строки появляются по клику на значение.</div>
   <div id="load-hint">Загрузка графа…</div>
   <div id="cluster-tip"></div>
 </div>
 <div id="legend">
   <h3>Легенда</h3>
-  <div class="leg-item"><div class="leg-dot leg-dot-thought"></div> Лист / мысль</div>
-  <div class="leg-item"><div class="leg-dot leg-dot-column"></div> Столбец</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-thought"></div> Карточка</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-column"></div> Столбец таблицы</div>
   <div class="leg-item"><div class="leg-dot leg-dot-value"></div> Значение</div>
-  <div class="leg-item"><div class="leg-dot leg-dot-row"></div> Строка</div>
+  <div class="leg-item"><div class="leg-dot leg-dot-row"></div> Строка таблицы</div>
   <div class="leg-item"><div class="leg-dot leg-dot-entity"></div> Тег</div>
   <div class="leg-item"><div class="leg-bridge"></div> То же на другом листе</div>
 </div>
