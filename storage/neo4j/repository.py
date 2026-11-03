@@ -1238,10 +1238,12 @@ class ZettelRepository:
         entities_result = self.client.execute_read(entities_query, params)
 
         prefix_by_uid: Dict[str, str] = {}
+        project_by_uid: Dict[str, str] = {}
         if prefix_luhmann:
             for uid in user_ids:
-                label = labels.get(uid, uid)
-                prefix_by_uid[uid] = re.sub(r"\s+", " ", label).strip()[:18] or uid
+                label = re.sub(r"\s+", " ", labels.get(uid, uid)).strip() or uid
+                prefix_by_uid[uid] = label[:18]
+                project_by_uid[uid] = label[:80]
 
         zettels = []
         for row in nodes_result:
@@ -1264,6 +1266,7 @@ class ZettelRepository:
                 "parent_luhmann": parent_luhmann,
                 "source_input": row.get("source_input") or "text",
                 "source_quote": row.get("source_quote") or "",
+                "project": project_by_uid.get(uid, "") if prefix_luhmann else "",
             })
 
         entities = []

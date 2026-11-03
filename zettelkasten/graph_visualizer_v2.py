@@ -183,10 +183,10 @@ def _excel_value_circle(count: int) -> tuple[float, list[tuple[float, float]]]:
     """Значения по окружности вокруг столбца. Если их много — несколько колец."""
     if count <= 0:
         return 40.0, []
-    spacing = 50.0
+    spacing = 58.0
     if count == 1:
-        return 62.0, [(48.0, 0.0)]
-    one_r = max(48.0, spacing * count / (2 * math.pi))
+        return 104.0, [(86.0, 0.0)]
+    one_r = max(86.0, spacing * count / (2 * math.pi))
     if one_r <= 155.0:
         offsets = [
             (one_r * math.cos(ang), one_r * math.sin(ang))
@@ -201,7 +201,7 @@ def _excel_value_circle(count: int) -> tuple[float, list[tuple[float, float]]]:
     ring = 0
     outer = 48.0
     while placed < count and ring < 18:
-        vr = 56.0 + ring * spacing
+        vr = 86.0 + ring * spacing
         cap = max(6, int(2 * math.pi * vr / spacing))
         take = min(cap, count - placed)
         phase = (math.pi / take) if ring % 2 else 0.0
@@ -231,6 +231,33 @@ def _column_orbits(outers: list[float]) -> list[float]:
         peak = max(radii)
         return [peak for _ in radii]
     return radii
+
+
+def _palette_index(name: str) -> int:
+    total = 0
+    for ch in name:
+        total = (total * 33 + ord(ch)) & 0xFFFFFFFF
+    return total % len(_BRANCH_PALETTE)
+
+
+def _scatter_origins(sizes: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Коробки по спирали: пятно, а не колонна кластеров."""
+    golden = math.pi * (3 - math.sqrt(5))
+    origins: list[tuple[float, float]] = []
+    radius = 0.0
+    for index, (width, height) in enumerate(sizes):
+        reach = 0.42 * math.hypot(width, height) + 28.0
+        if index == 0:
+            cx = cy = 0.0
+        else:
+            ang = index * golden
+            jitter = ((index * 37) % 50) - 25.0
+            radius = max(radius * 0.92, reach * 0.35)
+            cx = radius * math.cos(ang) + jitter
+            cy = radius * math.sin(ang) * 0.78 + jitter * 0.4
+            radius += reach * 0.48
+        origins.append((cx - width / 2.0, cy - height / 2.0))
+    return origins
 
 
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
@@ -280,8 +307,8 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         elif right_t == "excel_row" and left_t == "excel_value":
             related_values[right].append(left)
 
-    x_unit = 150
-    y_gap = 165
+    x_unit = 118
+    y_gap = 128
 
     def structural_kids(lid: str) -> list[str]:
         return [
@@ -344,31 +371,24 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     excel_roots = [lid for lid in roots if type_by_lid.get(lid) == "excel_sheet"]
     other_roots = [lid for lid in roots if type_by_lid.get(lid) != "excel_sheet"]
 
-    row_limit = 5200
-    x_cursor = 0.0
-    y_cursor = 0.0
-    row_h = 0.0
+    boxes: list[tuple[str, str, float, float]] = []
     for sheet in excel_roots:
         _clusters, bound = excel_layout(sheet)
-        span_w = 2.0 * bound + 36.0
-        if x_cursor > 0 and x_cursor + span_w > row_limit:
-            x_cursor = 0.0
-            y_cursor += row_h + 56
-            row_h = 0.0
-        place_excel_sheet(sheet, x_cursor + span_w / 2, y_cursor + span_w / 2)
-        x_cursor += span_w + 40
-        row_h = max(row_h, span_w)
-
+        span = 2.0 * bound + 36.0
+        boxes.append(("excel", sheet, span, span))
     for root in other_roots:
-        width = leaf_memo.get(root, 1) * x_unit
-        height = depth_memo.get(root, 1) * y_gap
-        if x_cursor > 0 and x_cursor + width > row_limit:
-            x_cursor = 0.0
-            y_cursor += row_h + 260
-            row_h = 0.0
-        _place_tree(root, x_cursor, y_cursor, structural_kids, leaf_memo, x_unit, y_gap, luhmann_to_id, pos)
-        x_cursor += width + 110
-        row_h = max(row_h, height)
+        boxes.append((
+            "tree",
+            root,
+            leaf_memo.get(root, 1) * x_unit,
+            depth_memo.get(root, 1) * y_gap,
+        ))
+    origins = _scatter_origins([(width, height) for _kind, _lid, width, height in boxes])
+    for (kind, lid, width, height), (left, top) in zip(boxes, origins):
+        if kind == "excel":
+            place_excel_sheet(lid, left + width / 2, top + height / 2)
+        else:
+            _place_tree(lid, left, top, structural_kids, leaf_memo, x_unit, y_gap, luhmann_to_id, pos)
 
     excel_zids = {
         z["zettel_id"] for z in zettels if (z.get("thought_type") or "") in _EXCEL_TYPES
@@ -391,7 +411,8 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             ay = sum(p[1] for p in pts) / len(pts)
             pos[eid] = (ax + 34 * math.cos(i * 1.7), ay + 72 + 34 * math.sin(i * 1.7))
         else:
-            pos[eid] = (i * 88.0, y_cursor + row_h + 220)
+            floor = max((point[1] for point in pos.values()), default=0.0)
+            pos[eid] = (i * 88.0, floor + 180)
     return pos
 
 
@@ -492,9 +513,12 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         xy = positions.get(nid, (0.0, 0.0))
         root = root_of(z["luhmann_id"])
         id_index[nid] = len(nodes)
+        project = " ".join((z.get("project") or "").split())
         group, radius, color = _excel_node_style(
             tt, z["luhmann_id"], parent_by_luhmann, color_index, root, depth, value_degree.get(nid, 0),
         )
+        if project:
+            color = _palette_index(project)
         label = _excel_label(tt, topic, content) if tt in _EXCEL_TYPES else _node_label(display)
         nodes.append({
             "x": round(xy[0], 1),
@@ -526,6 +550,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             ]).lower(),
             _public_source_url(source or "text"),
             _short_text(quote, 360),
+            project,
         ])
 
     for e in graph_data["entities"]:
@@ -651,6 +676,7 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "tz": int(total_z),
         "te": int(total_e),
         "tr": int(total_r),
+        "gp": 1 if any(len(row) > 10 and row[10] for row in meta) else 0,
     }
 
 
@@ -699,16 +725,17 @@ let hay = [];
 const CELL = 160;
 let grid = new Map();
 let clusters = [];
+let groupByProject = false;
 let clusterHot = -1;
 let hoverX = 0, hoverY = 0;
 
 function fillOf(i) {
-  if (G[i] === 1) return '#38BDF8';
+  if (G[i] === 1) return isLight() ? '#e2e8f0' : '#64748b';
   if (G[i] === 2) return '#64748B';
   return PAL[C[i]][0];
 }
 function strokeOf(i) {
-  if (G[i] === 1) return '#FFFFFF';
+  if (G[i] === 1) return isLight() ? '#94a3b8' : '#cbd5e1';
   if (G[i] === 2) return '#94A3B8';
   return PAL[C[i]][1];
 }
@@ -860,22 +887,36 @@ function sourceExample(raw) {
   return esc(sourceLabel(src));
 }
 
+function projectColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 33 + name.charCodeAt(i)) >>> 0;
+  return h % PAL.length;
+}
 function buildClusters() {
   const grouped = new Map();
   for (let i = 0; i < N; i++) {
     if (G[i] === 1 || G[i] === 2) continue;
     const tt = String((META[i] || [])[3] || '');
     if (tt.indexOf('excel_') === 0) continue;
-    const key = C[i] | 0;
+    const m = META[i] || [];
+    const project = String(m[10] || '').trim();
+    const key = (groupByProject && project) ? ('p:' + project) : (C[i] | 0);
     let g = grouped.get(key);
     if (!g) {
-      g = { color: key, nodes: [], sumX: 0, sumY: 0, topic: new Map(), source: new Map() };
+      g = {
+        color: (groupByProject && project) ? projectColor(project) : (C[i] | 0),
+        nodes: [],
+        sumX: 0,
+        sumY: 0,
+        topic: new Map(),
+        source: new Map(),
+        project: project
+      };
       grouped.set(key, g);
     }
     g.nodes.push(i);
     g.sumX += X[i];
     g.sumY += Y[i];
-    const m = META[i] || [];
     const topic = String(m[2] || '').trim();
     if (topic) g.topic.set(topic, (g.topic.get(topic) || 0) + 1);
     const src = String(m[8] || '').trim();
@@ -897,7 +938,9 @@ function buildClusters() {
     // "Облако" кластера делаем компактным, чтобы не перекрывать весь экран.
     const drawR = Math.max(46, Math.min(190, outer * 0.45 + 26));
     const hitR = Math.max(drawR * 1.18, 64);
-    const topics = [...g.topic.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]);
+    const topics = (groupByProject && g.project)
+      ? [g.project]
+      : [...g.topic.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]);
     const sources = [...g.source.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => x[0]);
     clusters.push({
       id: cid,
@@ -930,20 +973,20 @@ function reindexNode(i, oldX, oldY) {
 function cellsInView(x0, y0, x1, y1) {
   const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
   const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
-  const ncx = Math.max(1, cx1 - cx0 + 1);
-  const ncy = Math.max(1, cy1 - cy0 + 1);
-  let step = 1;
-  if (ncx * ncy > 700) step = Math.ceil(Math.sqrt((ncx * ncy) / 700));
   const out = [];
-  for (let cx = cx0; cx <= cx1; cx += step) {
-    for (let cy = cy0; cy <= cy1; cy += step) {
+  for (let cx = cx0; cx <= cx1; cx++) {
+    for (let cy = cy0; cy <= cy1; cy++) {
       const b = grid.get(cx + ':' + cy);
       if (!b) continue;
-      const take = b.length > 80 ? 80 : b.length;
-      for (let i = 0; i < take; i++) out.push(b[i]);
+      for (let i = 0; i < b.length; i++) out.push(b[i]);
     }
   }
   return out;
+}
+function screenRadius(i) {
+  const raw = R[i] * zoom;
+  const minR = zoom < 0.18 ? 3.2 : (zoom < 0.45 ? 4.5 : 6);
+  return Math.max(minR, raw);
 }
 
 function resize() {
@@ -965,7 +1008,7 @@ function requestDraw() {
 
 function drawNode(i, alpha, ring) {
   const x = sx(X[i]), y = sy(Y[i]);
-  const r = Math.max(6, R[i] * zoom);
+  const r = screenRadius(i);
   ctx.globalAlpha = alpha;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
@@ -1002,14 +1045,21 @@ function reserveLabel(x, y, text, align, baseline) {
   labelBoxes.push(box);
   return true;
 }
+function wantsLabel(i) {
+  if (hot && hot[i]) return true;
+  const rank = labelRank(i);
+  if (zoom < 0.22) return rank <= 1 || R[i] >= 40;
+  if (zoom < 0.5) return rank <= 1 || R[i] >= 30;
+  return true;
+}
 function drawLabel(i, alpha, light) {
   const tt = String((META[i] || [])[3] || '');
   const excelNode = tt.indexOf('excel_') === 0;
-  const r = Math.max(6, R[i] * zoom);
-  if (r < 8 && G[i] !== 2 && !excelNode) return false;
+  const r = screenRadius(i);
+  if (!wantsLabel(i)) return false;
   if (!L[i]) return false;
   const excel = excelNode && tt !== 'excel_sheet';
-  ctx.font = Math.max(10, Math.min(13, 11 * zoom)) + 'px Arial';
+  ctx.font = '12px Arial';
   let tx, ty, align, baseline;
   if (excel) {
     const dir = outwardOf(i);
@@ -1024,10 +1074,19 @@ function drawLabel(i, alpha, light) {
     ty = sy(Y[i]) + r + 3;
   }
   if (!reserveLabel(tx, ty, L[i], align, baseline)) return false;
-  ctx.globalAlpha = alpha;
-  ctx.fillStyle = light ? '#0f172a' : '#ffffff';
+  ctx.globalAlpha = Math.max(alpha, 0.92);
   ctx.textAlign = align;
   ctx.textBaseline = baseline;
+  const tw = ctx.measureText(L[i]).width;
+  const padX = 4;
+  let left = tx - padX, top = ty - 1;
+  if (align === 'center') left = tx - tw / 2 - padX;
+  else if (align === 'right') left = tx - tw - padX;
+  if (baseline === 'middle') top = ty - 8;
+  ctx.fillStyle = light ? 'rgba(248,250,252,0.94)' : 'rgba(15,23,42,0.9)';
+  roundBox(left, top, tw + padX * 2, 16, 4);
+  ctx.fill();
+  ctx.fillStyle = light ? '#0f172a' : '#f8fafc';
   ctx.fillText(L[i], tx, ty);
   return true;
 }
@@ -1139,22 +1198,23 @@ function draw() {
   }
   const pad = 90 / Math.max(zoom, 0.001);
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
-  const overview = zoom < 0.2 && !hot;
+  const vis = cellsInView(x0, y0, x1, y1);
+  const crowded = vis.length > 4200;
+  const overview = !hot && (zoom < 0.05 || (crowded && zoom < 0.2));
   if (overview) {
     drawOverview(x0, y0, x1, y1, light);
     ctx.globalAlpha = 1;
     return;
   }
-  const vis = cellsInView(x0, y0, x1, y1);
-  const showTags = tagsOn && zoom >= 0.32;
-  const showEdges = zoom >= 0.2;
-  const showLabels = zoom >= 0.22;
+  const showTags = tagsOn && zoom >= 0.28;
+  const showEdges = true;
+  const showLabels = true;
   const dim = hot ? 0.16 : 1;
-  const maxE = zoom < 0.45 ? 1800 : 5000;
+  const maxE = 8000;
   const maxN = vis.length > 6000 ? 4000 : vis.length;
 
   // Показываем облака кластеров только на общем плане, чтобы не шуметь при приближении.
-  if (zoom <= 0.85 || clusterHot >= 0) {
+  if (zoom <= 0.4 || clusterHot >= 0) {
     for (let ci = 0; ci < clusters.length; ci++) {
       const c = clusters[ci];
       const sr = c.r * zoom;
@@ -1175,33 +1235,55 @@ function draw() {
     }
   }
 
+  const painted = new Uint8Array(N);
+  let budget = maxN;
+  for (let v = 0; v < vis.length && budget > 0; v++) {
+    const i = vis[v];
+    if (!nodeVisible(i)) continue;
+    painted[i] = 1;
+    budget--;
+  }
+  if (hot) {
+    for (let i = 0; i < N; i++) {
+      if (!hot[i]) continue;
+      if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
+      if (!nodeVisible(i)) continue;
+      painted[i] = 1;
+    }
+  }
+
   if (showEdges && adjOff) {
     let drawn = 0;
-    ctx.lineWidth = Math.max(0.7, Math.min(2.2, zoom * 1.2));
     for (let v = 0; v < vis.length && drawn < maxE; v++) {
       const a = vis[v];
-      if (!nodeVisible(a)) continue;
+      if (!painted[a]) continue;
       const start = adjOff[a], end = adjOff[a + 1];
       for (let p = start; p < end && drawn < maxE; p++) {
         const b = adjTo[p];
-        if (b < a) continue;
+        if (b < a || !painted[b]) continue;
         const k = adjK[p];
         if (k === 1 && !showTags) continue;
         const rowEdge = G[a] === 2 || G[b] === 2;
+        const tagEdge = k === 1;
         const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
         const bridge = k === 3;
         if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
         if (!bridge && rowEdge && selected !== a && selected !== b) continue;
-        if (!nodeVisible(b)) continue;
         const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
-        if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
-        ctx.globalAlpha = focusEdge ? 1 : (bridge ? 0.9 : dim);
-        ctx.strokeStyle = focusEdge ? '#2563eb' : (bridge ? '#c026d3' : (light ? '#64748b' : '#cbd5e1'));
-        ctx.lineWidth = bridge ? Math.max(1.8, Math.min(2.8, zoom * 1.6)) : Math.max(1.15, Math.min(2.4, zoom * 1.25));
+        if (ax < x0 || ax > x1 || ay < y0 || ay > y1 || bx < x0 || bx > x1 || by < y0 || by > y1) continue;
+        const dx = bx - ax, dy = by - ay;
+        const len = Math.hypot(dx, dy);
+        if (len < 1) continue;
+        const ra = screenRadius(a) / zoom, rb = screenRadius(b) / zoom;
+        if ((len - ra - rb) * zoom < 3) continue;
+        const ux = dx / len, uy = dy / len;
+        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.28 : (bridge ? 0.9 : Math.max(dim, 0.72)));
+        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#cbd5e1' : '#64748b') : (bridge ? '#c026d3' : (light ? '#475569' : '#94a3b8')));
+        ctx.lineWidth = tagEdge ? 1 : (bridge ? 2.2 : 1.35);
         ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
         ctx.beginPath();
-        ctx.moveTo(sx(ax), sy(ay));
-        ctx.lineTo(sx(bx), sy(by));
+        ctx.moveTo(sx(ax + ux * ra), sy(ay + uy * ra));
+        ctx.lineTo(sx(bx - ux * rb), sy(by - uy * rb));
         ctx.stroke();
         drawn++;
       }
@@ -1218,10 +1300,13 @@ function draw() {
     drawnN++;
   }
   if (hot) {
-    for (let v = 0; v < vis.length; v++) {
-      const i = vis[v];
-      if (!nodeVisible(i) || !isHot(i)) continue;
+    let marked = 0;
+    for (let i = 0; i < N && marked < 900; i++) {
+      if (!hot[i]) continue;
+      if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
+      if (!nodeVisible(i)) continue;
       drawNode(i, 1, hot[i] === 2);
+      marked++;
     }
   }
   if (showLabels) {
@@ -1251,7 +1336,7 @@ function hit(px, py) {
     if (!nodeVisible(i)) continue;
     const dx = X[i] - x, dy = Y[i] - y;
     const d = dx * dx + dy * dy;
-    const lim = Math.max(R[i], 14 / zoom);
+    const lim = Math.max(screenRadius(i) / zoom, 14 / zoom);
     if (d < lim * lim && d < bestD) { best = i; bestD = d; }
   }
   return best;
@@ -1297,14 +1382,14 @@ function showClusterTip(ci, px, py) {
   const tip = document.getElementById('cluster-tip');
   if (!tip || ci < 0 || ci >= clusters.length) return;
   const c = clusters[ci];
-  const topic = c.topics.length ? c.topics.map(esc).join(' / ') : 'Темы без названия';
+  const topic = c.topics.length ? c.topics.map(esc).join(' / ') : (groupByProject ? 'Проект' : 'Темы без названия');
   const samples = c.sources.length
     ? c.sources.map(function(s) { return '<li>' + sourceExample(s) + '</li>'; }).join('')
     : '<li>источник не указан</li>';
   tip.innerHTML =
-    '<div class="ct-title">О чем этот кластер</div>' +
+    '<div class="ct-title">' + (groupByProject ? 'Проект' : 'О чем этот кластер') + '</div>' +
     '<div class="ct-row"><b>Карточек:</b> ' + c.n + '</div>' +
-    '<div class="ct-row"><b>Ключевые темы:</b> ' + topic + '</div>' +
+    '<div class="ct-row"><b>' + (groupByProject ? 'Название:' : 'Ключевые темы:') + '</b> ' + topic + '</div>' +
     '<div class="ct-row"><b>Примеры источников:</b><ul>' + samples + '</ul></div>';
   tip.style.display = 'block';
   const pad = 12;
@@ -1602,16 +1687,30 @@ function applySearch(raw) {
     const b = document.getElementById('btn-rows');
     if (b) b.classList.add('active');
   }
-  if (matched.length === 1) {
-    camX = X[matched[0]]; camY = Y[matched[0]];
-    zoom = Math.max(zoom, 0.8);
-  }
+  if (matched.length) frameMatches(matched);
   requestDraw();
+}
+function frameMatches(ids) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const step = Math.max(1, Math.ceil(ids.length / 120));
+  for (let i = 0; i < ids.length; i += step) {
+    const id = ids[i];
+    if (X[id] < minX) minX = X[id];
+    if (Y[id] < minY) minY = Y[id];
+    if (X[id] > maxX) maxX = X[id];
+    if (Y[id] > maxY) maxY = Y[id];
+  }
+  if (!isFinite(minX)) return;
+  camX = (minX + maxX) / 2;
+  camY = (minY + maxY) / 2;
+  const dx = Math.max(maxX - minX, 260);
+  const dy = Math.max(maxY - minY, 260);
+  zoom = Math.max(0.12, Math.min(1.2, Math.min((W - 140) / dx, (H - 140) / dy)));
 }
 document.getElementById('searchInput').addEventListener('input', function() {
   const v = this.value;
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(function() { applySearch(v); }, 80);
+  searchTimer = setTimeout(function() { applySearch(v); }, 40);
 });
 
 const tagsBtn = document.getElementById('btn-tags');
@@ -1666,6 +1765,7 @@ function applyPayload(data) {
   META = data.m || [];
   EFLAT = data.e || [];
   E = (EFLAT.length / 3) | 0;
+  groupByProject = !!data.gp;
   hot = null;
   visMask = null;
   revealedRows = [];
@@ -1774,7 +1874,7 @@ def _build_html(
   .leg-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid; flex-shrink: 0; }}
   .leg-bridge {{ width: 22px; height: 0; border-top: 2px dashed #e879f9; flex-shrink: 0; }}
   .leg-dot-thought {{ background: #D4A055; border-color: #B8862E; }}
-  .leg-dot-entity {{ background: #38BDF8; border-color: #FFFFFF; }}
+  .leg-dot-entity {{ background: #e2e8f0; border-color: #94a3b8; }}
   .leg-dot-column {{ background: #9078C8; border-color: #7058A8; }}
   .leg-dot-value {{ background: #72B862; border-color: #529842; }}
   .leg-dot-row {{ background: #64748B; border-color: #94A3B8; }}
@@ -1864,7 +1964,7 @@ def _build_html(
 </div>
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
-  <div id="graph-hint">Цвет — одна ветка, подпись показывает тему и число карточек. Приблизьте, чтобы увидеть узлы и связи. Клик открывает карточку. У таблицы строки появляются по клику на значение.</div>
+  <div id="graph-hint">На среднем масштабе видны узлы, связи между ними и названия крупных карточек. Приблизьте, чтобы подписать остальные. Поиск переносит к совпадениям.</div>
   <div id="load-hint">Загрузка графа…</div>
   <div id="cluster-tip"></div>
 </div>
