@@ -689,6 +689,7 @@ def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[byte
     headers = {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
+        "x-graph-size": str(len(raw)),
     }
     if "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
         return gzip.compress(raw, compresslevel=4), {
@@ -724,6 +725,12 @@ let raf = 0;
 let hay = [];
 const CELL = 160;
 let grid = new Map();
+let hubs = [];
+let hubMark = null;
+let dotPick = null;
+let dotCols = 0;
+let dotBin = 12;
+let fitted = false;
 let clusters = [];
 let groupByProject = false;
 let clusterHot = -1;
@@ -861,11 +868,26 @@ function buildIndex() {
   }
   grid = new Map();
   for (let i = 0; i < N; i++) {
-    const key = (X[i] / CELL | 0) + ':' + (Y[i] / CELL | 0);
+    const cx = X[i] / CELL | 0, cy = Y[i] / CELL | 0;
+    const key = cx + ':' + cy;
     let bucket = grid.get(key);
-    if (!bucket) { bucket = []; grid.set(key, bucket); }
+    if (!bucket) {
+      bucket = [];
+      bucket.cx = cx;
+      bucket.cy = cy;
+      grid.set(key, bucket);
+    }
     bucket.push(i);
   }
+  const rank = [];
+  for (let i = 0; i < N; i++) {
+    if (G[i] === 1 || G[i] === 2) continue;
+    rank.push(i);
+  }
+  rank.sort(function(a, b) { return R[b] - R[a]; });
+  hubs = rank.slice(0, Math.min(rank.length, N > 2500 ? 180 : 320));
+  hubMark = new Uint8Array(N);
+  for (let h = 0; h < hubs.length; h++) hubMark[hubs[h]] = 1;
   hay = new Array(N);
   for (let i = 0; i < N; i++) {
     const m = META[i] || [];
@@ -966,14 +988,27 @@ function reindexNode(i, oldX, oldY) {
     if (ix >= 0) ob.splice(ix, 1);
   }
   let nb = grid.get(newKey);
-  if (!nb) { nb = []; grid.set(newKey, nb); }
+  if (!nb) {
+    nb = [];
+    nb.cx = X[i] / CELL | 0;
+    nb.cy = Y[i] / CELL | 0;
+    grid.set(newKey, nb);
+  }
   nb.push(i);
 }
 
 function cellsInView(x0, y0, x1, y1) {
   const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
   const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
+  const ncell = (cx1 - cx0 + 1) * (cy1 - cy0 + 1);
   const out = [];
+  if (ncell > 2500) {
+    grid.forEach(function(bucket) {
+      if (bucket.cx < cx0 || bucket.cx > cx1 || bucket.cy < cy0 || bucket.cy > cy1) return;
+      for (let i = 0; i < bucket.length; i++) out.push(bucket[i]);
+    });
+    return out;
+  }
   for (let cx = cx0; cx <= cx1; cx++) {
     for (let cy = cy0; cy <= cy1; cy++) {
       const b = grid.get(cx + ':' + cy);
@@ -988,6 +1023,9 @@ function screenRadius(i) {
   const minR = zoom < 0.18 ? 3.2 : (zoom < 0.45 ? 4.5 : 6);
   return Math.max(minR, raw);
 }
+function hubRadius(i) {
+  return Math.max(8, Math.min(18, R[i] * Math.max(zoom, 0.14)));
+}
 
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -998,6 +1036,7 @@ function resize() {
   canvas.style.width = W + 'px';
   canvas.style.height = H + 'px';
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!fitted) fit();
   requestDraw();
 }
 
@@ -1137,49 +1176,74 @@ function drawBranchCaptions(light) {
     ctx.fillText(text, px, py);
   }
 }
-function drawOverview(x0, y0, x1, y1, light) {
-  const bin = 11;
-  const dot = 5.5;
-  const cols = Math.ceil(W / bin) + 2;
-  const rows = Math.ceil(H / bin) + 2;
-  const used = new Uint8Array(cols * rows);
-  const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
-  const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
-  const walkAll = (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > grid.size * 2;
-  const outline = light ? '#ffffff' : '#0b1220';
-  function paintNode(i) {
-    if (!nodeVisible(i)) return;
-    const px = sx(X[i]), py = sy(Y[i]);
-    if (px < -bin || py < -bin || px > W + bin || py > H + bin) return;
-    const bx = (px / bin) | 0, by = (py / bin) | 0;
-    if (bx < 0 || by < 0 || bx >= cols || by >= rows) return;
-    const id = bx + by * cols;
-    if (used[id]) return;
-    used[id] = 1;
-    ctx.globalAlpha = 0.95;
+function drawHubs(light) {
+  labelBoxes = [];
+  ctx.font = '12px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let h = 0; h < hubs.length; h++) {
+    const i = hubs[h];
+    if (!nodeVisible(i)) continue;
+    const x = sx(X[i]), y = sy(Y[i]);
+    if (x < -24 || y < -24 || x > W + 24 || y > H + 24) continue;
+    const r = hubRadius(i);
+    ctx.globalAlpha = 1;
     ctx.beginPath();
-    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, dot, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
     ctx.fill();
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = light ? '#ffffff' : '#0b1220';
+    ctx.stroke();
+    if (!L[i]) continue;
+    const ty = y + r + 3;
+    if (!reserveLabel(x, ty, L[i], 'center', 'top')) continue;
+    const tw = ctx.measureText(L[i]).width;
+    ctx.fillStyle = light ? 'rgba(248,250,252,0.94)' : 'rgba(15,23,42,0.9)';
+    roundBox(x - tw / 2 - 4, ty - 1, tw + 8, 16, 4);
+    ctx.fill();
+    ctx.fillStyle = light ? '#0f172a' : '#f8fafc';
+    ctx.fillText(L[i], x, ty);
+  }
+}
+function drawOverview(x0, y0, x1, y1, light) {
+  const bin = 12;
+  const cols = Math.ceil(W / bin) + 2;
+  const rows = Math.ceil(H / bin) + 2;
+  const best = new Int32Array(cols * rows);
+  const bestR = new Uint16Array(cols * rows);
+  best.fill(-1);
+  dotPick = best;
+  dotCols = cols;
+  dotBin = bin;
+  const outline = light ? '#ffffff' : '#0b1220';
+  for (let i = 0; i < N; i++) {
+    if (G[i] === 2) continue;
+    if (G[i] === 1 && !tagsOn) continue;
+    const px = sx(X[i]), py = sy(Y[i]);
+    if (px < -bin || py < -bin || px > W + bin || py > H + bin) continue;
+    const bx = (px / bin) | 0, by = (py / bin) | 0;
+    if (bx < 0 || by < 0 || bx >= cols || by >= rows) continue;
+    const id = bx + by * cols;
+    if (best[id] >= 0 && R[i] <= bestR[id]) continue;
+    best[id] = i;
+    bestR[id] = R[i];
+  }
+  for (let id = 0; id < best.length; id++) {
+    const i = best[id];
+    if (i < 0) continue;
+    const bx = id % cols, by = (id / cols) | 0;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath();
+    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = fillOf(i);
+    ctx.fill();
+    ctx.lineWidth = 1.4;
     ctx.strokeStyle = outline;
     ctx.stroke();
   }
-  if (walkAll) {
-    grid.forEach(function(bucket) {
-      const i = bucket[0];
-      if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) return;
-      paintNode(i);
-    });
-  } else {
-    for (let cx = cx0; cx <= cx1; cx++) {
-      for (let cy = cy0; cy <= cy1; cy++) {
-        const bucket = grid.get(cx + ':' + cy);
-        if (bucket) paintNode(bucket[0]);
-      }
-    }
-  }
   drawBranchCaptions(light);
+  drawHubs(light);
 }
 
 function draw() {
@@ -1196,22 +1260,27 @@ function draw() {
     ctx.fillText('Граф пуст', W / 2, H / 2);
     return;
   }
-  const pad = 90 / Math.max(zoom, 0.001);
+  const pad = 90 / Math.max(zoom, 0.02);
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
-  const vis = cellsInView(x0, y0, x1, y1);
-  const crowded = vis.length > 4200;
-  const overview = !hot && (zoom < 0.05 || (crowded && zoom < 0.2));
+  let overview = zoom < 0.07 || (N > 2000 && zoom < 0.24);
+  let vis = null;
+  if (!overview) {
+    vis = cellsInView(x0, y0, x1, y1);
+    if (vis.length > 1600) overview = true;
+  }
   if (overview) {
     drawOverview(x0, y0, x1, y1, light);
+    drawHotMarks();
     ctx.globalAlpha = 1;
     return;
   }
+  dotPick = null;
   const showTags = tagsOn && zoom >= 0.28;
   const showEdges = true;
   const showLabels = true;
   const dim = hot ? 0.16 : 1;
-  const maxE = 8000;
-  const maxN = vis.length > 6000 ? 4000 : vis.length;
+  const maxE = 3500;
+  const maxN = vis.length;
 
   // Показываем облака кластеров только на общем плане, чтобы не шуметь при приближении.
   if (zoom <= 0.4 || clusterHot >= 0) {
@@ -1327,19 +1396,75 @@ function draw() {
   ctx.globalAlpha = 1;
 }
 
+function considerHit(best, i, r, cx, cy, px, py, force) {
+  if (i < 0 || (!force && !nodeVisible(i))) return best;
+  const dx = cx - px, dy = cy - py;
+  const d2 = dx * dx + dy * dy;
+  const lim = r + 6;
+  let inside = d2 <= lim * lim;
+  let score = d2;
+  if (!inside && L[i] && py >= cy + r - 2 && py <= cy + r + 18 && Math.abs(px - cx) <= 78) {
+    inside = true;
+    score = d2 + 20;
+  }
+  if (!inside) return best;
+  const rank = r * 100000 + score;
+  if (!best || rank < best.rank) return { i: i, rank: rank };
+  return best;
+}
 function hit(px, py) {
+  let best = null;
+  if (dotPick) {
+    for (let h = 0; h < hubs.length; h++) {
+      const i = hubs[h];
+      best = considerHit(best, i, hubRadius(i), sx(X[i]), sy(Y[i]), px, py, true);
+    }
+    if (best) return best.i;
+    const bin = dotBin;
+    const bx = (px / bin) | 0, by = (py / bin) | 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const cx = bx + ox, cy = by + oy;
+        if (cx < 0 || cy < 0 || cx >= dotCols) continue;
+        const id = cx + cy * dotCols;
+        if (id < 0 || id >= dotPick.length) continue;
+        const i = dotPick[id];
+        if (i < 0) continue;
+        const dx = cx * bin + bin / 2 - px;
+        const dy = cy * bin + bin / 2 - py;
+        if (dx * dx + dy * dy > 81) continue;
+        best = considerHit(best, i, 8, cx * bin + bin / 2, cy * bin + bin / 2, px, py, true);
+      }
+    }
+    return best ? best.i : -1;
+  }
+  const reach = 48 / Math.max(zoom, 0.08);
   const x = wx(px), y = wy(py);
-  const cand = cellsInView(x - 80, y - 80, x + 80, y + 80);
-  let best = -1, bestD = 1e12;
+  const cand = cellsInView(x - reach, y - reach, x + reach, y + reach);
   for (let c = 0; c < cand.length; c++) {
     const i = cand[c];
-    if (!nodeVisible(i)) continue;
-    const dx = X[i] - x, dy = Y[i] - y;
-    const d = dx * dx + dy * dy;
-    const lim = Math.max(screenRadius(i) / zoom, 14 / zoom);
-    if (d < lim * lim && d < bestD) { best = i; bestD = d; }
+    best = considerHit(best, i, screenRadius(i), sx(X[i]), sy(Y[i]), px, py);
   }
-  return best;
+  return best ? best.i : -1;
+}
+function drawHotMarks() {
+  if (!hot) return;
+  let marked = 0;
+  for (let i = 0; i < N && marked < 240; i++) {
+    if (!hot[i]) continue;
+    const x = sx(X[i]), y = sy(Y[i]);
+    if (x < -30 || y < -30 || x > W + 30 || y > H + 30) continue;
+    const r = Math.max(hot[i] === 2 ? 10 : 6, Math.min(18, screenRadius(i)));
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = fillOf(i);
+    ctx.fill();
+    ctx.lineWidth = hot[i] === 2 ? 3 : 1.6;
+    ctx.strokeStyle = hot[i] === 2 ? '#60a5fa' : strokeOf(i);
+    ctx.stroke();
+    marked++;
+  }
 }
 
 function hitCluster(px, py) {
@@ -1509,7 +1634,7 @@ function focusNode(idx) {
 }
 
 function fit() {
-  if (!N) return;
+  if (!N || W < 80 || H < 80) return;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < N; i++) {
     if (!tagsOn && G[i] === 1) continue;
@@ -1525,6 +1650,7 @@ function fit() {
   const dx = Math.max(maxX - minX, 200);
   const dy = Math.max(maxY - minY, 200);
   zoom = Math.max(0.001, Math.min(1.4, Math.min((W - 80) / dx, (H - 80) / dy)));
+  fitted = true;
 }
 
 wrap.addEventListener('mousedown', function(e) {
@@ -1782,11 +1908,60 @@ function applyPayload(data) {
   buildClusters();
   clusterHot = -1;
   hideClusterTip();
+  fitted = false;
   resize();
-  fit();
   requestDraw();
 }
 
+function setLoad(pct, caption) {
+  const n = Math.max(0, Math.min(100, Math.round(pct)));
+  const el = document.getElementById('load-pct');
+  const arc = document.getElementById('load-arc');
+  const cap = document.getElementById('load-caption');
+  if (el) el.textContent = n + '%';
+  if (cap && caption) cap.textContent = caption;
+  if (arc) {
+    const circ = 175.9;
+    arc.classList.toggle('spin', n <= 0);
+    arc.style.strokeDashoffset = n <= 0 ? '132' : String(circ * (1 - n / 100));
+  }
+}
+function paintLoad() {
+  return new Promise(function(resolve) { requestAnimationFrame(resolve); });
+}
+async function readGraph(resp) {
+  const total = Number(resp.headers.get('x-graph-size') || resp.headers.get('content-length') || 0);
+  if (!resp.body || !resp.body.getReader) {
+    setLoad(30, 'Загрузка графа');
+    return resp.json();
+  }
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let got = 0;
+  setLoad(0, 'Загрузка графа');
+  while (true) {
+    const step = await reader.read();
+    if (step.done) break;
+    chunks.push(step.value);
+    got += step.value.length;
+    const ratio = total > 0 ? got / total : Math.min(0.85, 0.08 + Math.log10(got + 10) / 8);
+    setLoad(Math.min(90, ratio * 90), 'Загрузка графа');
+  }
+  setLoad(94, 'Сборка графа');
+  await paintLoad();
+  let len = 0;
+  for (let i = 0; i < chunks.length; i++) len += chunks[i].length;
+  const buf = new Uint8Array(len);
+  let off = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    buf.set(chunks[i], off);
+    off += chunks[i].length;
+  }
+  const data = JSON.parse(new TextDecoder().decode(buf));
+  setLoad(100, 'Готово');
+  await paintLoad();
+  return data;
+}
 (async function boot() {
   const hint = document.getElementById('load-hint');
   try {
@@ -1794,16 +1969,23 @@ function applyPayload(data) {
     if (DATA_URL) {
       const resp = await fetch(DATA_URL, { headers: { 'Accept': 'application/json' } });
       if (!resp.ok) throw new Error('Не удалось загрузить граф');
-      data = await resp.json();
+      data = await readGraph(resp);
     } else if (DATA_B64) {
+      setLoad(20, 'Загрузка графа');
+      await paintLoad();
       data = await inflateB64(DATA_B64);
+      setLoad(100, 'Готово');
+      await paintLoad();
     } else {
       data = { n: 0, x: [], y: [], r: [], g: [], c: [], l: [], m: [], e: [], tz: 0, te: 0, tr: 0 };
     }
     if (hint) hint.remove();
     applyPayload(data);
   } catch (err) {
-    if (hint) hint.textContent = 'Ошибка загрузки графа: ' + err.message;
+    setLoad(0, 'Ошибка загрузки');
+    const cap = document.getElementById('load-caption');
+    if (cap) cap.textContent = 'Ошибка загрузки графа: ' + err.message;
+    else if (hint) hint.textContent = 'Ошибка загрузки графа: ' + err.message;
   }
 })();
 </script>
@@ -1883,8 +2065,24 @@ def _build_html(
   #graph {{ position: absolute; inset: 0; width: 100%; height: 100%; display: block; }}
   #load-hint {{
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    color: #94a3b8; font-size: 15px; z-index: 5; pointer-events: none;
+    z-index: 6; pointer-events: none; background: rgba(11, 18, 32, 0.55);
   }}
+  .load-box {{ display: flex; flex-direction: column; align-items: center; gap: 12px; }}
+  .load-dial {{ position: relative; width: 92px; height: 92px; }}
+  .load-ring {{ width: 92px; height: 92px; display: block; }}
+  .load-track {{ fill: none; stroke: #334155; stroke-width: 6; }}
+  .load-arc {{
+    fill: none; stroke: #60a5fa; stroke-width: 6; stroke-linecap: round;
+    transform-origin: 36px 36px; transform: rotate(-90deg);
+    stroke-dasharray: 175.9; stroke-dashoffset: 132;
+  }}
+  .load-arc.spin {{ animation: load-spin 0.9s linear infinite; }}
+  @keyframes load-spin {{ to {{ transform: rotate(270deg); }} }}
+  #load-pct {{
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 700; color: #f8fafc;
+  }}
+  #load-caption {{ font-size: 13px; color: #cbd5e1; text-align: center; max-width: 280px; }}
   #detail-panel {{
     position: absolute; top: 64px; right: 16px; width: 340px; max-height: calc(100vh - 100px);
     background: rgba(15, 23, 42, 0.98); border: 1px solid #334155; border-radius: 12px;
@@ -1937,7 +2135,12 @@ def _build_html(
   body.light-theme #legend h3 {{ color: #374151; }}
   body.light-theme #detail-panel {{ background: #ffffff; border: 1px solid #e5e7eb; }}
   body.light-theme #detail-panel h2, body.light-theme #detail-panel .field-value {{ color: #1f2937; }}
-  body.light-theme #detail-panel .field-label, body.light-theme #graph-hint, body.light-theme #load-hint {{ color: #6b7280; }}
+  body.light-theme #detail-panel .field-label, body.light-theme #graph-hint {{ color: #6b7280; }}
+  body.light-theme #load-hint {{ background: rgba(248, 250, 252, 0.72); }}
+  body.light-theme .load-track {{ stroke: #e2e8f0; }}
+  body.light-theme .load-arc {{ stroke: #2563eb; }}
+  body.light-theme #load-pct {{ color: #0f172a; }}
+  body.light-theme #load-caption {{ color: #64748b; }}
   body.light-theme #detail-panel a {{ color: #2563eb; }}
   body.light-theme #detail-panel .neighbor-item {{ background: #f3f4f6; color: #374151; }}
   body.light-theme #search-box input {{ background: #ffffff; border: 1px solid #d1d5db; color: #374151; }}
@@ -1965,7 +2168,18 @@ def _build_html(
 <div id="graph-wrap">
   <canvas id="graph"></canvas>
   <div id="graph-hint">На среднем масштабе видны узлы, связи между ними и названия крупных карточек. Приблизьте, чтобы подписать остальные. Поиск переносит к совпадениям.</div>
-  <div id="load-hint">Загрузка графа…</div>
+  <div id="load-hint">
+    <div class="load-box">
+      <div class="load-dial">
+        <svg class="load-ring" viewBox="0 0 72 72" aria-hidden="true">
+          <circle class="load-track" cx="36" cy="36" r="28"></circle>
+          <circle id="load-arc" class="load-arc spin" cx="36" cy="36" r="28"></circle>
+        </svg>
+        <div id="load-pct">0%</div>
+      </div>
+      <div id="load-caption">Загрузка графа</div>
+    </div>
+  </div>
   <div id="cluster-tip"></div>
 </div>
 <div id="legend">
