@@ -4,12 +4,14 @@
 """
 from __future__ import annotations
 
+import array
 import base64
 import gzip
 import json
 import math
 import os
 import re
+import struct
 import tempfile
 from collections import defaultdict
 from html import escape as html_escape
@@ -363,6 +365,124 @@ def _scatter_origins(sizes: list[tuple[float, float]]) -> list[tuple[float, floa
     return origins
 
 
+_LEAF_R = 12.0
+_FAMILY_MIN = 600
+
+
+def _family_enclose(child_radii: list[float]) -> float:
+    """Плотный круг: дети рядом с родителем, без пустого кольца."""
+    if not child_radii:
+        return _LEAF_R
+    area = 0.0
+    max_r = _LEAF_R
+    for radius in child_radii:
+        padded = radius + 3.5
+        area += padded * padded
+        if padded > max_r:
+            max_r = padded
+    return max(math.sqrt(area) * 0.92, max_r + 10.0)
+
+
+def _place_families(
+    members: list[str],
+    by_zid: dict,
+    center: tuple[float, float],
+) -> dict[str, tuple[float, float]]:
+    """Каждая ветка — плотная семья: родитель в середине, дети вокруг."""
+    zid_of: dict[str, str] = {}
+    lid_of: dict[str, str] = {}
+    for zid in members:
+        zettel = by_zid.get(zid)
+        if not zettel:
+            continue
+        lid = str(zettel.get("luhmann_id") or zid)
+        lid_of[zid] = lid
+        zid_of[lid] = zid
+    children: dict[str, list[str]] = defaultdict(list)
+    roots: list[str] = []
+    for zid, lid in lid_of.items():
+        parent = str((by_zid[zid].get("parent_luhmann") or ""))
+        if parent and parent in zid_of and parent != lid:
+            children[parent].append(lid)
+        else:
+            roots.append(lid)
+    if not roots:
+        roots = list(zid_of)
+
+    radius: dict[str, float] = {}
+    color: dict[str, int] = {}
+    stack: list[tuple[str, bool]] = [(lid, False) for lid in roots]
+    while stack:
+        lid, expanded = stack.pop()
+        if expanded:
+            kids = children.get(lid) or []
+            radius[lid] = _family_enclose([radius.get(kid, _LEAF_R) for kid in kids])
+            kids.sort(key=lambda kid: radius.get(kid, _LEAF_R))
+            color[lid] = 2
+            continue
+        state = color.get(lid, 0)
+        if state == 2:
+            continue
+        if state == 1:
+            radius[lid] = _LEAF_R
+            color[lid] = 2
+            continue
+        color[lid] = 1
+        stack.append((lid, True))
+        for kid in reversed(children.get(lid) or []):
+            if color.get(kid, 0) == 0:
+                stack.append((kid, False))
+    for lid in zid_of:
+        if lid not in radius:
+            roots.append(lid)
+            radius[lid] = _LEAF_R
+
+    roots.sort(key=lambda lid: radius.get(lid, _LEAF_R), reverse=True)
+    golden = math.pi * (3 - math.sqrt(5))
+    anchors: dict[str, tuple[float, float]] = {}
+    count = len(roots)
+    if count == 1:
+        anchors[roots[0]] = center
+    else:
+        area = sum((radius.get(lid, _LEAF_R) + 3.5) ** 2 for lid in roots)
+        outer = math.sqrt(area) * 0.92
+        for index, lid in enumerate(roots):
+            own = radius.get(lid, _LEAF_R)
+            span = max(outer - own, 14.0)
+            dist = math.sqrt((index + 0.5) / count) * span
+            ang = index * golden
+            anchors[lid] = (
+                center[0] + dist * math.cos(ang),
+                center[1] + dist * math.sin(ang) * 0.96,
+            )
+
+    pos: dict[str, tuple[float, float]] = {}
+    place: list[tuple[str, float, float]] = [
+        (lid, anchors[lid][0], anchors[lid][1]) for lid in roots if lid in anchors
+    ]
+    while place:
+        lid, x, y = place.pop()
+        zid = zid_of.get(lid)
+        if zid and zid not in pos:
+            pos[zid] = (x, y)
+        kids = children.get(lid) or []
+        n = len(kids)
+        if not n:
+            continue
+        outer = radius.get(lid, _LEAF_R)
+        for index, kid in enumerate(kids):
+            own = radius.get(kid, _LEAF_R)
+            span = max(outer - own, 12.0)
+            dist = max(12.0, math.sqrt((index + 0.5) / n) * span)
+            ang = (index + 1) * golden
+            place.append((
+                kid,
+                x + dist * math.cos(ang),
+                y + dist * math.sin(ang) * 0.96,
+            ))
+    return pos
+
+
 def _spread_like_obsidian(
     pos: Dict[str, Tuple[float, float]],
     zettels: list,
@@ -379,6 +499,7 @@ def _spread_like_obsidian(
         groups[" ".join((zettel.get("project") or "").split())].append(zid)
     if not groups:
         return
+    by_zid = {zettel["zettel_id"]: zettel for zettel in zettels}
     names = sorted(groups, key=lambda name: len(groups[name]), reverse=True)
     radii = [26.0 * math.sqrt(max(len(groups[name]), 1)) + 36.0 for name in names]
     if len(names) == 1:
@@ -391,9 +512,14 @@ def _spread_like_obsidian(
             for (left, top), (width, height) in zip(origins, boxes)
         ]
     seeded: dict[str, tuple[float, float]] = {}
+    used_families = False
     for name, center, radius in zip(names, centers, radii):
         members = groups[name]
         count = len(members)
+        if count >= _FAMILY_MIN:
+            used_families = True
+            seeded.update(_place_families(members, by_zid, center))
+            continue
         for index, zid in enumerate(members):
             if count == 1:
                 seeded[zid] = center
@@ -404,6 +530,7 @@ def _spread_like_obsidian(
                 center[0] + dist * math.cos(ang),
                 center[1] + dist * math.sin(ang) * 0.96,
             )
+    will_relax = len(seeded) < 30_000 and not used_families
     mentions: dict[str, list[str]] = defaultdict(list)
     links: list[tuple[str, str]] = []
     for edge in edges:
@@ -412,9 +539,12 @@ def _spread_like_obsidian(
         if not left or not right or left in excel_zids or right in excel_zids:
             continue
         if rel == "MENTIONS":
-            mentions[str(right)].append(str(left))
-            links.append((str(left), str(right)))
-        elif rel == "CHILD_OF":
+            bucket = mentions[str(right)]
+            if will_relax or len(bucket) < 64:
+                bucket.append(str(left))
+            if will_relax:
+                links.append((str(left), str(right)))
+        elif rel == "CHILD_OF" and will_relax:
             links.append((str(left), str(right)))
     for eid, point in list(pos.items()):
         if not str(eid).startswith("entity:"):
@@ -426,7 +556,8 @@ def _spread_like_obsidian(
             seeded[eid] = (ax, ay)
         else:
             seeded[eid] = point
-    _relax_cloud(seeded, links)
+    if will_relax:
+        _relax_cloud(seeded, links)
     for zid, xy in seeded.items():
         pos[zid] = xy
 
@@ -522,10 +653,30 @@ def _tag_anchor(points: list[tuple[float, float]]) -> tuple[float, float]:
     )
 
 
+def _positions_large(zettels: list, entities: list, edges: list) -> Dict[str, Tuple[float, float]]:
+    """Сотни тысяч узлов: сразу круги проектов, без дерева и силового расклада."""
+    excel_zids = {
+        z["zettel_id"] for z in zettels if (z.get("thought_type") or "") in _EXCEL_TYPES
+    }
+    pos: Dict[str, Tuple[float, float]] = {}
+    for zettel in zettels:
+        zid = zettel["zettel_id"]
+        if zid not in excel_zids:
+            pos[zid] = (0.0, 0.0)
+    for entity in entities:
+        pos[f"entity:{entity['name']}"] = (0.0, 0.0)
+    for index, zid in enumerate(excel_zids):
+        pos[zid] = (1_000_000.0 + (index % 64) * 40.0, (index // 64) * 40.0)
+    _spread_like_obsidian(pos, zettels, edges, excel_zids)
+    return pos
+
+
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
     zettels = graph_data.get("zettels") or []
     entities = graph_data.get("entities") or []
     edges = graph_data.get("edges") or []
+    if len(zettels) >= 80_000:
+        return _positions_large(zettels, entities, edges)
 
     children: dict[str, list[str]] = defaultdict(list)
     luhmann_to_id: dict[str, str] = {}
@@ -865,6 +1016,8 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         if project:
             color = _palette_index(project)
         label = _excel_label(tt, topic, content) if tt in _EXCEL_TYPES else _node_label(display)
+        if card_count >= 80_000 and group == 0 and radius < 13:
+            label = ""
         nodes.append({
             "x": round(xy[0], 1),
             "y": round(xy[1], 1),
@@ -873,22 +1026,25 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "c": color,
             "l": label,
         })
-        preview = f"{topic}: {_short_text(content, lim_preview)}" if topic else _short_text(content, lim_preview)
-        quote = z.get("source_quote") or ""
-        source = z.get("source_input") or ""
-        meta.append([
-            z["luhmann_id"],
-            z.get("parent_luhmann") or "",
-            _short_text(topic, lim_topic),
-            tt,
-            ", ".join(tags[:8]),
-            _short_text(content, lim_content),
-            preview,
-            "",
-            _public_source_url(source or "text"),
-            _short_text(quote, lim_quote),
-            project,
-        ])
+        if card_count >= 80_000:
+            meta.append([project] if project else [])
+        else:
+            preview = f"{topic}: {_short_text(content, lim_preview)}" if topic else _short_text(content, lim_preview)
+            quote = z.get("source_quote") or ""
+            source = z.get("source_input") or ""
+            meta.append([
+                z["luhmann_id"],
+                z.get("parent_luhmann") or "",
+                _short_text(topic, lim_topic),
+                tt,
+                ", ".join(tags[:8]),
+                _short_text(content, lim_content),
+                preview,
+                "",
+                _public_source_url(source or "text"),
+                _short_text(quote, lim_quote),
+                project,
+            ])
 
     for e in graph_data["entities"]:
         eid = f"entity:{e['name']}"
@@ -1058,9 +1214,29 @@ def encode_graph_html(html: str, accept_encoding: str = "") -> tuple[bytes, dict
     return raw, headers
 
 
+def _thin_edges(edges: list[list[int]], limit: int = 2_000_000) -> list[list[int]]:
+    """На очень большом графе оставляем структуру и ограниченное число связей тегов."""
+    if len(edges) <= limit:
+        return edges
+    kept: list[list[int]] = []
+    mentions = 0
+    mention_budget = 150_000
+    for edge in edges:
+        kind = edge[2]
+        if kind == 1:
+            if mentions >= mention_budget:
+                continue
+            mentions += 1
+        kept.append(edge)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
 def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
     """Компактный payload: параллельные массивы вместо массива объектов."""
     nodes, edges, meta, total_z, total_e, total_r = _pack_graph(graph_data)
+    edges = _thin_edges(edges)
     n = len(nodes)
     eflat: list[int] = []
     for a, b, k in edges:
@@ -1078,18 +1254,93 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "tz": int(total_z),
         "te": int(total_e),
         "tr": int(total_r),
-        "gp": 1 if any(len(row) > 10 and row[10] for row in meta) else 0,
+        "gp": 1 if any(_meta_project(row) for row in meta) else 0,
     }
+
+
+def _meta_project(row: list) -> str:
+    if not row:
+        return ""
+    if len(row) > 10:
+        return str(row[10] or "")
+    return str(row[0] or "")
 
 
 def dumps_payload(payload: dict) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def dumps_binary(payload: dict) -> bytes:
+    """Плотный формат для сотен тысяч узлов: числа массивами, без JSON."""
+    n = int(payload["n"])
+    eflat = payload["e"]
+    edge_count = len(eflat) // 3
+    labels = [
+        (index, str(text).encode("utf-8")[:120])
+        for index, text in enumerate(payload.get("l") or [])
+        if text
+    ]
+    meta = payload.get("m") or []
+    projects: list[bytes] = []
+    proj_of: array.array | None = None
+    if payload.get("gp") and meta:
+        names: dict[str, int] = {}
+        proj_of = array.array("H")
+        for row in meta:
+            name = _meta_project(row)
+            slot = names.get(name)
+            if slot is None:
+                slot = len(projects)
+                names[name] = slot
+                projects.append(str(name).encode("utf-8")[:80])
+            proj_of.append(slot)
+        if len(proj_of) < n:
+            proj_of.extend([0] * (n - len(proj_of)))
+    flags = 1 if proj_of is not None else 0
+    xs = array.array("f", payload["x"])
+    ys = array.array("f", payload["y"])
+    rs = array.array("B", (min(255, int(v)) for v in payload["r"]))
+    gs = array.array("B", (min(255, int(v)) for v in payload["g"]))
+    cs = array.array("B", (min(255, int(v)) for v in payload["c"]))
+    ea = array.array("I", eflat[0::3])
+    eb = array.array("I", eflat[1::3])
+    ek = array.array("B", eflat[2::3])
+    header = struct.pack(
+        "<4sIIIIIIII",
+        b"ZGB1",
+        n,
+        edge_count,
+        len(labels),
+        len(projects),
+        flags,
+        int(payload.get("tz") or 0),
+        int(payload.get("te") or 0),
+        int(payload.get("tr") or 0),
+    )
+    chunks = [header, xs.tobytes(), ys.tobytes(), rs.tobytes(), gs.tobytes(), cs.tobytes()]
+    raw_len = sum(len(part) for part in chunks)
+    pad = (4 - (raw_len % 4)) % 4
+    if pad:
+        chunks.append(b"\0" * pad)
+    chunks.extend((ea.tobytes(), eb.tobytes(), ek.tobytes()))
+    if proj_of is not None:
+        if edge_count & 1:
+            chunks.append(b"\0")
+        chunks.append(proj_of.tobytes())
+        for name in projects:
+            chunks.append(struct.pack("<H", len(name)))
+            chunks.append(name)
+    for index, text in labels:
+        chunks.append(struct.pack("<IH", index, len(text)))
+        chunks.append(text)
+    return b"".join(chunks)
+
+
 def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[bytes, dict]:
-    raw = dumps_payload(payload)
+    binary = int(payload.get("n") or 0) >= 80_000
+    raw = dumps_binary(payload) if binary else dumps_payload(payload)
     headers = {
-        "content-type": "application/json; charset=utf-8",
+        "content-type": "application/octet-stream" if binary else "application/json; charset=utf-8",
         "cache-control": "no-store",
         "x-graph-size": str(len(raw)),
     }
@@ -1127,6 +1378,7 @@ let panDrag = false, nodeDrag = -1, lastX = 0, lastY = 0, moved = false;
 let raf = 0;
 let hay = [];
 const CELL = 160;
+function cellIndex(v) { return Math.floor(v / CELL); }
 let grid = new Map();
 let hubs = [];
 let hubMark = null;
@@ -1137,6 +1389,16 @@ let fitted = false;
 let clusters = [];
 let groupByProject = false;
 let projectLinks = [];
+let PINDEX = null;
+let PNAMES = null;
+let searchIds = null;
+let parentOf = null;
+let childN = null;
+let frameXY = 1;
+let xyStamp = null;
+let xyX = null;
+let xyY = null;
+let lastVis = null;
 let clusterHot = -1;
 let hoverNode = -2;
 let hoverX = 0, hoverY = 0;
@@ -1152,6 +1414,16 @@ function strokeOf(i) {
   return PAL[C[i]][1];
 }
 function isLight() { return document.body.classList.contains('light-theme'); }
+function beginNodeXY() {}
+function nodeXY(i) {
+  return [X[i], Y[i]];
+}
+function overviewRadius(i) {
+  if (R[i] >= 15) return 5.6;
+  if (R[i] >= 11) return 4.3;
+  if (R[i] >= 8) return 3.4;
+  return 2.4;
+}
 function sx(x) { return (x - camX) * zoom + W / 2; }
 function sy(y) { return (y - camY) * zoom + H / 2; }
 function wx(x) { return (x - W / 2) / zoom + camX; }
@@ -1266,6 +1538,9 @@ function buildIndex() {
   adjFrom = new Uint32Array(adjOff[N]);
   const cur = adjOff.slice();
   projectLinks = [];
+  parentOf = new Int32Array(N);
+  parentOf.fill(-1);
+  childN = new Uint32Array(N);
   for (let i = 0; i < E; i++) {
     const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1], k = EFLAT[i * 3 + 2];
     let p = cur[a]++;
@@ -1273,10 +1548,14 @@ function buildIndex() {
     p = cur[b]++;
     adjTo[p] = a; adjK[p] = k; adjFrom[p] = a;
     if (k === 4) projectLinks.push(a, b);
+    if (k === 0 && parentOf[a] < 0) {
+      parentOf[a] = b;
+      childN[b]++;
+    }
   }
   grid = new Map();
   for (let i = 0; i < N; i++) {
-    const cx = X[i] / CELL | 0, cy = Y[i] / CELL | 0;
+    const cx = cellIndex(X[i]), cy = cellIndex(Y[i]);
     const key = cx + ':' + cy;
     let bucket = grid.get(key);
     if (!bucket) {
@@ -1286,6 +1565,7 @@ function buildIndex() {
       grid.set(key, bucket);
     }
     bucket.push(i);
+    if (bucket.maxI == null || R[i] >= R[bucket.maxI]) bucket.maxI = i;
   }
   const rank = [];
   for (let i = 0; i < N; i++) {
@@ -1297,10 +1577,24 @@ function buildIndex() {
   hubMark = new Uint8Array(N);
   for (let h = 0; h < hubs.length; h++) hubMark[hubs[h]] = 1;
   hay = new Array(N);
+  searchIds = N > 40000 ? [] : null;
   for (let i = 0; i < N; i++) {
     const m = META[i] || [];
-    hay[i] = [m[0], m[2], m[4], m[5], m[7], m[10], L[i]].join(' ').toLowerCase();
+    const label = L[i] || '';
+    if (searchIds) {
+      if (label || m[2] || m[10]) {
+        hay[i] = [m[2], m[10], label].join(' ').toLowerCase();
+        searchIds.push(i);
+      } else hay[i] = '';
+    } else {
+      hay[i] = [m[0], m[2], m[4], m[5], m[7], m[10], label].join(' ').toLowerCase();
+    }
   }
+}
+function projectOf(i) {
+  if (PNAMES && PINDEX) return PNAMES[PINDEX[i]] || '';
+  const m = META[i] || [];
+  return String(m[10] || '').trim();
 }
 
 function sourceLabel(raw) {
@@ -1329,7 +1623,7 @@ function buildClusters() {
     const tt = String((META[i] || [])[3] || '');
     if (tt.indexOf('excel_') === 0) continue;
     const m = META[i] || [];
-    const project = String(m[10] || '').trim();
+    const project = projectOf(i);
     const key = (groupByProject && project) ? ('p:' + project) : (C[i] | 0);
     let g = grouped.get(key);
     if (!g) {
@@ -1340,11 +1634,14 @@ function buildClusters() {
         sumY: 0,
         topic: new Map(),
         source: new Map(),
-        project: project
+        project: project,
+        count: 0,
+        nodes: N > 40000 ? null : []
       };
       grouped.set(key, g);
     }
-    g.nodes.push(i);
+    g.count++;
+    if (g.nodes) g.nodes.push(i);
     g.sumX += X[i];
     g.sumY += Y[i];
     const topic = String(m[2] || '').trim();
@@ -1354,6 +1651,38 @@ function buildClusters() {
   }
 
   clusters = [];
+  if (N > 40000) {
+    const acc = new Map();
+    grouped.forEach(function(g, key) {
+      acc.set(key, { outer: 60, cx: g.sumX / g.count, cy: g.sumY / g.count });
+    });
+    for (let i = 0; i < N; i++) {
+      if (G[i] === 1 || G[i] === 2) continue;
+      const tt = String((META[i] || [])[3] || '');
+      if (tt.indexOf('excel_') === 0) continue;
+      const project = projectOf(i);
+      const key = (groupByProject && project) ? ('p:' + project) : (C[i] | 0);
+      const box = acc.get(key);
+      if (!box) continue;
+      const dx = X[i] - box.cx, dy = Y[i] - box.cy;
+      const dist = Math.sqrt(dx * dx + dy * dy) + R[i] + 10;
+      if (dist > box.outer) box.outer = dist;
+    }
+    grouped.forEach(function(g, cid) {
+      const box = acc.get(cid);
+      const count = g.count;
+      const drawR = Math.max(42, Math.min(110, box.outer * 0.18 + 24));
+      const topics = (groupByProject && g.project)
+        ? [g.project]
+        : [...g.topic.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]);
+      const sources = [...g.source.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => x[0]);
+      clusters.push({
+        id: cid, color: g.color, n: count, cx: box.cx, cy: box.cy,
+        r: drawR, hr: Math.max(drawR * 1.18, 64), topics: topics, sources: sources
+      });
+    });
+    return;
+  }
   grouped.forEach(function(g, cid) {
     const count = g.nodes.length;
     if (!count) return;
@@ -1387,22 +1716,30 @@ function buildClusters() {
 }
 
 function reindexNode(i, oldX, oldY) {
-  const oldKey = (oldX / CELL | 0) + ':' + (oldY / CELL | 0);
-  const newKey = (X[i] / CELL | 0) + ':' + (Y[i] / CELL | 0);
+  const oldKey = cellIndex(oldX) + ':' + cellIndex(oldY);
+  const newKey = cellIndex(X[i]) + ':' + cellIndex(Y[i]);
   if (oldKey === newKey) return;
   const ob = grid.get(oldKey);
   if (ob) {
     const ix = ob.indexOf(i);
     if (ix >= 0) ob.splice(ix, 1);
+    if (ob.maxI === i) {
+      ob.maxI = null;
+      for (let k = 0; k < ob.length; k++) {
+        const j = ob[k];
+        if (ob.maxI == null || R[j] >= R[ob.maxI]) ob.maxI = j;
+      }
+    }
   }
   let nb = grid.get(newKey);
   if (!nb) {
     nb = [];
-    nb.cx = X[i] / CELL | 0;
-    nb.cy = Y[i] / CELL | 0;
+    nb.cx = cellIndex(X[i]);
+    nb.cy = cellIndex(Y[i]);
     grid.set(newKey, nb);
   }
   nb.push(i);
+  if (nb.maxI == null || R[i] >= R[nb.maxI]) nb.maxI = i;
 }
 
 function cellsInView(x0, y0, x1, y1) {
@@ -1463,7 +1800,8 @@ function requestDraw() {
 }
 
 function drawNode(i, alpha, ring) {
-  const x = sx(X[i]), y = sy(Y[i]);
+  const xy = nodeXY(i, 0);
+  const x = sx(xy[0]), y = sy(xy[1]);
   const r = screenRadius(i);
   ctx.globalAlpha = nodeAlpha(i, alpha);
   ctx.beginPath();
@@ -1530,13 +1868,15 @@ function drawLabel(i, alpha, light) {
     const dir = outwardOf(i);
     align = dir[0] >= 0 ? 'left' : 'right';
     baseline = 'middle';
-    tx = sx(X[i]) + dir[0] * (r + 8);
-    ty = sy(Y[i]) + dir[1] * (r + 4);
+    const xy = nodeXY(i, 0);
+    tx = sx(xy[0]) + dir[0] * (r + 8);
+    ty = sy(xy[1]) + dir[1] * (r + 4);
   } else {
     align = 'center';
     baseline = 'top';
-    tx = sx(X[i]);
-    ty = sy(Y[i]) + r + 3;
+    const xy = nodeXY(i, 0);
+    tx = sx(xy[0]);
+    ty = sy(xy[1]) + r + 3;
   }
   if (!reserveLabel(tx, ty, L[i], align, baseline)) return false;
   pushHitLabel(i, tx, ty, align, baseline);
@@ -1611,7 +1951,8 @@ function drawHubs(light) {
   for (let h = 0; h < hubs.length; h++) {
     const i = hubs[h];
     if (!nodeVisible(i)) continue;
-    const x = sx(X[i]), y = sy(Y[i]);
+    const xy = nodeXY(i, 0);
+    const x = sx(xy[0]), y = sy(xy[1]);
     if (x < -24 || y < -24 || x > W + 24 || y > H + 24) continue;
     const r = hubRadius(i);
     ctx.globalAlpha = 1;
@@ -1652,7 +1993,68 @@ function drawProjectLinks(light) {
   }
   ctx.restore();
 }
+function drawOverviewBuckets(x0, y0, x1, y1, light) {
+  const bin = 12;
+  const cols = Math.ceil(W / bin) + 2;
+  const rows = Math.ceil(H / bin) + 2;
+  const best = new Int32Array(cols * rows);
+  const bestR = new Uint16Array(cols * rows);
+  best.fill(-1);
+  dotPick = best;
+  drawProjectLinks(light);
+  dotCols = cols;
+  dotBin = bin;
+  const outline = light ? '#ffffff' : '#0b1220';
+  const cx0 = Math.floor(x0 / CELL), cy0 = Math.floor(y0 / CELL);
+  const cx1 = Math.floor(x1 / CELL), cy1 = Math.floor(y1 / CELL);
+  const ncell = (cx1 - cx0 + 1) * (cy1 - cy0 + 1);
+  function consider(bucket) {
+    const i = bucket.maxI;
+    if (i == null) return;
+    if (visMask && !visMask[i]) return;
+    const px = sx(X[i]), py = sy(Y[i]);
+    if (px < -bin || py < -bin || px > W + bin || py > H + bin) return;
+    const bx = (px / bin) | 0, by = (py / bin) | 0;
+    if (bx < 0 || by < 0 || bx >= cols || by >= rows) return;
+    const id = bx + by * cols;
+    if (best[id] >= 0 && R[i] <= bestR[id]) return;
+    best[id] = i;
+    bestR[id] = R[i];
+  }
+  if (ncell > 2500) {
+    grid.forEach(function(bucket) {
+      if (bucket.cx < cx0 || bucket.cx > cx1 || bucket.cy < cy0 || bucket.cy > cy1) return;
+      consider(bucket);
+    });
+  } else {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      for (let cy = cy0; cy <= cy1; cy++) {
+        const bucket = grid.get(cx + ':' + cy);
+        if (bucket) consider(bucket);
+      }
+    }
+  }
+  for (let id = 0; id < best.length; id++) {
+    const i = best[id];
+    if (i < 0) continue;
+    const bx = id % cols, by = (id / cols) | 0;
+    ctx.globalAlpha = nodeAlpha(i, 0.9);
+    ctx.beginPath();
+    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, overviewRadius(i), 0, Math.PI * 2);
+    ctx.fillStyle = fillOf(i);
+    ctx.fill();
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = outline;
+    ctx.stroke();
+  }
+  drawBranchCaptions(light);
+  drawHubs(light);
+}
 function drawOverview(x0, y0, x1, y1, light) {
+  if (N > 40000) {
+    drawOverviewBuckets(x0, y0, x1, y1, light);
+    return;
+  }
   const bin = 12;
   const cols = Math.ceil(W / bin) + 2;
   const rows = Math.ceil(H / bin) + 2;
@@ -1683,7 +2085,7 @@ function drawOverview(x0, y0, x1, y1, light) {
     const bx = id % cols, by = (id / cols) | 0;
     ctx.globalAlpha = nodeAlpha(i, 0.9);
     ctx.beginPath();
-    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, 3.1, 0, Math.PI * 2);
+    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, overviewRadius(i), 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
     ctx.fill();
     ctx.lineWidth = 1.4;
@@ -1697,6 +2099,7 @@ function drawOverview(x0, y0, x1, y1, light) {
 function draw() {
   hitLabels = [];
   const light = isLight();
+  beginNodeXY();
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.globalAlpha = 1;
   ctx.fillStyle = light ? '#f8fafc' : '#0b1220';
@@ -1725,6 +2128,7 @@ function draw() {
     return;
   }
   dotPick = null;
+  lastVis = vis;
   drawProjectLinks(light);
   const showTags = tagsOn && zoom >= 0.28;
   const showEdges = true;
@@ -1791,7 +2195,8 @@ function draw() {
         const projectLink = k === 4;
         if (!bridge && !projectLink && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
         if (!bridge && !projectLink && rowEdge && selected !== a && selected !== b) continue;
-        const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
+        const pa = nodeXY(a, 0), pb = nodeXY(b, 0);
+        const ax = pa[0], ay = pa[1], bx = pb[0], by = pb[1];
         if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
         const dx = bx - ax, dy = by - ay;
         const len = Math.hypot(dx, dy);
@@ -1854,15 +2259,29 @@ function hit(px, py) {
     const b = hitLabels[k];
     if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return b.i;
   }
+  let best = -1, bestD = 1e12;
+  if (!dotPick && lastVis && zoom > 0.55) {
+    for (let c = 0; c < lastVis.length; c++) {
+      const i = lastVis[c];
+      if (!nodeVisible(i)) continue;
+      const xy = nodeXY(i, 0);
+      const cx = sx(xy[0]), cy = sy(xy[1]);
+      const dx = cx - px, dy = cy - py;
+      const d2 = dx * dx + dy * dy;
+      const r = Math.max(screenRadius(i), 11);
+      if (d2 <= (r + 8) * (r + 8) && d2 < bestD) { best = i; bestD = d2; }
+    }
+    if (best >= 0) return best;
+  }
   const reach = 64 / Math.max(zoom, 0.04);
   const x = wx(px), y = wy(py);
   const cand = cellsInView(x - reach, y - reach, x + reach, y + reach);
-  let best = -1, bestD = 1e12;
   for (let c = 0; c < cand.length; c++) {
     const i = cand[c];
     const hub = dotPick && hubMark && hubMark[i];
     if (!nodeVisible(i) && !hub) continue;
-    const cx = sx(X[i]), cy = sy(Y[i]);
+    const xy = nodeXY(i, 0);
+    const cx = sx(xy[0]), cy = sy(xy[1]);
     const dx = cx - px, dy = cy - py;
     const d2 = dx * dx + dy * dy;
     const r = hub ? hubRadius(i) : Math.max(screenRadius(i), 11);
@@ -1894,7 +2313,8 @@ function drawHotMarks() {
   const labeled = [];
   for (let i = 0; i < N && marked < 240; i++) {
     if (!hot[i]) continue;
-    const x = sx(X[i]), y = sy(Y[i]);
+    const xy = nodeXY(i, 0);
+    const x = sx(xy[0]), y = sy(xy[1]);
     if (x < -30 || y < -30 || x > W + 30 || y > H + 30) continue;
     const r = Math.max(hot[i] === 2 ? 10 : 6, Math.min(18, screenRadius(i)));
     ctx.globalAlpha = nodeAlpha(i, 1);
@@ -1990,7 +2410,10 @@ function showDetail(idx) {
   const panel = document.getElementById('detail-panel');
   const content = document.getElementById('detail-content');
   let html = '<h2>' + esc(L[idx]) + '</h2>';
-  if (G[idx] === 0) {
+  if (G[idx] === 0 && !m[0] && !m[2] && !m[5]) {
+    const project = projectOf(idx);
+    if (project) html += '<div class="field"><div class="field-label">Проект</div><div class="field-value">' + esc(project) + '</div></div>';
+  } else if (G[idx] === 0) {
     html += '<div class="field-value"><b>[' + esc(m[0]) + ']</b> ' +
       (m[1] ? '← [' + esc(m[1]) + ']' : 'корневая') + '</div>';
     if (m[2]) html += '<div class="field"><div class="field-label">Тема</div><div class="field-value">' + esc(m[2]) + '</div></div>';
@@ -2169,7 +2592,7 @@ window.addEventListener('mousemove', function(e) {
 function applyZoomAt(mx, my, factor) {
   if (!factor || factor === 1) return;
   const beforeX = wx(mx), beforeY = wy(my);
-  zoom = Math.max(1e-8, Math.min(3.5, zoom * factor));
+  zoom = Math.max(1e-8, Math.min(12, zoom * factor));
   camX = beforeX - (mx - W / 2) / zoom;
   camY = beforeY - (my - H / 2) / zoom;
   requestDraw();
@@ -2230,8 +2653,11 @@ function applySearch(raw) {
   const matched = [];
   let tagHit = false;
   let rowHit = false;
-  for (let i = 0; i < N; i++) {
-    if (hay[i].indexOf(q) !== -1) {
+  const scan = searchIds || null;
+  const scanN = scan ? scan.length : N;
+  for (let s = 0; s < scanN; s++) {
+    const i = scan ? scan[s] : s;
+    if (hay[i] && hay[i].indexOf(q) !== -1) {
       matched.push(i);
       if (G[i] === 1) tagHit = true;
       if (G[i] === 2) rowHit = true;
@@ -2250,7 +2676,8 @@ function applySearch(raw) {
     const i = matched[m];
     hot[i] = 2;
     const start = adjOff[i], end = adjOff[i + 1];
-    for (let p = start; p < end; p++) {
+    const nbrCap = N > 40000 ? Math.min(end, start + 48) : end;
+    for (let p = start; p < nbrCap; p++) {
       const ni = adjTo[p];
       visMask[ni] = 1;
       if (hot[ni] !== 2) hot[ni] = 1;
@@ -2367,16 +2794,74 @@ async function inflateB64(b64) {
   throw new Error('Нет DecompressionStream');
 }
 
+function parseBinary(buffer) {
+  const buf = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
+  const view = new DataView(buf);
+  if (view.getUint8(0) !== 90 || view.getUint8(1) !== 71 || view.getUint8(2) !== 66 || view.getUint8(3) !== 49) {
+    throw new Error('Неизвестный формат графа');
+  }
+  let o = 4;
+  const n = view.getUint32(o, true); o += 4;
+  const e = view.getUint32(o, true); o += 4;
+  const nlab = view.getUint32(o, true); o += 4;
+  const nproj = view.getUint32(o, true); o += 4;
+  const flags = view.getUint32(o, true); o += 4;
+  const tz = view.getUint32(o, true); o += 4;
+  const te = view.getUint32(o, true); o += 4;
+  const tr = view.getUint32(o, true); o += 4;
+  const x = new Float32Array(buf.slice(o, o + n * 4)); o += n * 4;
+  const y = new Float32Array(buf.slice(o, o + n * 4)); o += n * 4;
+  const r = new Uint8Array(buf.slice(o, o + n)); o += n;
+  const g = new Uint8Array(buf.slice(o, o + n)); o += n;
+  const c = new Uint8Array(buf.slice(o, o + n)); o += n;
+  o = (o + 3) & ~3;
+  const ea = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
+  const eb = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
+  const ek = new Uint8Array(buf.slice(o, o + e)); o += e;
+  const eflat = new Uint32Array(e * 3);
+  for (let i = 0; i < e; i++) {
+    eflat[i * 3] = ea[i];
+    eflat[i * 3 + 1] = eb[i];
+    eflat[i * 3 + 2] = ek[i];
+  }
+  let pi = null;
+  let pnames = null;
+  const dec = new TextDecoder();
+  if (flags & 1) {
+    if (o & 1) o += 1;
+    pi = new Uint16Array(buf.slice(o, o + n * 2));
+    o += n * 2;
+    pnames = new Array(nproj);
+    for (let i = 0; i < nproj; i++) {
+      const len = view.getUint16(o, true); o += 2;
+      pnames[i] = dec.decode(new Uint8Array(buf, o, len));
+      o += len;
+    }
+  }
+  const labels = new Array(n);
+  for (let i = 0; i < nlab; i++) {
+    const index = view.getUint32(o, true); o += 4;
+    const len = view.getUint16(o, true); o += 2;
+    labels[index] = dec.decode(new Uint8Array(buf, o, len));
+    o += len;
+  }
+  return {
+    n: n, x: x, y: y, r: r, g: g, c: c, l: labels, m: [], e: eflat,
+    tz: tz, te: te, tr: tr, gp: flags & 1, pi: pi, pnames: pnames
+  };
+}
 function applyPayload(data) {
   N = data.n || 0;
-  X = Float32Array.from(data.x || []);
-  Y = Float32Array.from(data.y || []);
-  R = Uint16Array.from(data.r || []);
-  G = Uint8Array.from(data.g || []);
-  C = Uint8Array.from(data.c || []);
+  X = data.x instanceof Float32Array ? data.x : Float32Array.from(data.x || []);
+  Y = data.y instanceof Float32Array ? data.y : Float32Array.from(data.y || []);
+  R = (data.r instanceof Uint8Array || data.r instanceof Uint16Array) ? data.r : Uint16Array.from(data.r || []);
+  G = data.g instanceof Uint8Array ? data.g : Uint8Array.from(data.g || []);
+  C = data.c instanceof Uint8Array ? data.c : Uint8Array.from(data.c || []);
   L = data.l || [];
   META = data.m || [];
   EFLAT = data.e || [];
+  PINDEX = data.pi || null;
+  PNAMES = data.pnames || null;
   E = (EFLAT.length / 3) | 0;
   groupByProject = !!data.gp;
   hot = null;
@@ -2447,7 +2932,12 @@ async function readGraph(resp) {
     buf.set(chunks[i], off);
     off += chunks[i].length;
   }
-  const data = JSON.parse(new TextDecoder().decode(buf));
+  let data;
+  if (buf.length >= 4 && buf[0] === 90 && buf[1] === 71 && buf[2] === 66 && buf[3] === 49) {
+    data = parseBinary(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  } else {
+    data = JSON.parse(new TextDecoder().decode(buf));
+  }
   setLoad(100, 'Готово');
   await paintLoad();
   return data;
@@ -2457,7 +2947,7 @@ async function readGraph(resp) {
   try {
     let data;
     if (DATA_URL) {
-      const resp = await fetch(DATA_URL, { headers: { 'Accept': 'application/json' } });
+      const resp = await fetch(DATA_URL, { headers: { 'Accept': 'application/octet-stream, application/json' } });
       if (!resp.ok) throw new Error('Не удалось загрузить граф');
       data = await readGraph(resp);
     } else if (DATA_B64) {

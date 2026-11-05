@@ -6,6 +6,7 @@ import json
 import os
 import uuid
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ ATOMIZER_CHUNK_CHARS = 5000
 ATOMIZER_CHUNK_OVERLAP = 1200
 ATOMIZER_PRIOR_THOUGHTS = 16
 ATOMIZER_PRIOR_CHARS = 4000
+ATOMIZER_PARALLEL = max(1, int(os.getenv("ATOMIZER_PARALLEL", "4")))
 
 
 _TAG_WORD = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
@@ -270,34 +272,77 @@ class NoteAtomizer:
         """
         Текст заметки → список Zettel-карточек.
 
-        Длинный документ режется на фрагменты с перекрытием. Каждый следующий
-        вызов видит уже извлечённые мысли, поэтому иерархия остаётся как у
-        цельного разбора. Карточки и Luhmann-id собираются один раз в конце.
+        Длинный документ режется на фрагменты с перекрытием. Несколько соседних
+        фрагментов атомизируются параллельно. Следующая волна видит уже извлечённые
+        мысли, поэтому иерархия между волнами сохраняется. Карточки и Luhmann-id
+        собираются один раз в конце, до связывания.
         """
         text = text.strip()
         if not text:
             return ("Пустой текст заметки")
         try:
             chunks = self._split_text_for_llm(text)
-            all_thoughts: list[AtomicThought] = []
-            total = len(chunks)
-            for i, chunk in enumerate(chunks, 1):
-                if on_progress:
-                    on_progress(i, total)
-                part = (i, total) if total > 1 else None
-                thoughts = self._extract_thoughts(
-                    chunk.body,
-                    prior_thoughts=all_thoughts,
-                    overlap=chunk.overlap,
-                    part=part,
-                )
-                all_thoughts.extend(self._dedupe_thoughts(all_thoughts, thoughts))
+            all_thoughts = self._atomize_chunks(chunks, on_progress)
             cards = self._build_cards(all_thoughts, current_db_max_root_id)
             return self._validate_and_fix(cards)
         except Exception as e:
             if type(e).__name__ == "IngestCancelled":
                 raise
             return (f"Ошибка при извлечении атомарных мыслей: {e}")
+
+    def _atomize_chunks(
+        self,
+        chunks: list[TextChunk],
+        on_progress: Optional[Callable[[int, int], None]],
+    ) -> list[AtomicThought]:
+        """Волны по ATOMIZER_PARALLEL фрагментов. Внутри волны запросы идут вместе."""
+        total = len(chunks)
+        if total <= 1 or ATOMIZER_PARALLEL <= 1:
+            return self._atomize_sequential(chunks, on_progress)
+        all_thoughts: list[AtomicThought] = []
+        step = min(ATOMIZER_PARALLEL, total)
+        with ThreadPoolExecutor(max_workers=step, thread_name_prefix="atom") as pool:
+            start = 0
+            while start < total:
+                wave = chunks[start:start + step]
+                end = start + len(wave)
+                if on_progress:
+                    on_progress(end, total)
+                prior = list(all_thoughts)
+                futures = [
+                    pool.submit(
+                        self._extract_thoughts,
+                        chunk.body,
+                        prior,
+                        chunk.overlap,
+                        (start + offset + 1, total),
+                    )
+                    for offset, chunk in enumerate(wave)
+                ]
+                for future in futures:
+                    all_thoughts.extend(self._dedupe_thoughts(all_thoughts, future.result()))
+                start = end
+        return all_thoughts
+
+    def _atomize_sequential(
+        self,
+        chunks: list[TextChunk],
+        on_progress: Optional[Callable[[int, int], None]],
+    ) -> list[AtomicThought]:
+        all_thoughts: list[AtomicThought] = []
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, 1):
+            if on_progress:
+                on_progress(index, total)
+            part = (index, total) if total > 1 else None
+            thoughts = self._extract_thoughts(
+                chunk.body,
+                prior_thoughts=all_thoughts,
+                overlap=chunk.overlap,
+                part=part,
+            )
+            all_thoughts.extend(self._dedupe_thoughts(all_thoughts, thoughts))
+        return all_thoughts
 
     @staticmethod
     def _is_length_limit_error(exc: Exception) -> bool:
