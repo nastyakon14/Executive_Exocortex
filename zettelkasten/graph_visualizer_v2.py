@@ -1240,20 +1240,9 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
     nodes, edges, meta, total_z, total_e, total_r = _pack_graph(graph_data)
     n = len(nodes)
     edges = _thin_edges(edges, limit=300_000 if n >= 40_000 else 2_000_000)
-    binary = n >= 25_000
-    ea = eb = ek = None
     eflat: list[int] = []
-    if binary:
-        ea = array.array("I")
-        eb = array.array("I")
-        ek = array.array("B")
-        for a, b, k in edges:
-            ea.append(int(a))
-            eb.append(int(b))
-            ek.append(int(k))
-    else:
-        for a, b, k in edges:
-            eflat.extend((int(a), int(b), int(k)))
+    for a, b, k in edges:
+        eflat.extend((int(a), int(b), int(k)))
     return {
         "n": n,
         "x": [float(nodes[i]["x"]) for i in range(n)],
@@ -1264,9 +1253,6 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "l": [nodes[i]["l"] for i in range(n)],
         "m": meta,
         "e": eflat,
-        "ea": ea,
-        "eb": eb,
-        "ek": ek,
         "tz": int(total_z),
         "te": int(total_e),
         "tr": int(total_r),
@@ -1362,14 +1348,13 @@ def dumps_binary(payload: dict) -> bytes:
 
 
 def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[bytes, dict]:
-    binary = int(payload.get("n") or 0) >= 25_000
-    raw = dumps_binary(payload) if binary else dumps_payload(payload)
+    raw = dumps_payload(payload)
     headers = {
-        "content-type": "application/octet-stream" if binary else "application/json; charset=utf-8",
+        "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
         "x-graph-size": str(len(raw)),
     }
-    if not binary and "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
+    if "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
         level = 1 if len(raw) > 1_500_000 else 4
         return gzip.compress(raw, compresslevel=level), {
             **headers,
@@ -2102,11 +2087,23 @@ function drawOverviewBuckets(x0, y0, x1, y1, light) {
   drawBranchCaptions(light);
   drawHubs(light);
 }
-function drawOverview(x0, y0, x1, y1, light) {
-  if (N > 2500) {
-    drawOverviewBuckets(x0, y0, x1, y1, light);
-    return;
+function collectVisible(x0, y0, x1, y1, limit) {
+  const out = [];
+  const step = Math.max(1, Math.floor(N / Math.max(limit, 1)));
+  for (let i = 0; i < N; i += step) {
+    if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
+    if (G[i] === 2 && !(hot && hot[i])) continue;
+    out.push(i);
+    if (out.length >= limit) break;
   }
+  for (let i = 0; i < N; i++) {
+    if (R[i] < 8 || G[i] === 2) continue;
+    if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
+    out.push(i);
+  }
+  return out;
+}
+function drawOverview(x0, y0, x1, y1, light) {
   const bin = 12;
   const cols = Math.ceil(W / bin) + 2;
   const rows = Math.ceil(H / bin) + 2;
@@ -2122,6 +2119,7 @@ function drawOverview(x0, y0, x1, y1, light) {
     if (G[i] === 2 && !(hot && hot[i] === 2)) continue;
     if (G[i] === 1 && !tagsOn && !(hot && hot[i])) continue;
     if (visMask && !visMask[i]) continue;
+    if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
     const px = sx(X[i]), py = sy(Y[i]);
     if (px < -bin || py < -bin || px > W + bin || py > H + bin) continue;
     const bx = (px / bin) | 0, by = (py / bin) | 0;
@@ -2167,10 +2165,11 @@ function draw() {
   }
   const pad = 90 / Math.max(zoom, 0.02);
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
-  let overview = !indexReady || zoom < 0.07 || (N > 2000 && zoom < 0.24);
+  let overview = zoom < 0.07 || (N > 2000 && zoom < 0.24);
   let vis = null;
   if (!overview) {
     vis = cellsInView(x0, y0, x1, y1);
+    if (!vis.length) vis = collectVisible(x0, y0, x1, y1, 2400);
     if (vis.length > 1600) overview = true;
   }
   if (overview) {
