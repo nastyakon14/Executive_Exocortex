@@ -1347,6 +1347,84 @@ def dumps_binary(payload: dict) -> bytes:
     return b"".join(chunks)
 
 
+def build_overview_binary(zettels: list) -> bytes:
+    """Короткий ответ для большого графа: координаты и цвет, без текстов и связей."""
+    n = len(zettels)
+    if n >= 4_000:
+        positions = _positions_large(zettels, [], [])
+    else:
+        positions = _compute_node_positions({"zettels": zettels, "entities": [], "edges": []})
+    parent_by = {z["luhmann_id"]: z.get("parent_luhmann") or "" for z in zettels}
+    depths = _node_depths(parent_by, [z["luhmann_id"] for z in zettels])
+    root_of = _root_lookup(parent_by)
+    roots = sorted({root_of(z["luhmann_id"]) for z in zettels}, key=_luhmann_sort_key)
+    color_index = {root: i % len(_BRANCH_PALETTE) for i, root in enumerate(roots)}
+    xs = array.array("f")
+    ys = array.array("f")
+    rs = array.array("B")
+    gs = array.array("B")
+    cs = array.array("B")
+    names: dict[str, int] = {}
+    project_names: list[bytes] = []
+    proj_of = array.array("H")
+    labels: list[tuple[int, bytes]] = []
+    has_project = any(z.get("project") for z in zettels)
+    for index, zettel in enumerate(zettels):
+        point = positions.get(zettel["zettel_id"], (0.0, 0.0))
+        xs.append(float(point[0]))
+        ys.append(float(point[1]))
+        lid = zettel["luhmann_id"]
+        depth = depths.get(lid, 0)
+        root = root_of(lid)
+        thought = zettel.get("thought_type") or ""
+        group, radius, color = _excel_node_style(
+            thought, lid, parent_by, color_index, root, depth, 0,
+        )
+        project = zettel.get("project") or ""
+        if project:
+            color = _palette_index(project)
+        rs.append(min(255, max(5, int(round(radius * 0.7)))))
+        gs.append(group & 255)
+        cs.append(color & 255)
+        if has_project:
+            slot = names.get(project)
+            if slot is None:
+                slot = len(project_names)
+                names[project] = slot
+                project_names.append(project.encode("utf-8")[:80])
+            proj_of.append(slot)
+        topic = " ".join((zettel.get("topic") or "").split())
+        if topic and depth <= 1 and group == 0:
+            labels.append((index, topic.encode("utf-8")[:80]))
+    flags = 1 if has_project else 0
+    header = struct.pack(
+        "<4sIIIIIIII",
+        b"ZGB1",
+        n,
+        0,
+        len(labels),
+        len(project_names),
+        flags,
+        n,
+        0,
+        0,
+    )
+    chunks = [header, xs.tobytes(), ys.tobytes(), rs.tobytes(), gs.tobytes(), cs.tobytes()]
+    raw_len = sum(len(part) for part in chunks)
+    pad = (4 - (raw_len % 4)) % 4
+    if pad:
+        chunks.append(b"\0" * pad)
+    if has_project:
+        chunks.append(proj_of.tobytes())
+        for name in project_names:
+            chunks.append(struct.pack("<H", len(name)))
+            chunks.append(name)
+    for index, text in labels:
+        chunks.append(struct.pack("<IH", index, len(text)))
+        chunks.append(text)
+    return b"".join(chunks)
+
+
 def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[bytes, dict]:
     raw = dumps_payload(payload)
     headers = {
@@ -2115,19 +2193,27 @@ function drawOverview(x0, y0, x1, y1, light) {
   dotCols = cols;
   dotBin = bin;
   const outline = light ? '#ffffff' : '#0b1220';
-  for (let i = 0; i < N; i++) {
-    if (G[i] === 2 && !(hot && hot[i] === 2)) continue;
-    if (G[i] === 1 && !tagsOn && !(hot && hot[i])) continue;
-    if (visMask && !visMask[i]) continue;
-    if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) continue;
+  const step = N > 60000 ? 4 : 1;
+  function considerNode(i) {
+    if (G[i] === 2 && !(hot && hot[i] === 2)) return;
+    if (G[i] === 1 && !tagsOn && !(hot && hot[i])) return;
+    if (visMask && !visMask[i]) return;
+    if (X[i] < x0 || X[i] > x1 || Y[i] < y0 || Y[i] > y1) return;
     const px = sx(X[i]), py = sy(Y[i]);
-    if (px < -bin || py < -bin || px > W + bin || py > H + bin) continue;
+    if (px < -bin || py < -bin || px > W + bin || py > H + bin) return;
     const bx = (px / bin) | 0, by = (py / bin) | 0;
-    if (bx < 0 || by < 0 || bx >= cols || by >= rows) continue;
+    if (bx < 0 || by < 0 || bx >= cols || by >= rows) return;
     const id = bx + by * cols;
-    if (best[id] >= 0 && R[i] <= bestR[id]) continue;
+    if (best[id] >= 0 && R[i] <= bestR[id]) return;
     best[id] = i;
     bestR[id] = R[i];
+  }
+  for (let i = 0; i < N; i += step) considerNode(i);
+  if (step > 1) {
+    for (let i = 0; i < N; i++) {
+      if (R[i] < 8 || G[i] === 2) continue;
+      considerNode(i);
+    }
   }
   for (let id = 0; id < best.length; id++) {
     const i = best[id];

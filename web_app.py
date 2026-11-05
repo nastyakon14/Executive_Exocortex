@@ -63,6 +63,7 @@ from zettelkasten.anonymizer import Anonymizer, EntityMap, unmask_card
 from zettelkasten.atomizer import NoteAtomizer
 from zettelkasten.graph_rag import GraphRAG, strip_luhmann_marks
 from zettelkasten.graph_visualizer_v2 import (
+    build_overview_binary,
     encode_graph_html,
     encode_graph_payload,
     pack_graph_payload,
@@ -5736,6 +5737,22 @@ _graph_cache_lock = threading.Lock()
 def _drop_graph_cache() -> None:
     with _graph_cache_lock:
         _graph_cache.clear()
+    folder = Path("data/graph_cache")
+    if folder.exists():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _overview_cache_file(key: tuple) -> Path:
+    token = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()
+    return Path("data/graph_cache") / f"{token}.zgb"
+
+
+def _overview_headers(body: bytes) -> dict:
+    return {
+        "content-type": "application/octet-stream",
+        "cache-control": "no-store",
+        "x-graph-size": str(len(body)),
+    }
 
 
 def _remember_graph(key: tuple, body: bytes, headers: dict) -> None:
@@ -5761,7 +5778,41 @@ async def api_graph(slug: str, request: Request):
         count = linker.repository.total_count(scope["graph_id"])
     binary = count >= 25_000
     use_gzip = (not binary) and "gzip" in encoding.lower()
-    key = (ids, int(count), str(scope.get("data_updated_at") or ""), binary, use_gzip)
+    stamp = str(scope.get("data_updated_at") or "")
+    if int(count) >= 4_000:
+        key = (ids, int(count), stamp, "overview")
+        with _graph_cache_lock:
+            cached = _graph_cache.get(key)
+        if cached:
+            return Response(content=cached[0], headers=cached[1])
+        cache_file = _overview_cache_file(key)
+        if cache_file.exists():
+            body = cache_file.read_bytes()
+            headers = _overview_headers(body)
+            _remember_graph(key, body, headers)
+            return Response(content=body, headers=headers)
+        started = time.perf_counter()
+        print(f"[graph] быстрый вид, карточек {count}", flush=True)
+        if scope["readonly"]:
+            rows = linker.repository.export_overview_rows(
+                list(ids), scope.get("project_labels") or {}, prefix_luhmann=True,
+            )
+        else:
+            rows = linker.repository.export_overview_rows(list(ids))
+        body = build_overview_binary(rows)
+        headers = _overview_headers(body)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_file.with_suffix(".tmp")
+        temporary.write_bytes(body)
+        temporary.replace(cache_file)
+        _remember_graph(key, body, headers)
+        print(
+            f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}, "
+            f"{time.perf_counter() - started:.1f} с",
+            flush=True,
+        )
+        return Response(content=body, headers=headers)
+    key = (ids, int(count), stamp, binary, use_gzip)
     with _graph_cache_lock:
         cached = _graph_cache.get(key)
     if cached:

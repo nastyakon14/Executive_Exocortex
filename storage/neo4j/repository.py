@@ -1166,6 +1166,58 @@ class ZettelRepository:
         print(self.get_graph_text(user_id))
         print("═" * 70 + "\n")
 
+    def export_overview_rows(
+        self,
+        user_ids: List[str],
+        labels: Optional[Dict[str, str]] = None,
+        prefix_luhmann: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Только карточки и родитель: без текстов, тегов и остальных связей."""
+        if not user_ids:
+            return []
+        labels = labels or {}
+        rows = self.client.execute_read(
+            """
+            MATCH (z:Zettel)
+            WHERE z.user_id IN $user_ids
+            OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
+            WHERE parent.user_id = z.user_id
+            RETURN z.user_id AS user_id,
+                   z.zettel_id AS zettel_id,
+                   z.luhmann_id AS luhmann_id,
+                   z.thought_type AS thought_type,
+                   left(coalesce(z.topic, ''), 32) AS topic,
+                   parent.luhmann_id AS parent_luhmann
+            """,
+            {"user_ids": user_ids},
+        )
+        prefix_by_uid: Dict[str, str] = {}
+        project_by_uid: Dict[str, str] = {}
+        if prefix_luhmann:
+            for uid in user_ids:
+                label = re.sub(r"\s+", " ", labels.get(uid, uid)).strip() or uid
+                prefix_by_uid[uid] = label[:18]
+                project_by_uid[uid] = label[:80]
+        zettels = []
+        for row in rows:
+            uid = row.get("user_id") or ""
+            luhmann = row.get("luhmann_id") or ""
+            parent_luhmann = row.get("parent_luhmann") or ""
+            if prefix_luhmann:
+                short = prefix_by_uid.get(uid, uid)
+                luhmann = f"{short}/{luhmann}"
+                if parent_luhmann:
+                    parent_luhmann = f"{short}/{parent_luhmann}"
+            zettels.append({
+                "zettel_id": row["zettel_id"],
+                "luhmann_id": luhmann,
+                "parent_luhmann": parent_luhmann,
+                "thought_type": row.get("thought_type") or "",
+                "topic": row.get("topic") or "",
+                "project": project_by_uid.get(uid, "") if prefix_luhmann else "",
+            })
+        return zettels
+
     def export_graph_data(self, user_id: str) -> Dict[str, Any]:
         """
         Экспортирует полный граф пользователя для визуализации:
