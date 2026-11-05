@@ -101,10 +101,67 @@ def _node_depths(parent_by_luhmann: dict, ids: list[str]) -> dict[str, int]:
     return depth
 
 
-def _tree_metrics(order: list[str], kids_of) -> tuple[dict[str, int], dict[str, int]]:
-    """Число листьев и глубина дерева. Явный стек, чтобы длинная ветка не падала по рекурсии."""
-    leaves: dict[str, int] = {}
-    depths: dict[str, int] = {}
+_XU = 52.0
+_YU = 36.0
+_CHAIN = 5
+_WRAP = 5
+
+
+def _absorb_chain(lid: str, kids_of) -> tuple[list[str], list[str]]:
+    """Прямая цепочка от узла до первого ветвления."""
+    nodes: list[str] = []
+    seen: set[str] = set()
+    current = lid
+    tail: list[str] = []
+    while current and current not in seen:
+        seen.add(current)
+        nodes.append(current)
+        kids = [child for child in kids_of(current) if child not in seen]
+        if len(kids) != 1:
+            tail = kids
+            break
+        current = kids[0]
+    return nodes, tail
+
+
+def _pack_size(shapes: list[tuple[float, float]]) -> tuple[float, float]:
+    total_w = 0.0
+    total_h = 0.0
+    row_w = 0.0
+    row_h = 0.0
+    filled = 0
+    for width, height in shapes:
+        if filled == _WRAP:
+            total_w = max(total_w, row_w)
+            total_h += row_h
+            row_w = 0.0
+            row_h = 0.0
+            filled = 0
+        row_w += width
+        row_h = max(row_h, height)
+        filled += 1
+    total_w = max(total_w, row_w)
+    total_h += row_h
+    return total_w, total_h
+
+
+def _block_size(lid: str, kids_of, memo: dict[str, tuple[float, float]]) -> tuple[float, float]:
+    nodes, tail = _absorb_chain(lid, kids_of)
+    cols = max(1, math.ceil(len(nodes) / _CHAIN))
+    rows = min(len(nodes), _CHAIN)
+    width = cols * _XU
+    height = rows * _YU
+    if tail:
+        shapes = [memo.get(child, (_XU, _YU)) for child in tail]
+        child_w, child_h = _pack_size(shapes)
+        width = max(width, child_w)
+        height += child_h
+    return width, height
+
+
+def _subtree_spans(order: list[str], kids_of, x_unit: float, y_gap: float) -> tuple[dict[str, float], dict[str, float]]:
+    """Родитель сверху, дети снизу. Длинная цепочка ложится короткими столбцами."""
+    memo: dict[str, tuple[float, float]] = {}
     color: dict[str, int] = {}
     for start in order:
         if color.get(start) == 2:
@@ -113,29 +170,23 @@ def _tree_metrics(order: list[str], kids_of) -> tuple[dict[str, int], dict[str, 
         while stack:
             lid, expanded = stack.pop()
             if expanded:
-                children = kids_of(lid)
-                if children:
-                    leaves[lid] = max(sum(leaves.get(child, 1) for child in children), 1)
-                    depths[lid] = 1 + max(depths.get(child, 0) for child in children)
-                else:
-                    leaves[lid] = 1
-                    depths[lid] = 1
+                memo[lid] = _block_size(lid, kids_of, memo)
                 color[lid] = 2
                 continue
             if color.get(lid) == 2:
                 continue
             if color.get(lid) == 1:
-                leaves[lid] = 1
-                depths[lid] = 1
+                memo[lid] = (_XU, _YU)
                 color[lid] = 2
                 continue
             color[lid] = 1
             stack.append((lid, True))
             for child in reversed(kids_of(lid)):
-                state = color.get(child, 0)
-                if state == 0:
+                if color.get(child, 0) == 0:
                     stack.append((child, False))
-    return leaves, depths
+    width = {lid: memo.get(lid, (_XU, _YU))[0] for lid in order}
+    height = {lid: memo.get(lid, (_XU, _YU))[1] for lid in order}
+    return width, height
 
 
 def _place_tree(
@@ -143,31 +194,55 @@ def _place_tree(
     x_left: float,
     y: float,
     kids_of,
-    leaves: dict[str, int],
+    width: dict[str, float],
+    height: dict[str, float],
     x_unit: float,
     y_gap: float,
     luhmann_to_id: dict[str, str],
     pos: dict,
 ) -> None:
-    stack: list[tuple[str, float, float]] = [(root, x_left, y)]
+    """Сверху родитель, под ним дети слева направо. Цепочка читается сверху вниз."""
     guard: set[str] = set()
-    while stack:
-        lid, left, row_y = stack.pop()
+
+    def place(lid: str, left: float, top: float) -> None:
         if lid in guard:
-            continue
-        guard.add(lid)
-        width = leaves.get(lid, 1) * x_unit
-        zid = luhmann_to_id.get(lid)
-        if zid:
-            pos[zid] = (left + width / 2, row_y)
-        cursor = left
-        frames: list[tuple[str, float, float]] = []
-        for child in kids_of(lid):
-            child_w = leaves.get(child, 1) * x_unit
-            frames.append((child, cursor, row_y + y_gap))
-            cursor += child_w
-        for frame in reversed(frames):
-            stack.append(frame)
+            return
+        nodes, tail = _absorb_chain(lid, kids_of)
+        block_w = width.get(lid, _XU)
+        cols = max(1, math.ceil(len(nodes) / _CHAIN))
+        rows = min(len(nodes), _CHAIN)
+        chain_w = cols * _XU
+        origin_x = left + max(0.0, (block_w - chain_w) / 2.0)
+        for index, node in enumerate(nodes):
+            if node in guard:
+                continue
+            guard.add(node)
+            col = index // _CHAIN
+            row = index % _CHAIN
+            zid = luhmann_to_id.get(node)
+            if zid:
+                pos[zid] = (origin_x + col * _XU + _XU / 2.0, top + row * _YU)
+        if not tail:
+            return
+        shapes = [(width.get(child, _XU), height.get(child, _YU)) for child in tail]
+        pack_w, _pack_h = _pack_size(shapes)
+        cursor_x = left + max(0.0, (block_w - pack_w) / 2.0)
+        cursor_y = top + rows * _YU
+        row_h = 0.0
+        filled = 0
+        origin_row = cursor_x
+        for child, (child_w, child_h) in zip(tail, shapes):
+            if filled == _WRAP:
+                cursor_y += row_h
+                cursor_x = origin_row
+                row_h = 0.0
+                filled = 0
+            place(child, cursor_x, cursor_y)
+            cursor_x += child_w
+            row_h = max(row_h, child_h)
+            filled += 1
+
+    place(root, x_left, y)
 
 
 def _assign_branch_colors(zettels: list, parent_by_luhmann: dict) -> dict:
@@ -240,24 +315,211 @@ def _palette_index(name: str) -> int:
     return total % len(_BRANCH_PALETTE)
 
 
+def _scatter_islands(sizes: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Пятна проектов: крупное в центре, остальные кольцом, без наложения."""
+    gap = 220.0
+    if not sizes:
+        return []
+    if len(sizes) == 1:
+        width, height = sizes[0]
+        return [(-width / 2.0, -height / 2.0)]
+    first_w, first_h = sizes[0]
+    first_half = 0.5 * math.hypot(first_w, first_h)
+    rest = sizes[1:]
+    max_rest = max(0.5 * math.hypot(width, height) for width, height in rest)
+    ring = first_half + max_rest + gap
+    count = len(rest)
+    if count > 1:
+        need = (2.0 * max_rest + gap) / (2.0 * math.sin(math.pi / count))
+        ring = max(ring, need)
+    origins = [(-first_w / 2.0, -first_h / 2.0)]
+    for index, (width, height) in enumerate(rest):
+        ang = 0.0 if count == 1 else (-math.pi / 2 + 2 * math.pi * index / count)
+        cx = ring * math.cos(ang)
+        cy = ring * math.sin(ang) * 0.92
+        origins.append((cx - width / 2.0, cy - height / 2.0))
+    return origins
+
+
 def _scatter_origins(sizes: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Коробки по спирали: пятно, а не колонна кластеров."""
+    """Подсолнух: у края то же расстояние между ветками, что и в центре."""
     golden = math.pi * (3 - math.sqrt(5))
+    if not sizes:
+        return []
+    extents = sorted(0.5 * math.hypot(width, height) for width, height in sizes)
+    typical = extents[len(extents) // 2]
+    gap = min(max(typical * 1.05, 88.0), 360.0)
+    half0 = 0.5 * math.hypot(sizes[0][0], sizes[0][1])
     origins: list[tuple[float, float]] = []
-    radius = 0.0
     for index, (width, height) in enumerate(sizes):
-        reach = 0.42 * math.hypot(width, height) + 28.0
         if index == 0:
             cx = cy = 0.0
         else:
+            radius = half0 * 0.82 + gap * math.sqrt(index)
             ang = index * golden
-            jitter = ((index * 37) % 50) - 25.0
-            radius = max(radius * 0.92, reach * 0.35)
-            cx = radius * math.cos(ang) + jitter
-            cy = radius * math.sin(ang) * 0.78 + jitter * 0.4
-            radius += reach * 0.48
+            cx = radius * math.cos(ang)
+            cy = radius * math.sin(ang) * 0.94
         origins.append((cx - width / 2.0, cy - height / 2.0))
     return origins
+
+
+def _spread_like_obsidian(
+    pos: Dict[str, Tuple[float, float]],
+    zettels: list,
+    edges: list,
+    excel_zids: set[str],
+) -> None:
+    """Свободное поле: узлы заполняют круг, связанные держатся рядом."""
+    golden = math.pi * (3 - math.sqrt(5))
+    groups: dict[str, list[str]] = defaultdict(list)
+    for zettel in zettels:
+        zid = zettel["zettel_id"]
+        if zid not in pos or zid in excel_zids:
+            continue
+        groups[" ".join((zettel.get("project") or "").split())].append(zid)
+    if not groups:
+        return
+    names = sorted(groups, key=lambda name: len(groups[name]), reverse=True)
+    radii = [26.0 * math.sqrt(max(len(groups[name]), 1)) + 36.0 for name in names]
+    if len(names) == 1:
+        centers = [(0.0, 0.0)]
+    else:
+        boxes = [(radius * 1.15, radius * 1.15) for radius in radii]
+        origins = _scatter_islands(boxes)
+        centers = [
+            (left + width / 2.0, top + height / 2.0)
+            for (left, top), (width, height) in zip(origins, boxes)
+        ]
+    seeded: dict[str, tuple[float, float]] = {}
+    for name, center, radius in zip(names, centers, radii):
+        members = groups[name]
+        count = len(members)
+        for index, zid in enumerate(members):
+            if count == 1:
+                seeded[zid] = center
+                continue
+            dist = radius * math.sqrt((index + 0.5) / count)
+            ang = index * golden
+            seeded[zid] = (
+                center[0] + dist * math.cos(ang),
+                center[1] + dist * math.sin(ang) * 0.96,
+            )
+    mentions: dict[str, list[str]] = defaultdict(list)
+    links: list[tuple[str, str]] = []
+    for edge in edges:
+        rel = edge.get("rel_type")
+        left, right = edge.get("from_id"), edge.get("to_id")
+        if not left or not right or left in excel_zids or right in excel_zids:
+            continue
+        if rel == "MENTIONS":
+            mentions[str(right)].append(str(left))
+            links.append((str(left), str(right)))
+        elif rel == "CHILD_OF":
+            links.append((str(left), str(right)))
+    for eid, point in list(pos.items()):
+        if not str(eid).startswith("entity:"):
+            continue
+        pts = [seeded[zid] for zid in mentions.get(str(eid), ()) if zid in seeded]
+        if pts:
+            ax = sum(p[0] for p in pts) / len(pts)
+            ay = sum(p[1] for p in pts) / len(pts)
+            seeded[eid] = (ax, ay)
+        else:
+            seeded[eid] = point
+    _relax_cloud(seeded, links)
+    for zid, xy in seeded.items():
+        pos[zid] = xy
+
+
+def _relax_cloud(seeded: dict[str, tuple[float, float]], links: list[tuple[str, str]]) -> None:
+    ids = list(seeded)
+    count = len(ids)
+    if count < 3:
+        return
+    index = {zid: i for i, zid in enumerate(ids)}
+    xs = [seeded[zid][0] for zid in ids]
+    ys = [seeded[zid][1] for zid in ids]
+    pairs: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for left, right in links:
+        ia = index.get(left)
+        ib = index.get(right)
+        if ia is None or ib is None or ia == ib:
+            continue
+        pair = (ia, ib) if ia < ib else (ib, ia)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    ideal = 40.0
+    steps = 34 if count < 900 else (22 if count < 4500 else 12)
+    cell = ideal * 1.7
+    for step in range(steps):
+        temp = ideal * (1.0 - step / steps) * 1.35 + 4.0
+        buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for i in range(count):
+            buckets[(int(math.floor(xs[i] / cell)), int(math.floor(ys[i] / cell)))].append(i)
+        disp_x = [0.0] * count
+        disp_y = [0.0] * count
+        for (cx, cy), members in buckets.items():
+            nearby: list[int] = []
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    nearby.extend(buckets.get((cx + ox, cy + oy), ()))
+            if len(nearby) > 28:
+                nearby = nearby[:: max(1, len(nearby) // 24)]
+            for i in members:
+                xi, yi = xs[i], ys[i]
+                for j in nearby:
+                    if j <= i:
+                        continue
+                    dx = xi - xs[j]
+                    dy = yi - ys[j]
+                    dist2 = dx * dx + dy * dy
+                    if dist2 < 0.01 or dist2 > cell * cell * 3.2:
+                        continue
+                    dist = math.sqrt(dist2)
+                    force = (ideal * ideal) / dist
+                    ux, uy = dx / dist, dy / dist
+                    disp_x[i] += ux * force
+                    disp_y[i] += uy * force
+                    disp_x[j] -= ux * force
+                    disp_y[j] -= uy * force
+        rest = ideal * 0.9
+        for ia, ib in pairs:
+            dx = xs[ia] - xs[ib]
+            dy = ys[ia] - ys[ib]
+            dist = math.hypot(dx, dy) or 0.01
+            pull = (dist - rest) * 0.055
+            ux, uy = dx / dist, dy / dist
+            disp_x[ia] -= ux * pull
+            disp_y[ia] -= uy * pull
+            disp_x[ib] += ux * pull
+            disp_y[ib] += uy * pull
+        for i in range(count):
+            dist = math.hypot(disp_x[i], disp_y[i])
+            if dist < 0.001:
+                continue
+            scale = min(temp, dist) / dist
+            xs[i] += disp_x[i] * scale
+            ys[i] += disp_y[i] * scale
+    for i, zid in enumerate(ids):
+        seeded[zid] = (xs[i], ys[i])
+
+
+def _tag_anchor(points: list[tuple[float, float]]) -> tuple[float, float]:
+    """Тег стоит у самой плотной группы своих карточек, а не в пустоте между ними."""
+    if len(points) == 1:
+        return points[0]
+    cell = 160.0
+    bins: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    for x, y in points:
+        bins[(int(math.floor(x / cell)), int(math.floor(y / cell)))].append((x, y))
+    best = max(bins.values(), key=len)
+    return (
+        sum(point[0] for point in best) / len(best),
+        sum(point[1] for point in best) / len(best),
+    )
 
 
 def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
@@ -269,6 +531,7 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
     luhmann_to_id: dict[str, str] = {}
     parent_of: dict[str, str | None] = {}
     type_by_lid: dict[str, str] = {}
+    project_by_lid: dict[str, str] = {}
     zid_to_lid: dict[str, str] = {}
     order: list[str] = []
     for z in zettels:
@@ -277,6 +540,7 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         luhmann_to_id[lid] = zid
         zid_to_lid[zid] = lid
         type_by_lid[lid] = z.get("thought_type") or ""
+        project_by_lid[lid] = " ".join((z.get("project") or "").split())
         order.append(lid)
         parent = z.get("parent_luhmann")
         parent_of[lid] = parent
@@ -307,8 +571,8 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         elif right_t == "excel_row" and left_t == "excel_value":
             related_values[right].append(left)
 
-    x_unit = 118
-    y_gap = 128
+    x_unit = 96
+    y_gap = 104
 
     def structural_kids(lid: str) -> list[str]:
         return [
@@ -316,7 +580,7 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             if child in known and type_by_lid.get(child) != "excel_row"
         ]
 
-    leaf_memo, depth_memo = _tree_metrics(order, structural_kids)
+    span_w, span_h = _subtree_spans(order, structural_kids, x_unit, y_gap)
     pos: Dict[str, Tuple[float, float]] = {}
 
     def excel_layout(sheet_lid: str) -> tuple[list[tuple[str, list[str], float, list[tuple[float, float]]]], float]:
@@ -380,15 +644,69 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
         boxes.append((
             "tree",
             root,
-            leaf_memo.get(root, 1) * x_unit,
-            depth_memo.get(root, 1) * y_gap,
+            span_w.get(root, x_unit),
+            span_h.get(root, y_gap),
         ))
-    origins = _scatter_origins([(width, height) for _kind, _lid, width, height in boxes])
-    for (kind, lid, width, height), (left, top) in zip(boxes, origins):
-        if kind == "excel":
-            place_excel_sheet(lid, left + width / 2, top + height / 2)
-        else:
-            _place_tree(lid, left, top, structural_kids, leaf_memo, x_unit, y_gap, luhmann_to_id, pos)
+    def place_box_list(box_list: list[tuple[str, str, float, float]]) -> list[str]:
+        box_list = sorted(box_list, key=lambda box: box[2] * box[3], reverse=True)
+        origins = _scatter_origins([(width, height) for _kind, _lid, width, height in box_list])
+        before = set(pos)
+        for (kind, lid, width, height), (left, top) in zip(box_list, origins):
+            if kind == "excel":
+                place_excel_sheet(lid, left + width / 2, top + height / 2)
+            else:
+                _place_tree(lid, left, top, structural_kids, span_w, span_h, x_unit, y_gap, luhmann_to_id, pos)
+        return [zid for zid in pos if zid not in before]
+
+    boxes_by_project: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
+    for box in boxes:
+        boxes_by_project[project_by_lid.get(box[1], "")].append(box)
+    split_projects = len([name for name in boxes_by_project if name]) > 1
+
+    if not split_projects:
+        place_box_list(boxes)
+    else:
+        order_names = sorted(
+            boxes_by_project,
+            key=lambda name: sum(width * height for _k, _l, width, height in boxes_by_project[name]),
+            reverse=True,
+        )
+        placed_groups: list[tuple[list[str], float, float, float, float]] = []
+        for name in order_names:
+            ids = place_box_list(boxes_by_project[name])
+            pending = [
+                z for z in zettels
+                if z["zettel_id"] not in pos and project_by_lid.get(z["luhmann_id"], "") == name
+            ]
+            if pending and ids:
+                xs = [pos[zid][0] for zid in ids]
+                ys = [pos[zid][1] for zid in ids]
+                left = max(xs) + 80.0
+                top = min(ys)
+                cols = max(1, int(math.sqrt(len(pending))))
+                for index, zettel in enumerate(pending):
+                    pos[zettel["zettel_id"]] = (
+                        left + (index % cols) * 72.0,
+                        top + (index // cols) * 72.0,
+                    )
+                    ids.append(zettel["zettel_id"])
+            if not ids:
+                continue
+            xs = [pos[zid][0] for zid in ids]
+            ys = [pos[zid][1] for zid in ids]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            placed_groups.append((ids, max(max_x - min_x, 160.0), max(max_y - min_y, 160.0), min_x, min_y))
+        island_origins = _scatter_islands(
+            [(width, height) for _ids, width, height, _min_x, _min_y in placed_groups]
+        )
+        for (ids, _width, _height, min_x, min_y), (left, top) in zip(placed_groups, island_origins):
+            dx, dy = left - min_x, top - min_y
+            if not dx and not dy:
+                continue
+            for zid in ids:
+                x, y = pos[zid]
+                pos[zid] = (x + dx, y + dy)
 
     missing = [z for z in zettels if z["zettel_id"] not in pos]
     if missing:
@@ -418,15 +736,25 @@ def _compute_node_positions(graph_data: Dict[str, Any]) -> Dict[str, Tuple[float
             continue
         pts = [pos[zid] for zid in linked if zid in pos]
         if pts:
-            ax = sum(p[0] for p in pts) / len(pts)
-            ay = sum(p[1] for p in pts) / len(pts)
-            pos[eid] = (ax + 34 * math.cos(i * 1.7), ay + 72 + 34 * math.sin(i * 1.7))
+            ax, ay = _tag_anchor(pts)
+            ang = i * 2.399
+            pos[eid] = (ax + 42.0 * math.cos(ang), ay + 42.0 * math.sin(ang))
         else:
             loose.append((i, eid))
     if loose:
-        floor = max((point[1] for point in pos.values()), default=0.0)
-        for i, eid in loose:
-            pos[eid] = (i * 88.0, floor + 180)
+        anchor_x = [point[0] for point in pos.values()]
+        anchor_y = [point[1] for point in pos.values()]
+        if split_projects and anchor_x:
+            cx = max(anchor_x) + 140.0
+            cy = min(anchor_y)
+        else:
+            cx = sorted(anchor_x)[len(anchor_x) // 2] if anchor_x else 0.0
+            cy = sorted(anchor_y)[len(anchor_y) // 2] if anchor_y else 0.0
+        for n, (_i, eid) in enumerate(loose):
+            ang = n * 2.399
+            ring = 48.0 + 10.0 * math.sqrt(n)
+            pos[eid] = (cx + ring * math.cos(ang), cy + ring * math.sin(ang))
+    _spread_like_obsidian(pos, zettels, edges, excel_zids)
     return pos
 
 
@@ -469,29 +797,27 @@ def _excel_node_style(
     value_degree: int = 0,
 ) -> tuple[int, int, int]:
     if thought_type == "excel_row":
-        return 2, 11, 7
+        return 2, 8, 7
     if thought_type == "excel_sheet":
-        return 0, 96, color_index.get(root, 0)
+        return 0, 22, color_index.get(root, 0)
     if thought_type in {"excel_column", "excel_value"}:
         source = luhmann_id if thought_type == "excel_column" else (parent_by_luhmann.get(luhmann_id) or luhmann_id)
         parts = [p for p in (source or "").split(".") if p.isdigit()]
         color = int(parts[-1]) % len(_BRANCH_PALETTE) if parts else 1
         if thought_type == "excel_column":
-            return 0, 52, color
-        return 0, 32, color
+            return 0, 14, color
+        return 0, 10, color
     return 0, _thought_size(depth), color_index.get(root, 0)
 
 
 def _thought_size(depth: int) -> int:
     if depth <= 0:
-        return 62
+        return 24
     if depth == 1:
-        return 48
+        return 17
     if depth == 2:
-        return 34
-    if depth == 3:
-        return 28
-    return 24
+        return 13
+    return 8
 
 
 def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int, int]:
@@ -574,7 +900,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         nodes.append({
             "x": round(xy[0], 1),
             "y": round(xy[1], 1),
-            "r": 18,
+            "r": 8,
             "g": 1,
             "c": 0,
             "l": _node_label(name),
@@ -610,7 +936,72 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         edge_set.add(key)
         edges.append([a, b, kind.get(edge["rel_type"], 0)])
     _append_excel_bridges(graph_data, id_index, edges)
+    _append_project_bridges(graph_data, id_index, edges)
     return nodes, edges, meta, len(graph_data["zettels"]), len(graph_data["entities"]), len(edges)
+
+
+def _append_project_bridges(graph_data: Dict[str, Any], id_index: dict[str, int], edges: list) -> None:
+    """На общем графе проекты с общим тегом соединяются парой карточек."""
+    project_of: dict[str, str] = {}
+    for zettel in graph_data.get("zettels") or []:
+        name = " ".join((zettel.get("project") or "").split())
+        if name:
+            project_of[zettel["zettel_id"]] = name
+    if len(set(project_of.values())) < 2:
+        return
+    chosen: dict[str, dict[str, str]] = defaultdict(dict)
+    for zettel in graph_data.get("zettels") or []:
+        project = project_of.get(zettel["zettel_id"])
+        if not project:
+            continue
+        for tag in zettel.get("tags") or []:
+            key = " ".join(str(tag).lower().split())
+            if len(key) < 2:
+                continue
+            chosen[key].setdefault(project, zettel["zettel_id"])
+    entity_key: dict[str, str] = {}
+    for entity in graph_data.get("entities") or []:
+        raw = str(entity.get("name") or "")
+        label = " ".join((entity.get("display_name") or "").lower().split())
+        if "::" in raw:
+            raw = raw.split("::", 1)[1]
+        key = label or " ".join(raw.lower().split())
+        if len(key) >= 2:
+            entity_key[f"entity:{entity['name']}"] = key
+    for edge in graph_data.get("edges") or []:
+        if edge.get("rel_type") != "MENTIONS":
+            continue
+        project = project_of.get(edge.get("from_id"))
+        key = entity_key.get(str(edge.get("to_id") or ""))
+        if project and key:
+            chosen[key].setdefault(project, edge["from_id"])
+    seen_nodes: set[tuple[int, int]] = set()
+    pair_count: dict[tuple[str, str], int] = defaultdict(int)
+    added = 0
+    for by_project in chosen.values():
+        if len(by_project) < 2 or added >= 480:
+            continue
+        items = list(by_project.items())
+        hub_name, hub_zid = items[0]
+        hub = id_index.get(hub_zid)
+        if hub is None:
+            continue
+        for project, zid in items[1:]:
+            other = id_index.get(zid)
+            if other is None:
+                continue
+            ends = (hub, other) if hub < other else (other, hub)
+            if ends in seen_nodes:
+                continue
+            names = (hub_name, project) if hub_name < project else (project, hub_name)
+            if pair_count[names] >= 4:
+                continue
+            seen_nodes.add(ends)
+            pair_count[names] += 1
+            edges.append([ends[0], ends[1], 4])
+            added += 1
+            if added >= 480:
+                break
 
 
 def _bridge_key(text: str) -> str:
@@ -678,7 +1069,7 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "n": n,
         "x": [float(nodes[i]["x"]) for i in range(n)],
         "y": [float(nodes[i]["y"]) for i in range(n)],
-        "r": [max(11, int(round(nodes[i]["r"] * 0.66))) for i in range(n)],
+        "r": [max(5, int(round(nodes[i]["r"] * 0.7))) for i in range(n)],
         "g": [int(nodes[i]["g"]) for i in range(n)],
         "c": [int(nodes[i]["c"]) for i in range(n)],
         "l": [nodes[i]["l"] for i in range(n)],
@@ -745,6 +1136,7 @@ let dotBin = 12;
 let fitted = false;
 let clusters = [];
 let groupByProject = false;
+let projectLinks = [];
 let clusterHot = -1;
 let hoverNode = -2;
 let hoverX = 0, hoverY = 0;
@@ -767,8 +1159,9 @@ function wy(y) { return (y - H / 2) / zoom + camY; }
 let revealedMark = null;
 let revealedRows = [];
 function nodeVisible(i) {
-  if (G[i] === 1 && !(tagsOn && zoom >= 0.32)) return 0;
-  if (G[i] === 2) return revealedMark && revealedMark[i] ? 1 : 0;
+  const marked = hot && hot[i];
+  if (G[i] === 1 && !(tagsOn && zoom >= 0.32) && !marked) return 0;
+  if (G[i] === 2 && !(revealedMark && revealedMark[i]) && !(marked === 2)) return 0;
   if (visMask && visMask[i] === 0) return 0;
   return 1;
 }
@@ -872,12 +1265,14 @@ function buildIndex() {
   adjK = new Uint8Array(adjOff[N]);
   adjFrom = new Uint32Array(adjOff[N]);
   const cur = adjOff.slice();
+  projectLinks = [];
   for (let i = 0; i < E; i++) {
     const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1], k = EFLAT[i * 3 + 2];
     let p = cur[a]++;
     adjTo[p] = b; adjK[p] = k; adjFrom[p] = a;
     p = cur[b]++;
     adjTo[p] = a; adjK[p] = k; adjFrom[p] = a;
+    if (k === 4) projectLinks.push(a, b);
   }
   grid = new Map();
   for (let i = 0; i < N; i++) {
@@ -971,7 +1366,7 @@ function buildClusters() {
       outer = Math.max(outer, Math.sqrt(dx * dx + dy * dy) + R[i] + 10);
     }
     // "Облако" кластера делаем компактным, чтобы не перекрывать весь экран.
-    const drawR = Math.max(46, Math.min(190, outer * 0.45 + 26));
+    const drawR = Math.max(42, Math.min(110, outer * 0.18 + 24));
     const hitR = Math.max(drawR * 1.18, 64);
     const topics = (groupByProject && g.project)
       ? [g.project]
@@ -1035,12 +1430,18 @@ function nodeAlpha(i, base) {
   return G[i] === 1 ? base * 0.68 : base;
 }
 function screenRadius(i) {
-  const raw = R[i] * zoom;
-  const minR = zoom < 0.18 ? 3.2 : (zoom < 0.45 ? 4.5 : 6);
-  return Math.max(minR, raw);
+  const raw = R[i] * Math.min(zoom, 0.9);
+  const minR = zoom < 0.2 ? 2.2 : 3.1;
+  let cap = 5.6;
+  if (G[i] === 1) cap = 6;
+  else if (R[i] >= 15) cap = 14;
+  else if (R[i] >= 11) cap = 11;
+  else if (R[i] >= 8) cap = 8.2;
+  return Math.min(cap, Math.max(minR, raw));
 }
 function hubRadius(i) {
-  return Math.max(8, Math.min(18, R[i] * Math.max(zoom, 0.14)));
+  const cap = R[i] >= 15 ? 13 : (R[i] >= 11 ? 10 : (R[i] >= 8 ? 8 : 6));
+  return Math.max(4, Math.min(cap, R[i] * Math.max(zoom, 0.14)));
 }
 
 function resize() {
@@ -1069,7 +1470,7 @@ function drawNode(i, alpha, ring) {
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fillStyle = fillOf(i);
   ctx.fill();
-  ctx.lineWidth = ring ? 2.6 : (G[i] ? 2.2 : 1.8);
+  ctx.lineWidth = ring ? 1.6 : 1;
   ctx.strokeStyle = ring ? '#60a5fa' : strokeOf(i);
   ctx.stroke();
 }
@@ -1112,8 +1513,8 @@ function reserveLabel(x, y, text, align, baseline) {
 function wantsLabel(i) {
   if (hot && hot[i]) return true;
   const rank = labelRank(i);
-  if (zoom < 0.22) return rank <= 1 || R[i] >= 40;
-  if (zoom < 0.5) return rank <= 1 || R[i] >= 30;
+  if (zoom < 0.45) return rank <= 1;
+  if (zoom < 0.95) return rank <= 1 || R[i] >= 10;
   return true;
 }
 function drawLabel(i, alpha, light) {
@@ -1233,6 +1634,24 @@ function drawHubs(light) {
     ctx.fillText(L[i], x, ty);
   }
 }
+function drawProjectLinks(light) {
+  if (!projectLinks.length) return;
+  ctx.save();
+  ctx.globalAlpha = 0.82;
+  ctx.strokeStyle = light ? '#0369a1' : '#7dd3fc';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([7, 5]);
+  for (let i = 0; i < projectLinks.length; i += 2) {
+    const a = projectLinks[i], b = projectLinks[i + 1];
+    const ax = sx(X[a]), ay = sy(Y[a]), bx = sx(X[b]), by = sy(Y[b]);
+    if ((ax < -40 && bx < -40) || (ax > W + 40 && bx > W + 40) || (ay < -40 && by < -40) || (ay > H + 40 && by > H + 40)) continue;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 function drawOverview(x0, y0, x1, y1, light) {
   const bin = 12;
   const cols = Math.ceil(W / bin) + 2;
@@ -1241,12 +1660,14 @@ function drawOverview(x0, y0, x1, y1, light) {
   const bestR = new Uint16Array(cols * rows);
   best.fill(-1);
   dotPick = best;
+  drawProjectLinks(light);
   dotCols = cols;
   dotBin = bin;
   const outline = light ? '#ffffff' : '#0b1220';
   for (let i = 0; i < N; i++) {
-    if (G[i] === 2) continue;
-    if (G[i] === 1 && !tagsOn) continue;
+    if (G[i] === 2 && !(hot && hot[i] === 2)) continue;
+    if (G[i] === 1 && !tagsOn && !(hot && hot[i])) continue;
+    if (visMask && !visMask[i]) continue;
     const px = sx(X[i]), py = sy(Y[i]);
     if (px < -bin || py < -bin || px > W + bin || py > H + bin) continue;
     const bx = (px / bin) | 0, by = (py / bin) | 0;
@@ -1262,7 +1683,7 @@ function drawOverview(x0, y0, x1, y1, light) {
     const bx = id % cols, by = (id / cols) | 0;
     ctx.globalAlpha = nodeAlpha(i, 0.9);
     ctx.beginPath();
-    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, 4.5, 0, Math.PI * 2);
+    ctx.arc(bx * bin + bin / 2, by * bin + bin / 2, 3.1, 0, Math.PI * 2);
     ctx.fillStyle = fillOf(i);
     ctx.fill();
     ctx.lineWidth = 1.4;
@@ -1304,6 +1725,7 @@ function draw() {
     return;
   }
   dotPick = null;
+  drawProjectLinks(light);
   const showTags = tagsOn && zoom >= 0.28;
   const showEdges = true;
   const showLabels = true;
@@ -1321,7 +1743,7 @@ function draw() {
       if (sx0 + sr < -30 || sx0 - sr > W + 30 || sy0 + sr < -30 || sy0 - sr > H + 30) continue;
       const pal = PAL[c.color % PAL.length];
       const active = clusterHot === ci;
-      ctx.globalAlpha = active ? 0.16 : 0.1;
+      ctx.globalAlpha = active ? 0.12 : 0.05;
       ctx.beginPath();
       ctx.arc(sx0, sy0, sr, 0, Math.PI * 2);
       ctx.fillStyle = pal[0];
@@ -1360,13 +1782,15 @@ function draw() {
         const b = adjTo[p];
         if (painted[b] && b < a) continue;
         const k = adjK[p];
+        if (k === 4) continue;
         if (k === 1 && !showTags) continue;
         const rowEdge = G[a] === 2 || G[b] === 2;
         const tagEdge = k === 1;
         const focusEdge = hot && (hot[a] === 2 || hot[b] === 2);
         const bridge = k === 3;
-        if (!bridge && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
-        if (!bridge && rowEdge && selected !== a && selected !== b) continue;
+        const projectLink = k === 4;
+        if (!bridge && !projectLink && k === 2 && !(selected >= 0 && (a === selected || b === selected) && rowEdge)) continue;
+        if (!bridge && !projectLink && rowEdge && selected !== a && selected !== b) continue;
         const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
         if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (ay < y0 && by < y0) || (ay > y1 && by > y1)) continue;
         const dx = bx - ax, dy = by - ay;
@@ -1375,10 +1799,10 @@ function draw() {
         const ra = screenRadius(a) / zoom, rb = screenRadius(b) / zoom;
         if ((len - ra - rb) * zoom < 1) continue;
         const ux = dx / len, uy = dy / len;
-        ctx.globalAlpha = focusEdge ? 0.9 : (tagEdge ? 0.34 : (bridge ? 0.72 : Math.max(dim, 0.5)));
-        ctx.strokeStyle = focusEdge ? '#2563eb' : (tagEdge ? (light ? '#cbd5e1' : '#64748b') : (bridge ? '#c026d3' : (light ? '#64748b' : '#94a3b8')));
-        ctx.lineWidth = tagEdge ? 1 : (bridge ? 2 : 1.2);
-        ctx.setLineDash(k === 1 || bridge ? [6, 4] : []);
+        ctx.globalAlpha = focusEdge ? 0.9 : (projectLink ? 0.55 : (tagEdge ? 0.2 : (bridge ? 0.4 : (hot ? 0.16 : 0.32))));
+        ctx.strokeStyle = focusEdge ? '#2563eb' : (projectLink ? (light ? '#0369a1' : '#7dd3fc') : (tagEdge ? (light ? '#cbd5e1' : '#64748b') : (bridge ? '#c026d3' : (light ? '#64748b' : '#94a3b8'))));
+        ctx.lineWidth = projectLink ? 1.15 : (tagEdge ? 0.7 : (bridge ? 1.2 : 0.7));
+        ctx.setLineDash(projectLink || k === 1 || bridge ? [6, 4] : []);
         ctx.beginPath();
         ctx.moveTo(sx(ax + ux * ra), sy(ay + uy * ra));
         ctx.lineTo(sx(bx - ux * rb), sy(by - uy * rb));
@@ -1467,6 +1891,7 @@ function hit(px, py) {
 function drawHotMarks() {
   if (!hot) return;
   let marked = 0;
+  const labeled = [];
   for (let i = 0; i < N && marked < 240; i++) {
     if (!hot[i]) continue;
     const x = sx(X[i]), y = sy(Y[i]);
@@ -1480,8 +1905,15 @@ function drawHotMarks() {
     ctx.lineWidth = hot[i] === 2 ? 3 : 1.6;
     ctx.strokeStyle = hot[i] === 2 ? '#60a5fa' : strokeOf(i);
     ctx.stroke();
+    if (hot[i] === 2 && labeled.length < 48 && L[i]) labeled.push(i);
     marked++;
   }
+  if (!labeled.length) return;
+  ctx.font = '12px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const light = isLight();
+  for (let k = 0; k < labeled.length; k++) drawLabel(labeled[k], 1, light);
 }
 
 function hitCluster(px, py) {
@@ -1795,19 +2227,25 @@ function applySearch(raw) {
     requestDraw();
     return;
   }
-  visMask = new Uint8Array(N);
   const matched = [];
   let tagHit = false;
   let rowHit = false;
   for (let i = 0; i < N; i++) {
     if (hay[i].indexOf(q) !== -1) {
-      visMask[i] = 1;
       matched.push(i);
       if (G[i] === 1) tagHit = true;
       if (G[i] === 2) rowHit = true;
     }
   }
-  hot = matched.length ? new Uint8Array(N) : null;
+  if (!matched.length) {
+    visMask = null;
+    hot = null;
+    requestDraw();
+    return;
+  }
+  visMask = new Uint8Array(N);
+  for (let m = 0; m < matched.length; m++) visMask[matched[m]] = 1;
+  hot = new Uint8Array(N);
   for (let m = 0; m < matched.length; m++) {
     const i = matched[m];
     hot[i] = 2;
@@ -1832,10 +2270,42 @@ function applySearch(raw) {
   requestDraw();
 }
 function frameMatches(ids) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  const step = Math.max(1, Math.ceil(ids.length / 120));
-  for (let i = 0; i < ids.length; i += step) {
+  const finite = [];
+  for (let i = 0; i < ids.length; i++) {
     const id = ids[i];
+    if (isFinite(X[id]) && isFinite(Y[id])) finite.push(id);
+  }
+  if (!finite.length) return;
+  let focus = finite;
+  if (finite.length > 1) {
+    const cell = 240;
+    const bins = new Map();
+    for (let i = 0; i < finite.length; i++) {
+      const id = finite[i];
+      const key = Math.floor(X[id] / cell) + ':' + Math.floor(Y[id] / cell);
+      let bin = bins.get(key);
+      if (!bin) { bin = []; bins.set(key, bin); }
+      bin.push(id);
+    }
+    let bestKey = '', bestN = 0;
+    bins.forEach(function(bin, key) {
+      if (bin.length > bestN) { bestN = bin.length; bestKey = key; }
+    });
+    const parts = bestKey.split(':');
+    const bx = parseInt(parts[0], 10), by = parseInt(parts[1], 10);
+    focus = [];
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const bin = bins.get((bx + ox) + ':' + (by + oy));
+        if (!bin) continue;
+        for (let k = 0; k < bin.length; k++) focus.push(bin[k]);
+      }
+    }
+    if (!focus.length) focus = finite;
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < focus.length; i++) {
+    const id = focus[i];
     if (X[id] < minX) minX = X[id];
     if (Y[id] < minY) minY = Y[id];
     if (X[id] > maxX) maxX = X[id];
@@ -1844,9 +2314,11 @@ function frameMatches(ids) {
   if (!isFinite(minX)) return;
   camX = (minX + maxX) / 2;
   camY = (minY + maxY) / 2;
-  const dx = Math.max(maxX - minX, 260);
-  const dy = Math.max(maxY - minY, 260);
-  zoom = Math.max(0.12, Math.min(1.2, Math.min((W - 140) / dx, (H - 140) / dy)));
+  const dx = Math.max(maxX - minX, 160);
+  const dy = Math.max(maxY - minY, 160);
+  const fit = Math.min((W - 120) / dx, (H - 120) / dy);
+  zoom = Math.min(1.05, fit > 0 && isFinite(fit) ? fit : 0.4);
+  if (!(zoom > 1e-8)) zoom = 1e-8;
 }
 document.getElementById('searchInput').addEventListener('input', function() {
   const v = this.value;
