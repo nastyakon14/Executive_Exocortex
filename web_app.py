@@ -5766,6 +5766,7 @@ async def api_graph(slug: str, request: Request):
         cached = _graph_cache.get(key)
     if cached:
         return Response(content=cached[0], headers=cached[1])
+    started = time.perf_counter()
     if scope["readonly"]:
         labels = scope.get("project_labels") or {}
         data = linker.repository.export_graph_data_combined(scope["graph_ids"], labels)
@@ -5774,6 +5775,12 @@ async def api_graph(slug: str, request: Request):
     payload = pack_graph_payload(data)
     body, headers = encode_graph_payload(payload, encoding)
     _remember_graph(key, body, headers)
+    if count >= 25_000:
+        print(
+            f"[graph] ответ {len(body) / 1_000_000:.1f} МБ, узлов {payload.get('n') or 0}, "
+            f"{time.perf_counter() - started:.1f} с",
+            flush=True,
+        )
     return Response(content=body, headers=headers)
 
 

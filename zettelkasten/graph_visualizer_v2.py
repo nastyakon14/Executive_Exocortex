@@ -3010,7 +3010,7 @@ async function readGraph(resp) {
   const reader = resp.body.getReader();
   const chunks = [];
   let got = 0;
-  setLoad(0, 'Загрузка графа');
+  setLoad(4, 'Передача графа');
   while (true) {
     const step = await reader.read();
     if (step.done) break;
@@ -3044,6 +3044,8 @@ async function readGraph(resp) {
   try {
     let data;
     if (DATA_URL) {
+      setLoad(0, 'Сервер собирает граф');
+      await paintLoad();
       const resp = await fetch(DATA_URL, { headers: { 'Accept': 'application/octet-stream, application/json' } });
       if (!resp.ok) throw new Error('Не удалось загрузить граф');
       data = await readGraph(resp);
@@ -3059,7 +3061,7 @@ async function readGraph(resp) {
     if (hint) hint.remove();
     applyPayload(data);
   } catch (err) {
-    setLoad(0, 'Ошибка загрузки');
+    setLoad(1, 'Ошибка загрузки');
     const cap = document.getElementById('load-caption');
     if (cap) cap.textContent = 'Ошибка загрузки графа: ' + err.message;
     else if (hint) hint.textContent = 'Ошибка загрузки графа: ' + err.message;
@@ -3254,7 +3256,7 @@ def _build_html(
         </svg>
         <div id="load-pct">0%</div>
       </div>
-      <div id="load-caption">Загрузка графа</div>
+      <div id="load-caption">Сервер собирает граф</div>
     </div>
   </div>
   <div id="cluster-tip"></div>

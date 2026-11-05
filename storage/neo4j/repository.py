@@ -1193,8 +1193,9 @@ class ZettelRepository:
 
         labels = labels or {}
         card_count = self.total_count_many(user_ids)
-        if card_count >= 25_000:
-            topic_n, content_n, quote_n = 60, 0, 0
+        slim = card_count >= 25_000
+        if slim:
+            topic_n, content_n, quote_n = 48, 0, 0
         elif card_count >= 8_000:
             topic_n, content_n, quote_n = 90, 160, 80
         else:
@@ -1206,48 +1207,113 @@ class ZettelRepository:
             "quote_n": quote_n,
         }
 
-        nodes_query = """
-        MATCH (z:Zettel)
-        WHERE z.user_id IN $user_ids
-        OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
-        WHERE parent.user_id = z.user_id
-        RETURN z.user_id AS user_id,
-               z.zettel_id AS zettel_id,
-               z.luhmann_id AS luhmann_id,
-               left(coalesce(z.topic, ''), $topic_n) AS topic,
-               left(coalesce(z.content, ''), $content_n) AS content,
-               z.thought_type AS thought_type,
-               z.tags AS tags,
-               z.is_root_topic AS is_root_topic,
-               z.source_input AS source_input,
-               left(coalesce(z.source_quote, ''), $quote_n) AS source_quote,
-               parent.luhmann_id AS parent_luhmann
-        """
-        edges_query = """
-        MATCH (a:Zettel)-[r]->(b)
-        WHERE a.user_id IN $user_ids
-          AND (
-            (b:Zettel AND b.user_id = a.user_id)
-            OR (b:Entity AND b.user_id = a.user_id)
-          )
-        RETURN a.user_id AS user_id,
-               a.zettel_id AS from_id,
-               type(r) AS rel_type,
-               CASE WHEN b:Zettel THEN b.zettel_id ELSE 'entity:' + b.name END AS to_id
-        """
-        entities_query = """
-        MATCH (z:Zettel)-[:MENTIONS]->(e:Entity)
-        WHERE z.user_id IN $user_ids AND e.user_id = z.user_id
-        RETURN DISTINCT z.user_id AS user_id,
-               e.name AS name,
-               e.display_name AS display_name,
-               e.entity_type AS entity_type,
-               e.mention_count AS mention_count
-        """
-
-        nodes_result = self.client.execute_read(nodes_query, params)
-        edges_result = self.client.execute_read(edges_query, params)
-        entities_result = self.client.execute_read(entities_query, params)
+        if slim:
+            print(f"[graph] сборка {card_count} карточек", flush=True)
+            nodes_query = """
+            MATCH (z:Zettel)
+            WHERE z.user_id IN $user_ids
+            OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
+            WHERE parent.user_id = z.user_id
+            RETURN z.user_id AS user_id,
+                   z.zettel_id AS zettel_id,
+                   z.luhmann_id AS luhmann_id,
+                   left(coalesce(z.topic, ''), 48) AS topic,
+                   '' AS content,
+                   z.thought_type AS thought_type,
+                   null AS tags,
+                   false AS is_root_topic,
+                   '' AS source_input,
+                   '' AS source_quote,
+                   parent.luhmann_id AS parent_luhmann
+            """
+            entities_query = """
+            MATCH (e:Entity)
+            WHERE e.user_id IN $user_ids
+            RETURN e.user_id AS user_id,
+                   e.name AS name,
+                   e.display_name AS display_name,
+                   e.entity_type AS entity_type,
+                   e.mention_count AS mention_count
+            """
+            nodes_result = self.client.execute_read(nodes_query, params)
+            entities_result = self.client.execute_read(entities_query, params)
+            edges_result = self.client.execute_read(
+                """
+                MATCH (a:Zettel)-[:CHILD_OF]->(b:Zettel)
+                WHERE a.user_id IN $user_ids AND b.user_id = a.user_id
+                RETURN a.user_id AS user_id,
+                       a.zettel_id AS from_id,
+                       'CHILD_OF' AS rel_type,
+                       b.zettel_id AS to_id
+                """,
+                params,
+            )
+            edges_result.extend(self.client.execute_read(
+                """
+                MATCH (a:Zettel)-[:MENTIONS]->(b:Entity)
+                WHERE a.user_id IN $user_ids AND b.user_id = a.user_id
+                RETURN a.user_id AS user_id,
+                       a.zettel_id AS from_id,
+                       'MENTIONS' AS rel_type,
+                       'entity:' + b.name AS to_id
+                LIMIT 60000
+                """,
+                params,
+            ))
+            edges_result.extend(self.client.execute_read(
+                """
+                MATCH (a:Zettel)-[:RELATED_TO]->(b:Zettel)
+                WHERE a.user_id IN $user_ids AND b.user_id = a.user_id
+                RETURN a.user_id AS user_id,
+                       a.zettel_id AS from_id,
+                       'RELATED_TO' AS rel_type,
+                       b.zettel_id AS to_id
+                LIMIT 20000
+                """,
+                params,
+            ))
+        else:
+            nodes_query = """
+            MATCH (z:Zettel)
+            WHERE z.user_id IN $user_ids
+            OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
+            WHERE parent.user_id = z.user_id
+            RETURN z.user_id AS user_id,
+                   z.zettel_id AS zettel_id,
+                   z.luhmann_id AS luhmann_id,
+                   left(coalesce(z.topic, ''), $topic_n) AS topic,
+                   left(coalesce(z.content, ''), $content_n) AS content,
+                   z.thought_type AS thought_type,
+                   z.tags AS tags,
+                   z.is_root_topic AS is_root_topic,
+                   z.source_input AS source_input,
+                   left(coalesce(z.source_quote, ''), $quote_n) AS source_quote,
+                   parent.luhmann_id AS parent_luhmann
+            """
+            edges_query = """
+            MATCH (a:Zettel)-[r]->(b)
+            WHERE a.user_id IN $user_ids
+              AND (
+                (b:Zettel AND b.user_id = a.user_id)
+                OR (b:Entity AND b.user_id = a.user_id)
+              )
+            RETURN a.user_id AS user_id,
+                   a.zettel_id AS from_id,
+                   type(r) AS rel_type,
+                   CASE WHEN b:Zettel THEN b.zettel_id ELSE 'entity:' + b.name END AS to_id
+            """
+            entities_query = """
+            MATCH (z:Zettel)-[:MENTIONS]->(e:Entity)
+            WHERE z.user_id IN $user_ids AND e.user_id = z.user_id
+            RETURN DISTINCT z.user_id AS user_id,
+                   e.name AS name,
+                   e.display_name AS display_name,
+                   e.entity_type AS entity_type,
+                   e.mention_count AS mention_count
+            """
+            nodes_result = self.client.execute_read(nodes_query, params)
+            edges_result = self.client.execute_read(edges_query, params)
+            entities_result = self.client.execute_read(entities_query, params)
 
         prefix_by_uid: Dict[str, str] = {}
         project_by_uid: Dict[str, str] = {}
@@ -1273,7 +1339,7 @@ class ZettelRepository:
                 "topic": row.get("topic") or "",
                 "content": row.get("content") or "",
                 "thought_type": row.get("thought_type") or "",
-                "tags": _clean_tags(row.get("tags")),
+                "tags": _clean_tags(row.get("tags")) if row.get("tags") else [],
                 "is_root_topic": bool(row.get("is_root_topic")),
                 "parent_luhmann": parent_luhmann,
                 "source_input": row.get("source_input") or "text",
