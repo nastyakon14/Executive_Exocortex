@@ -1193,7 +1193,7 @@ class ZettelRepository:
 
         labels = labels or {}
         card_count = self.total_count_many(user_ids)
-        if card_count >= 80_000:
+        if card_count >= 25_000:
             topic_n, content_n, quote_n = 60, 0, 0
         elif card_count >= 8_000:
             topic_n, content_n, quote_n = 90, 160, 80

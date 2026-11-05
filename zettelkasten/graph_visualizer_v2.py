@@ -1016,7 +1016,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
         if project:
             color = _palette_index(project)
         label = _excel_label(tt, topic, content) if tt in _EXCEL_TYPES else _node_label(display)
-        if card_count >= 80_000 and group == 0 and radius < 13:
+        if card_count >= 25_000 and group == 0 and radius < 13:
             label = ""
         nodes.append({
             "x": round(xy[0], 1),
@@ -1026,7 +1026,7 @@ def _pack_graph(graph_data: Dict[str, Any]) -> tuple[list, list, list, int, int,
             "c": color,
             "l": label,
         })
-        if card_count >= 80_000:
+        if card_count >= 25_000:
             meta.append([project] if project else [])
         else:
             preview = f"{topic}: {_short_text(content, lim_preview)}" if topic else _short_text(content, lim_preview)
@@ -1215,30 +1215,32 @@ def encode_graph_html(html: str, accept_encoding: str = "") -> tuple[bytes, dict
 
 
 def _thin_edges(edges: list[list[int]], limit: int = 2_000_000) -> list[list[int]]:
-    """На очень большом графе оставляем структуру и ограниченное число связей тегов."""
+    """На очень большом графе оставляем структуру и немного связей тегов."""
     if len(edges) <= limit:
         return edges
-    kept: list[list[int]] = []
-    mentions = 0
-    mention_budget = 150_000
+    mention_budget = 20_000 if limit <= 400_000 else 150_000
+    structural: list[list[int]] = []
+    mentions: list[list[int]] = []
     for edge in edges:
-        kind = edge[2]
-        if kind == 1:
-            if mentions >= mention_budget:
-                continue
-            mentions += 1
-        kept.append(edge)
-        if len(kept) >= limit:
+        if edge[2] == 1:
+            if len(mentions) < mention_budget:
+                mentions.append(edge)
+            continue
+        structural.append(edge)
+        if len(structural) >= limit:
             break
-    return kept
+    room = limit - len(structural)
+    if room > 0:
+        structural.extend(mentions[:room])
+    return structural
 
 
 def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
     """Компактный payload: параллельные массивы вместо массива объектов."""
     nodes, edges, meta, total_z, total_e, total_r = _pack_graph(graph_data)
-    edges = _thin_edges(edges)
     n = len(nodes)
-    binary = n >= 80_000
+    edges = _thin_edges(edges, limit=300_000 if n >= 40_000 else 2_000_000)
+    binary = n >= 25_000
     ea = eb = ek = None
     eflat: list[int] = []
     if binary:
@@ -1360,7 +1362,7 @@ def dumps_binary(payload: dict) -> bytes:
 
 
 def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[bytes, dict]:
-    binary = int(payload.get("n") or 0) >= 80_000
+    binary = int(payload.get("n") or 0) >= 25_000
     raw = dumps_binary(payload) if binary else dumps_payload(payload)
     headers = {
         "content-type": "application/octet-stream" if binary else "application/json; charset=utf-8",
@@ -1586,18 +1588,18 @@ function buildAdj() {
 function buildGrid() {
   projectLinks = [];
   grid = new Map();
+  const storeIds = N < 4000;
   for (let i = 0; i < N; i++) {
     const cx = cellIndex(X[i]), cy = cellIndex(Y[i]);
     const key = cellKey(cx, cy);
     let bucket = grid.get(key);
     if (!bucket) {
-      bucket = [];
-      bucket.cx = cx;
-      bucket.cy = cy;
+      bucket = {cx: cx, cy: cy, maxI: i, ids: storeIds ? [i] : null};
       grid.set(key, bucket);
+      continue;
     }
-    bucket.push(i);
-    if (bucket.maxI == null || R[i] >= R[bucket.maxI]) bucket.maxI = i;
+    if (storeIds) bucket.ids.push(i);
+    if (R[i] >= R[bucket.maxI]) bucket.maxI = i;
   }
   const rank = [];
   const selective = N > 20000;
@@ -1768,25 +1770,24 @@ function reindexNode(i, oldX, oldY) {
   const newKey = cellKey(cellIndex(X[i]), cellIndex(Y[i]));
   if (oldKey === newKey) return;
   const ob = grid.get(oldKey);
-  if (ob) {
-    const ix = ob.indexOf(i);
-    if (ix >= 0) ob.splice(ix, 1);
+  if (ob && ob.ids) {
+    const ix = ob.ids.indexOf(i);
+    if (ix >= 0) ob.ids.splice(ix, 1);
     if (ob.maxI === i) {
-      ob.maxI = null;
-      for (let k = 0; k < ob.length; k++) {
-        const j = ob[k];
+      ob.maxI = ob.ids.length ? ob.ids[0] : null;
+      for (let k = 0; k < ob.ids.length; k++) {
+        const j = ob.ids[k];
         if (ob.maxI == null || R[j] >= R[ob.maxI]) ob.maxI = j;
       }
     }
   }
   let nb = grid.get(newKey);
   if (!nb) {
-    nb = [];
-    nb.cx = cellIndex(X[i]);
-    nb.cy = cellIndex(Y[i]);
+    nb = {cx: cellIndex(X[i]), cy: cellIndex(Y[i]), maxI: i, ids: []};
     grid.set(newKey, nb);
   }
-  nb.push(i);
+  if (!nb.ids) nb.ids = [];
+  nb.ids.push(i);
   if (nb.maxI == null || R[i] >= R[nb.maxI]) nb.maxI = i;
 }
 
@@ -1798,7 +1799,9 @@ function cellsInView(x0, y0, x1, y1) {
   if (ncell > 2500) {
     grid.forEach(function(bucket) {
       if (bucket.cx < cx0 || bucket.cx > cx1 || bucket.cy < cy0 || bucket.cy > cy1) return;
-      for (let i = 0; i < bucket.length; i++) out.push(bucket[i]);
+      const ids = bucket.ids;
+      if (!ids) return;
+      for (let i = 0; i < ids.length; i++) out.push(ids[i]);
     });
     return out;
   }
@@ -1806,7 +1809,8 @@ function cellsInView(x0, y0, x1, y1) {
     for (let cy = cy0; cy <= cy1; cy++) {
       const b = grid.get(cellKey(cx, cy));
       if (!b) continue;
-      for (let i = 0; i < b.length; i++) out.push(b[i]);
+      if (!b.ids) continue;
+      for (let i = 0; i < b.ids.length; i++) out.push(b.ids[i]);
     }
   }
   return out;
@@ -2849,9 +2853,11 @@ async function inflateB64(b64) {
   throw new Error('Нет DecompressionStream');
 }
 
-function parseBinary(buffer) {
-  const buf = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
-  const view = new DataView(buf);
+function parseBinary(bytes) {
+  const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const buf = raw.buffer;
+  const base = raw.byteOffset;
+  const view = new DataView(buf, base, raw.byteLength);
   if (view.getUint8(0) !== 90 || view.getUint8(1) !== 71 || view.getUint8(2) !== 66 || view.getUint8(3) !== 49) {
     throw new Error('Неизвестный формат графа');
   }
@@ -2864,26 +2870,26 @@ function parseBinary(buffer) {
   const tz = view.getUint32(o, true); o += 4;
   const te = view.getUint32(o, true); o += 4;
   const tr = view.getUint32(o, true); o += 4;
-  const x = new Float32Array(buf.slice(o, o + n * 4)); o += n * 4;
-  const y = new Float32Array(buf.slice(o, o + n * 4)); o += n * 4;
-  const r = new Uint8Array(buf.slice(o, o + n)); o += n;
-  const g = new Uint8Array(buf.slice(o, o + n)); o += n;
-  const c = new Uint8Array(buf.slice(o, o + n)); o += n;
+  const x = new Float32Array(buf, base + o, n); o += n * 4;
+  const y = new Float32Array(buf, base + o, n); o += n * 4;
+  const r = new Uint8Array(buf, base + o, n); o += n;
+  const g = new Uint8Array(buf, base + o, n); o += n;
+  const c = new Uint8Array(buf, base + o, n); o += n;
   o = (o + 3) & ~3;
-  const ea = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
-  const eb = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
-  const ek = new Uint8Array(buf.slice(o, o + e)); o += e;
+  const ea = new Uint32Array(buf, base + o, e); o += e * 4;
+  const eb = new Uint32Array(buf, base + o, e); o += e * 4;
+  const ek = new Uint8Array(buf, base + o, e); o += e;
   let pi = null;
   let pnames = null;
   const dec = new TextDecoder();
   if (flags & 1) {
     if (o & 1) o += 1;
-    pi = new Uint16Array(buf.slice(o, o + n * 2));
+    pi = new Uint16Array(buf, base + o, n);
     o += n * 2;
     pnames = new Array(nproj);
     for (let i = 0; i < nproj; i++) {
       const len = view.getUint16(o, true); o += 2;
-      pnames[i] = dec.decode(new Uint8Array(buf, o, len));
+      pnames[i] = dec.decode(new Uint8Array(buf, base + o, len));
       o += len;
     }
   }
@@ -2891,7 +2897,7 @@ function parseBinary(buffer) {
   for (let i = 0; i < nlab; i++) {
     const index = view.getUint32(o, true); o += 4;
     const len = view.getUint16(o, true); o += 2;
-    labels[index] = dec.decode(new Uint8Array(buf, o, len));
+    labels[index] = dec.decode(new Uint8Array(buf, base + o, len));
     o += len;
   }
   return {
@@ -2956,6 +2962,20 @@ function applyPayload(data) {
   indexReady = false;
   resize();
   requestDraw();
+  setTimeout(function() { fillGridIds(0); }, 0);
+}
+function fillGridIds(start) {
+  const end = Math.min(N, start + 40000);
+  for (let i = start; i < end; i++) {
+    const bucket = grid.get(cellKey(cellIndex(X[i]), cellIndex(Y[i])));
+    if (!bucket) continue;
+    if (!bucket.ids) bucket.ids = [];
+    bucket.ids.push(i);
+  }
+  if (end < N) {
+    setTimeout(function() { fillGridIds(end); }, 0);
+    return;
+  }
   setTimeout(function() {
     buildAdj();
     buildHay();
@@ -3011,7 +3031,7 @@ async function readGraph(resp) {
   }
   let data;
   if (buf.length >= 4 && buf[0] === 90 && buf[1] === 71 && buf[2] === 66 && buf[3] === 49) {
-    data = parseBinary(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    data = parseBinary(buf);
   } else {
     data = JSON.parse(new TextDecoder().decode(buf));
   }

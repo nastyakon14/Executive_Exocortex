@@ -5759,7 +5759,7 @@ async def api_graph(slug: str, request: Request):
     else:
         ids = (scope["graph_id"],)
         count = linker.repository.total_count(scope["graph_id"])
-    binary = count >= 80_000
+    binary = count >= 25_000
     use_gzip = (not binary) and "gzip" in encoding.lower()
     key = (ids, int(count), str(scope.get("data_updated_at") or ""), binary, use_gzip)
     with _graph_cache_lock:
