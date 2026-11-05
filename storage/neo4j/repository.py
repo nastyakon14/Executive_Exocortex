@@ -1218,6 +1218,45 @@ class ZettelRepository:
             })
         return zettels
 
+    def read_card_detail(self, zettel_id: str) -> Optional[Dict[str, Any]]:
+        """Одна карточка и её родитель с детьми — для правой панели."""
+        rows = self.client.execute_read(
+            """
+            MATCH (z:Zettel {zettel_id: $zettel_id})
+            OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
+            WHERE parent.user_id = z.user_id
+            OPTIONAL MATCH (child:Zettel)-[:CHILD_OF]->(z)
+            WHERE child.user_id = z.user_id
+            WITH z, parent, child
+            ORDER BY child.luhmann_id
+            WITH z, parent, collect(child) AS children
+            RETURN z.user_id AS user_id,
+                   z.topic AS topic,
+                   left(coalesce(z.content, ''), 700) AS content,
+                   z.thought_type AS thought_type,
+                   z.tags AS tags,
+                   z.luhmann_id AS luhmann_id,
+                   z.source_input AS source_input,
+                   left(coalesce(z.source_quote, ''), 400) AS source_quote,
+                   parent.zettel_id AS parent_id,
+                   parent.luhmann_id AS parent_luhmann,
+                   CASE
+                     WHEN parent IS NULL THEN ''
+                     WHEN coalesce(parent.topic, '') <> '' THEN left(parent.topic, 80)
+                     ELSE left(coalesce(parent.content, ''), 80)
+                   END AS parent_title,
+                   [c IN children WHERE c IS NOT NULL | {
+                     id: c.zettel_id,
+                     title: CASE
+                       WHEN coalesce(c.topic, '') <> '' THEN left(c.topic, 80)
+                       ELSE left(coalesce(c.content, ''), 80)
+                     END
+                   }] AS children
+            """,
+            {"zettel_id": zettel_id},
+        )
+        return rows[0] if rows else None
+
     def export_graph_data(self, user_id: str) -> Dict[str, Any]:
         """
         Экспортирует полный граф пользователя для визуализации:

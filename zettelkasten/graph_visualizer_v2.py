@@ -1518,7 +1518,7 @@ def build_overview_binary(zettels: list) -> bytes:
             proj_of.append(slot)
         topic = " ".join((zettel.get("topic") or "").split())
         if topic and depth <= 1 and group == 0:
-            labels.append((index, topic.encode("utf-8")[:80]))
+            labels.append((index, topic.encode("utf-8")[:48]))
         parent = index_of.get(zettel.get("parent_luhmann") or "")
         if parent is not None and parent != index:
             ea.append(index)
@@ -1624,6 +1624,7 @@ let lastVis = null;
 let clusterHot = -1;
 let hoverNode = -2;
 let hoverX = 0, hoverY = 0;
+let detailReq = 0;
 
 function fillOf(i) {
   if (G[i] === 1) return isLight() ? '#e2e8f0' : '#64748b';
@@ -1935,6 +1936,9 @@ function buildClusters() {
       const key = (groupByProject && project) ? ('p:' + project) : (C[i] | 0);
       const box = acc.get(key);
       if (!box) continue;
+      const named = String(L[i] || '').trim();
+      const bucket = grouped.get(key);
+      if (named && bucket && bucket.topic.size < 12) bucket.topic.set(named, (bucket.topic.get(named) || 0) + 1);
       const dx = X[i] - box.cx, dy = Y[i] - box.cy;
       const dist = Math.sqrt(dx * dx + dy * dy) + R[i] + 10;
       if (dist > box.outer) box.outer = dist;
@@ -2699,9 +2703,80 @@ function closeDetail() {
   setHot(-1);
   requestDraw();
 }
+function sourceHtml(src) {
+  src = String(src || '').trim();
+  if (!src) return '';
+  let body = '';
+  if (/^https?:\/\//i.test(src)) {
+    body = '<a href="' + esc(src) + '" target="_blank" rel="noopener noreferrer">' + esc(src) + '</a>';
+  } else if (src === 'text') {
+    body = 'текст';
+  } else {
+    body = esc(src);
+  }
+  return '<div class="field"><div class="field-label">Источник</div><div class="field-value">' + body + '</div></div>';
+}
+function renderNodeDetail(idx, info) {
+  if (info.title) L[idx] = info.title;
+  const panel = document.getElementById('detail-panel');
+  const content = document.getElementById('detail-content');
+  let html = '<h2>' + esc(info.title || L[idx] || 'Карточка') + '</h2>';
+  if (info.project) html += '<div class="field"><div class="field-label">Проект</div><div class="field-value">' + esc(info.project) + '</div></div>';
+  if (info.luhmann) {
+    html += '<div class="field-value"><b>[' + esc(info.luhmann) + ']</b> ' +
+      (info.parent_luhmann ? '← [' + esc(info.parent_luhmann) + ']' : 'корневая') + '</div>';
+  }
+  if (info.topic) html += '<div class="field"><div class="field-label">Тема</div><div class="field-value">' + esc(info.topic) + '</div></div>';
+  if (info.type) html += '<div class="field"><div class="field-label">Тип</div><div class="field-value">' + esc(info.type) + '</div></div>';
+  if (info.tags) html += '<div class="field"><div class="field-label">Теги</div><div class="field-value">' + esc(info.tags) + '</div></div>';
+  html += sourceHtml(info.source);
+  if (info.quote) html += '<div class="field"><div class="field-label">Абзац в источнике</div><div class="field-value">' + esc(info.quote) + '</div></div>';
+  if (info.content) html += '<hr/><div class="field-value">' + esc(info.content) + '</div>';
+  const neighbors = info.neighbors || [];
+  if (neighbors.length) {
+    html += '<hr/><div class="neighbors"><div class="field-label">Связи (' + (info.link_count || neighbors.length) + ')</div>';
+    for (let i = 0; i < neighbors.length; i++) {
+      const item = neighbors[i];
+      if (item.title && item.i >= 0) L[item.i] = item.title;
+      html += '<div class="neighbor-item" onclick="focusNode(' + item.i + ')">' +
+        esc(item.arrow || '') + '<b>' + esc(item.title || 'без названия') + '</b></div>';
+    }
+    if (info.more) html += '<div class="field-label">ещё ' + info.more + '</div>';
+    html += '</div>';
+  }
+  content.innerHTML = html;
+  panel.style.display = 'block';
+  requestDraw();
+}
 function showDetail(idx) {
   selected = idx;
   setHot(idx);
+  if (N >= 4000 && DATA_URL) {
+    const ticket = ++detailReq;
+    const panel = document.getElementById('detail-panel');
+    const content = document.getElementById('detail-content');
+    let html = '<h2>' + esc(L[idx] || 'Карточка') + '</h2>';
+    const project = projectOf(idx);
+    if (project) html += '<div class="field"><div class="field-label">Проект</div><div class="field-value">' + esc(project) + '</div></div>';
+    html += '<div class="field-label">Загрузка карточки…</div>';
+    content.innerHTML = html;
+    panel.style.display = 'block';
+    requestDraw();
+    fetch(DATA_URL + '/node/' + idx)
+      .then(function(resp) {
+        if (!resp.ok) throw new Error('Не удалось открыть карточку');
+        return resp.json();
+      })
+      .then(function(info) {
+        if (ticket !== detailReq || selected !== idx) return;
+        renderNodeDetail(idx, info);
+      })
+      .catch(function(err) {
+        if (ticket !== detailReq || selected !== idx) return;
+        content.innerHTML = '<h2>' + esc(L[idx] || 'Карточка') + '</h2><div class="field-value">' + esc(err.message || 'Ошибка') + '</div>';
+      });
+    return;
+  }
   const m = META[idx] || [];
   const panel = document.getElementById('detail-panel');
   const content = document.getElementById('detail-content');
@@ -2768,7 +2843,7 @@ function showDetail(idx) {
         }
       }
       const item = '<div class="neighbor-item" onclick="focusNode(' + ni + ')">' +
-        arrow + '<b>' + esc(pm[6] || L[ni]) + '</b></div>';
+        arrow + '<b>' + esc(pm[6] || L[ni] || 'без названия') + '</b></div>';
       if (G[ni] === 1) entityNeighbors.push(item);
       else if (G[ni] === 2 || tt === 'excel_row') rowNeighbors.push(item);
       else thoughtNeighbors.push(item);

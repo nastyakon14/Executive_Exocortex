@@ -5732,11 +5732,13 @@ async def view_page(slug: str, request: Request):
 
 _graph_cache: dict[tuple, tuple[bytes, dict]] = {}
 _graph_cache_lock = threading.Lock()
+_overview_ids: dict[tuple, list[str]] = {}
 
 
 def _drop_graph_cache() -> None:
     with _graph_cache_lock:
         _graph_cache.clear()
+        _overview_ids.clear()
     folder = Path("data/graph_cache")
     if folder.exists():
         shutil.rmtree(folder, ignore_errors=True)
@@ -5745,6 +5747,31 @@ def _drop_graph_cache() -> None:
 def _overview_cache_file(key: tuple) -> Path:
     token = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()
     return Path("data/graph_cache") / f"{token}.zgb"
+
+
+def _overview_ids_file(key: tuple) -> Path:
+    return _overview_cache_file(key).with_suffix(".ids")
+
+
+def _load_overview_ids(key: tuple) -> list[str]:
+    with _graph_cache_lock:
+        cached = _overview_ids.get(key)
+    if cached is not None:
+        return cached
+    path = _overview_ids_file(key)
+    if not path.exists():
+        return []
+    ids = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    with _graph_cache_lock:
+        _overview_ids[key] = ids
+    return ids
+
+
+def _card_title(topic: str, content: str) -> str:
+    text = " ".join((topic or "").split())
+    if text:
+        return text[:80]
+    return " ".join((content or "").split())[:80]
 
 
 def _overview_headers(body: bytes) -> dict:
@@ -5780,7 +5807,7 @@ async def api_graph(slug: str, request: Request):
     use_gzip = (not binary) and "gzip" in encoding.lower()
     stamp = str(scope.get("data_updated_at") or "")
     if int(count) >= 4_000:
-        key = (ids, int(count), stamp, "overview-islands")
+        key = (ids, int(count), stamp, "overview-click")
         with _graph_cache_lock:
             cached = _graph_cache.get(key)
         if cached:
@@ -5801,10 +5828,17 @@ async def api_graph(slug: str, request: Request):
             rows = linker.repository.export_overview_rows(list(ids))
         body = build_overview_binary(rows)
         headers = _overview_headers(body)
+        id_list = [str(row.get("zettel_id") or "") for row in rows]
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_file.with_suffix(".tmp")
         temporary.write_bytes(body)
         temporary.replace(cache_file)
+        ids_file = _overview_ids_file(key)
+        ids_tmp = ids_file.with_suffix(".tmp")
+        ids_tmp.write_text("\n".join(id_list), encoding="utf-8")
+        ids_tmp.replace(ids_file)
+        with _graph_cache_lock:
+            _overview_ids[key] = id_list
         _remember_graph(key, body, headers)
         print(
             f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}, "
@@ -5833,6 +5867,80 @@ async def api_graph(slug: str, request: Request):
             flush=True,
         )
     return Response(content=body, headers=headers)
+
+
+def _overview_key(scope: dict, ids: tuple, count: int) -> tuple:
+    return (ids, int(count), str(scope.get("data_updated_at") or ""), "overview-click")
+
+
+@app.get("/p/{slug}/api/graph/node/{index}")
+async def api_graph_node(slug: str, index: int):
+    scope = resolve_scope(slug)
+    if not scope:
+        return JSONResponse({"error": "Проект не найден"}, status_code=404)
+    if scope["readonly"]:
+        ids = tuple(scope["graph_ids"])
+        count = linker.repository.total_count_many(list(ids))
+        allowed = set(ids)
+    else:
+        ids = (scope["graph_id"],)
+        count = linker.repository.total_count(scope["graph_id"])
+        allowed = {scope["graph_id"]}
+    id_list = _load_overview_ids(_overview_key(scope, ids, count))
+    if index < 0 or index >= len(id_list):
+        return JSONResponse({"error": "Карточка не найдена"}, status_code=404)
+    row = linker.repository.read_card_detail(id_list[index])
+    if not row or row.get("user_id") not in allowed:
+        return JSONResponse({"error": "Карточка не найдена"}, status_code=404)
+    pos = {zid: i for i, zid in enumerate(id_list)}
+    children = row.get("children") or []
+    neighbors = []
+    parent_id = row.get("parent_id") or ""
+    if parent_id in pos:
+        neighbors.append({
+            "i": pos[parent_id],
+            "title": _card_title(row.get("parent_title") or "", ""),
+            "arrow": "← ",
+        })
+    shown = 0
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        child_id = child.get("id") or ""
+        if child_id not in pos:
+            continue
+        if shown >= 150:
+            break
+        neighbors.append({
+            "i": pos[child_id],
+            "title": _card_title(child.get("title") or "", ""),
+            "arrow": "→ ",
+        })
+        shown += 1
+    tags = row.get("tags") or []
+    if isinstance(tags, str):
+        tag_text = tags
+    else:
+        tag_text = ", ".join(str(tag) for tag in tags if tag)
+    project = ""
+    if scope["readonly"]:
+        project = (scope.get("project_labels") or {}).get(row.get("user_id") or "", "")
+    more = max(0, len(children) - shown)
+    return JSONResponse({
+        "title": _card_title(row.get("topic") or "", row.get("content") or ""),
+        "topic": " ".join(str(row.get("topic") or "").split()),
+        "content": row.get("content") or "",
+        "type": row.get("thought_type") or "",
+        "tags": tag_text,
+        "luhmann": row.get("luhmann_id") or "",
+        "parent_luhmann": row.get("parent_luhmann") or "",
+        "source": row.get("source_input") or "",
+        "quote": row.get("source_quote") or "",
+        "project": project,
+        "neighbors": neighbors,
+        "link_count": (1 if parent_id in pos else 0) + len(children),
+        "more": more,
+    })
 
 
 # ========== DELETE (Card-based) ==========
