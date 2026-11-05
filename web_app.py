@@ -5780,7 +5780,7 @@ async def api_graph(slug: str, request: Request):
     use_gzip = (not binary) and "gzip" in encoding.lower()
     stamp = str(scope.get("data_updated_at") or "")
     if int(count) >= 4_000:
-        key = (ids, int(count), stamp, "overview")
+        key = (ids, int(count), stamp, "overview-islands")
         with _graph_cache_lock:
             cached = _graph_cache.get(key)
         if cached:

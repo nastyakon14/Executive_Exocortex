@@ -483,6 +483,125 @@ def _place_families(
     return pos
 
 
+def _subtree_members(root: str, children: dict[str, list[str]], zid_of: dict[str, str]) -> list[str]:
+    members: list[str] = []
+    stack = [root]
+    seen: set[str] = set()
+    while stack:
+        lid = stack.pop()
+        if lid in seen:
+            continue
+        seen.add(lid)
+        zid = zid_of.get(lid)
+        if zid:
+            members.append(zid)
+        stack.extend(children.get(lid) or ())
+    return members
+
+
+def _island_centers(radii: list[float]) -> list[tuple[float, float]]:
+    """Крупные ветки держатся вместе в центре, мелкие стоят отдельными пятнами вокруг."""
+    count = len(radii)
+    if count == 0:
+        return []
+    if count == 1:
+        return [(0.0, 0.0)]
+    total = sum(radius * radius for radius in radii) or 1.0
+    inner_n = 1
+    filled = radii[0] * radii[0]
+    for index in range(1, count):
+        if filled >= total * 0.55 or inner_n >= 5:
+            break
+        inner_n += 1
+        filled += radii[index] * radii[index]
+    centers = [(0.0, 0.0)]
+    for index in range(1, inner_n):
+        ang = -math.pi / 2 + 2 * math.pi * (index - 1) / max(inner_n - 1, 1)
+        gap = max(56.0, 0.42 * max(radii[0], radii[index]))
+        dist = radii[0] + radii[index] + gap
+        centers.append((dist * math.cos(ang), dist * math.sin(ang) * 0.92))
+    inner_extent = 0.0
+    for (x, y), radius in zip(centers, radii[:inner_n]):
+        inner_extent = max(inner_extent, math.hypot(x, y) + radius)
+    outer = radii[inner_n:]
+    if not outer:
+        return centers
+    ring_count = max(10, int(2 * math.pi * max(inner_extent, 80.0) / 90.0))
+    cursor = 0
+    ring = 0
+    while cursor < len(outer):
+        take = min(ring_count + ring * 6, len(outer) - cursor)
+        ring_r = inner_extent + 88.0 + ring * 120.0
+        need = take * 78.0 / (2 * math.pi)
+        ring_r = max(ring_r, need)
+        for index in range(take):
+            ang = -math.pi / 2 + 2 * math.pi * index / take + ring * 0.4
+            radius = outer[cursor + index]
+            dist = ring_r + radius
+            centers.append((dist * math.cos(ang), dist * math.sin(ang) * 0.9))
+        cursor += take
+        ring += 1
+    return centers
+
+
+def _place_branch_islands(
+    members: list[str],
+    by_zid: dict,
+    center: tuple[float, float],
+) -> dict[str, tuple[float, float]]:
+    """Каждая крупная ветка — отдельное пятно, а не один общий круг."""
+    zid_of: dict[str, str] = {}
+    lid_of: dict[str, str] = {}
+    for zid in members:
+        zettel = by_zid.get(zid)
+        if not zettel:
+            continue
+        lid = str(zettel.get("luhmann_id") or zid)
+        lid_of[zid] = lid
+        zid_of[lid] = zid
+    children: dict[str, list[str]] = defaultdict(list)
+    roots: list[str] = []
+    for zid, lid in lid_of.items():
+        parent = str(by_zid[zid].get("parent_luhmann") or "")
+        if parent and parent in zid_of and parent != lid:
+            children[parent].append(lid)
+        else:
+            roots.append(lid)
+    if not roots:
+        return _place_families(members, by_zid, center)
+    attach_hub = ""
+    islands = roots
+    if len(roots) == 1:
+        kids = children.get(roots[0]) or []
+        branched = [kid for kid in kids if children.get(kid)]
+        if len(branched) >= 2 or len(kids) >= 8:
+            attach_hub = roots[0]
+            islands = list(kids)
+    packed: list[tuple[dict[str, tuple[float, float]], float]] = []
+    for lid in islands:
+        group = _subtree_members(lid, children, zid_of)
+        if len(group) <= 1:
+            local = {group[0]: (0.0, 0.0)} if group else {}
+            packed.append((local, 18.0))
+            continue
+        local = _place_families(group, by_zid, (0.0, 0.0))
+        radius = 18.0
+        for zid, point in local.items():
+            radius = max(radius, math.hypot(point[0], point[1]) + 14.0)
+        packed.append((local, radius))
+    packed.sort(key=lambda item: len(item[0]), reverse=True)
+    centers = _island_centers([radius for _local, radius in packed])
+    pos: dict[str, tuple[float, float]] = {}
+    for (local, _radius), (cx, cy) in zip(packed, centers):
+        for zid, point in local.items():
+            pos[zid] = (center[0] + cx + point[0], center[1] + cy + point[1])
+    if attach_hub:
+        zid = zid_of.get(attach_hub)
+        if zid:
+            pos[zid] = center
+    return pos
+
+
 def _spread_like_obsidian(
     pos: Dict[str, Tuple[float, float]],
     zettels: list,
@@ -518,7 +637,7 @@ def _spread_like_obsidian(
         count = len(members)
         if count >= _FAMILY_MIN:
             used_families = True
-            seeded.update(_place_families(members, by_zid, center))
+            seeded.update(_place_branch_islands(members, by_zid, center))
             continue
         for index, zid in enumerate(members):
             if count == 1:
@@ -1369,6 +1488,10 @@ def build_overview_binary(zettels: list) -> bytes:
     proj_of = array.array("H")
     labels: list[tuple[int, bytes]] = []
     has_project = any(z.get("project") for z in zettels)
+    index_of = {zettel["luhmann_id"]: index for index, zettel in enumerate(zettels)}
+    ea = array.array("I")
+    eb = array.array("I")
+    ek = array.array("B")
     for index, zettel in enumerate(zettels):
         point = positions.get(zettel["zettel_id"], (0.0, 0.0))
         xs.append(float(point[0]))
@@ -1396,17 +1519,23 @@ def build_overview_binary(zettels: list) -> bytes:
         topic = " ".join((zettel.get("topic") or "").split())
         if topic and depth <= 1 and group == 0:
             labels.append((index, topic.encode("utf-8")[:80]))
+        parent = index_of.get(zettel.get("parent_luhmann") or "")
+        if parent is not None and parent != index:
+            ea.append(index)
+            eb.append(parent)
+            ek.append(0)
     flags = 1 if has_project else 0
+    edge_count = len(ea)
     header = struct.pack(
         "<4sIIIIIIII",
         b"ZGB1",
         n,
-        0,
+        edge_count,
         len(labels),
         len(project_names),
         flags,
         n,
-        0,
+        edge_count,
         0,
     )
     chunks = [header, xs.tobytes(), ys.tobytes(), rs.tobytes(), gs.tobytes(), cs.tobytes()]
@@ -1414,6 +1543,9 @@ def build_overview_binary(zettels: list) -> bytes:
     pad = (4 - (raw_len % 4)) % 4
     if pad:
         chunks.append(b"\0" * pad)
+    chunks.extend((ea.tobytes(), eb.tobytes(), ek.tobytes()))
+    if has_project and edge_count & 1:
+        chunks.append(b"\0")
     if has_project:
         chunks.append(proj_of.tobytes())
         for name in project_names:
@@ -1509,10 +1641,36 @@ function nodeXY(i) {
   return [X[i], Y[i]];
 }
 function overviewRadius(i) {
-  if (R[i] >= 15) return 5.6;
-  if (R[i] >= 11) return 4.3;
-  if (R[i] >= 8) return 3.4;
-  return 2.4;
+  if (R[i] >= 15) return 7.4;
+  if (R[i] >= 11) return 5.4;
+  if (R[i] >= 8) return 3.6;
+  return 2.15;
+}
+function drawLocalLinks(light) {
+  if (!E) return;
+  ctx.save();
+  ctx.lineWidth = 0.7;
+  ctx.strokeStyle = light ? '#94a3b8' : '#475569';
+  ctx.globalAlpha = 0.34;
+  const step = E > 24000 ? 3 : 1;
+  let drawn = 0;
+  for (let i = 0; i < E && drawn < 4200; i += step) {
+    const a = EA ? EA[i] : EFLAT[i * 3];
+    const b = EA ? EB[i] : EFLAT[i * 3 + 1];
+    const ax = X[a], ay = Y[a], bx = X[b], by = Y[b];
+    const dx = ax - bx, dy = ay - by;
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 < 4 || dist2 > 160 * 160) continue;
+    if (R[a] < 8 && R[b] < 8 && (i & 1)) continue;
+    const x1 = sx(ax), y1 = sy(ay), x2 = sx(bx), y2 = sy(by);
+    if ((x1 < -30 && x2 < -30) || (x1 > W + 30 && x2 > W + 30) || (y1 < -30 && y2 < -30) || (y1 > H + 30 && y2 > H + 30)) continue;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    drawn++;
+  }
+  ctx.restore();
 }
 function sx(x) { return (x - camX) * zoom + W / 2; }
 function sy(y) { return (y - camY) * zoom + H / 2; }
@@ -2189,6 +2347,7 @@ function drawOverview(x0, y0, x1, y1, light) {
   const bestR = new Uint16Array(cols * rows);
   best.fill(-1);
   dotPick = best;
+  drawLocalLinks(light);
   drawProjectLinks(light);
   dotCols = cols;
   dotBin = bin;
