@@ -1017,6 +1017,7 @@ def set_ingest_phase(slug: str, phase: str) -> None:
 
 
 def end_ingest(slug: str, ok: bool = True, message: str = "") -> None:
+    _drop_graph_cache()
     with _state_lock:
         _ingest_jobs[slug] = max(0, _ingest_jobs.get(slug, 0) - 1)
         if not ok:
@@ -5728,18 +5729,51 @@ async def view_page(slug: str, request: Request):
     return _graph_page(request, scope["name"], f"/p/{slug}/api/graph", back_url=f"/p/{slug}")
 
 
+_graph_cache: dict[tuple, tuple[bytes, dict]] = {}
+_graph_cache_lock = threading.Lock()
+
+
+def _drop_graph_cache() -> None:
+    with _graph_cache_lock:
+        _graph_cache.clear()
+
+
+def _remember_graph(key: tuple, body: bytes, headers: dict) -> None:
+    if len(body) > 80_000_000:
+        return
+    with _graph_cache_lock:
+        if key not in _graph_cache and len(_graph_cache) >= 2:
+            _graph_cache.pop(next(iter(_graph_cache)))
+        _graph_cache[key] = (body, dict(headers))
+
+
 @app.get("/p/{slug}/api/graph")
 async def api_graph(slug: str, request: Request):
     scope = resolve_scope(slug)
     if not scope:
         return JSONResponse({"error": "Проект не найден"}, status_code=404)
+    encoding = request.headers.get("accept-encoding", "")
+    if scope["readonly"]:
+        ids = tuple(scope["graph_ids"])
+        count = linker.repository.total_count_many(list(ids))
+    else:
+        ids = (scope["graph_id"],)
+        count = linker.repository.total_count(scope["graph_id"])
+    binary = count >= 80_000
+    use_gzip = (not binary) and "gzip" in encoding.lower()
+    key = (ids, int(count), str(scope.get("data_updated_at") or ""), binary, use_gzip)
+    with _graph_cache_lock:
+        cached = _graph_cache.get(key)
+    if cached:
+        return Response(content=cached[0], headers=cached[1])
     if scope["readonly"]:
         labels = scope.get("project_labels") or {}
         data = linker.repository.export_graph_data_combined(scope["graph_ids"], labels)
     else:
         data = linker.repository.export_graph_data(scope["graph_id"])
     payload = pack_graph_payload(data)
-    body, headers = encode_graph_payload(payload, request.headers.get("accept-encoding", ""))
+    body, headers = encode_graph_payload(payload, encoding)
+    _remember_graph(key, body, headers)
     return Response(content=body, headers=headers)
 
 

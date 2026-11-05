@@ -1238,9 +1238,20 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
     nodes, edges, meta, total_z, total_e, total_r = _pack_graph(graph_data)
     edges = _thin_edges(edges)
     n = len(nodes)
+    binary = n >= 80_000
+    ea = eb = ek = None
     eflat: list[int] = []
-    for a, b, k in edges:
-        eflat.extend((int(a), int(b), int(k)))
+    if binary:
+        ea = array.array("I")
+        eb = array.array("I")
+        ek = array.array("B")
+        for a, b, k in edges:
+            ea.append(int(a))
+            eb.append(int(b))
+            ek.append(int(k))
+    else:
+        for a, b, k in edges:
+            eflat.extend((int(a), int(b), int(k)))
     return {
         "n": n,
         "x": [float(nodes[i]["x"]) for i in range(n)],
@@ -1251,6 +1262,9 @@ def pack_graph_payload(graph_data: Dict[str, Any]) -> dict:
         "l": [nodes[i]["l"] for i in range(n)],
         "m": meta,
         "e": eflat,
+        "ea": ea,
+        "eb": eb,
+        "ek": ek,
         "tz": int(total_z),
         "te": int(total_e),
         "tr": int(total_r),
@@ -1273,8 +1287,16 @@ def dumps_payload(payload: dict) -> bytes:
 def dumps_binary(payload: dict) -> bytes:
     """Плотный формат для сотен тысяч узлов: числа массивами, без JSON."""
     n = int(payload["n"])
-    eflat = payload["e"]
-    edge_count = len(eflat) // 3
+    ea_ready = payload.get("ea")
+    if ea_ready is not None:
+        ea = ea_ready
+        eb = payload["eb"]
+        ek = payload["ek"]
+        edge_count = len(ea)
+        eflat = None
+    else:
+        eflat = payload["e"]
+        edge_count = len(eflat) // 3
     labels = [
         (index, str(text).encode("utf-8")[:120])
         for index, text in enumerate(payload.get("l") or [])
@@ -1302,9 +1324,10 @@ def dumps_binary(payload: dict) -> bytes:
     rs = array.array("B", (min(255, int(v)) for v in payload["r"]))
     gs = array.array("B", (min(255, int(v)) for v in payload["g"]))
     cs = array.array("B", (min(255, int(v)) for v in payload["c"]))
-    ea = array.array("I", eflat[0::3])
-    eb = array.array("I", eflat[1::3])
-    ek = array.array("B", eflat[2::3])
+    if eflat is not None:
+        ea = array.array("I", eflat[0::3])
+        eb = array.array("I", eflat[1::3])
+        ek = array.array("B", eflat[2::3])
     header = struct.pack(
         "<4sIIIIIIII",
         b"ZGB1",
@@ -1344,7 +1367,7 @@ def encode_graph_payload(payload: dict, accept_encoding: str = "") -> tuple[byte
         "cache-control": "no-store",
         "x-graph-size": str(len(raw)),
     }
-    if "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
+    if not binary and "gzip" in (accept_encoding or "").lower() and len(raw) > 8_000:
         level = 1 if len(raw) > 1_500_000 else 4
         return gzip.compress(raw, compresslevel=level), {
             **headers,
@@ -1365,7 +1388,8 @@ const canvas = document.getElementById('graph');
 const ctx = canvas.getContext('2d', { alpha: false });
 
 let N = 0, E = 0;
-let X, Y, R, G, C, L, META, EFLAT;
+let X, Y, R, G, C, L, META, EFLAT, EA, EB, EK;
+let indexReady = true;
 let visMask = null;
 let hot = null;
 let adjOff, adjTo, adjK, adjFrom;
@@ -1379,6 +1403,7 @@ let raf = 0;
 let hay = [];
 const CELL = 160;
 function cellIndex(v) { return Math.floor(v / CELL); }
+function cellKey(cx, cy) { return (cx + 524288) * 1048576 + (cy + 524288); }
 let grid = new Map();
 let hubs = [];
 let hubMark = null;
@@ -1525,11 +1550,13 @@ function setHotMany(ids) {
   for (let k = 0; k < ids.length; k++) hot[ids[k]] = 2;
 }
 
-function buildIndex() {
+function buildAdj() {
   const cnt = new Uint32Array(N);
   for (let i = 0; i < E; i++) {
-    cnt[EFLAT[i * 3]]++;
-    cnt[EFLAT[i * 3 + 1]]++;
+    const a = EA ? EA[i] : EFLAT[i * 3];
+    const b = EA ? EB[i] : EFLAT[i * 3 + 1];
+    cnt[a]++;
+    cnt[b]++;
   }
   adjOff = new Uint32Array(N + 1);
   for (let i = 0; i < N; i++) adjOff[i + 1] = adjOff[i] + cnt[i];
@@ -1542,7 +1569,9 @@ function buildIndex() {
   parentOf.fill(-1);
   childN = new Uint32Array(N);
   for (let i = 0; i < E; i++) {
-    const a = EFLAT[i * 3], b = EFLAT[i * 3 + 1], k = EFLAT[i * 3 + 2];
+    const a = EA ? EA[i] : EFLAT[i * 3];
+    const b = EA ? EB[i] : EFLAT[i * 3 + 1];
+    const k = EA ? EK[i] : EFLAT[i * 3 + 2];
     let p = cur[a]++;
     adjTo[p] = b; adjK[p] = k; adjFrom[p] = a;
     p = cur[b]++;
@@ -1553,10 +1582,13 @@ function buildIndex() {
       childN[b]++;
     }
   }
+}
+function buildGrid() {
+  projectLinks = [];
   grid = new Map();
   for (let i = 0; i < N; i++) {
     const cx = cellIndex(X[i]), cy = cellIndex(Y[i]);
-    const key = cx + ':' + cy;
+    const key = cellKey(cx, cy);
     let bucket = grid.get(key);
     if (!bucket) {
       bucket = [];
@@ -1568,14 +1600,25 @@ function buildIndex() {
     if (bucket.maxI == null || R[i] >= R[bucket.maxI]) bucket.maxI = i;
   }
   const rank = [];
+  const selective = N > 20000;
   for (let i = 0; i < N; i++) {
     if (G[i] === 1 || G[i] === 2) continue;
+    if (selective && R[i] < 11) continue;
     rank.push(i);
+  }
+  if (selective && rank.length < 40) {
+    const step = Math.max(1, Math.floor(N / 180));
+    for (let i = 0; i < N && rank.length < 180; i += step) {
+      if (G[i] === 1 || G[i] === 2) continue;
+      rank.push(i);
+    }
   }
   rank.sort(function(a, b) { return R[b] - R[a]; });
   hubs = rank.slice(0, Math.min(rank.length, N > 2500 ? 180 : 320));
   hubMark = new Uint8Array(N);
   for (let h = 0; h < hubs.length; h++) hubMark[hubs[h]] = 1;
+}
+function buildHay() {
   hay = new Array(N);
   searchIds = N > 40000 ? [] : null;
   for (let i = 0; i < N; i++) {
@@ -1590,6 +1633,11 @@ function buildIndex() {
       hay[i] = [m[0], m[2], m[4], m[5], m[7], m[10], label].join(' ').toLowerCase();
     }
   }
+}
+function buildIndex() {
+  buildGrid();
+  buildAdj();
+  buildHay();
 }
 function projectOf(i) {
   if (PNAMES && PINDEX) return PNAMES[PINDEX[i]] || '';
@@ -1716,8 +1764,8 @@ function buildClusters() {
 }
 
 function reindexNode(i, oldX, oldY) {
-  const oldKey = cellIndex(oldX) + ':' + cellIndex(oldY);
-  const newKey = cellIndex(X[i]) + ':' + cellIndex(Y[i]);
+  const oldKey = cellKey(cellIndex(oldX), cellIndex(oldY));
+  const newKey = cellKey(cellIndex(X[i]), cellIndex(Y[i]));
   if (oldKey === newKey) return;
   const ob = grid.get(oldKey);
   if (ob) {
@@ -1756,7 +1804,7 @@ function cellsInView(x0, y0, x1, y1) {
   }
   for (let cx = cx0; cx <= cx1; cx++) {
     for (let cy = cy0; cy <= cy1; cy++) {
-      const b = grid.get(cx + ':' + cy);
+      const b = grid.get(cellKey(cx, cy));
       if (!b) continue;
       for (let i = 0; i < b.length; i++) out.push(b[i]);
     }
@@ -2029,7 +2077,7 @@ function drawOverviewBuckets(x0, y0, x1, y1, light) {
   } else {
     for (let cx = cx0; cx <= cx1; cx++) {
       for (let cy = cy0; cy <= cy1; cy++) {
-        const bucket = grid.get(cx + ':' + cy);
+        const bucket = grid.get(cellKey(cx, cy));
         if (bucket) consider(bucket);
       }
     }
@@ -2051,7 +2099,7 @@ function drawOverviewBuckets(x0, y0, x1, y1, light) {
   drawHubs(light);
 }
 function drawOverview(x0, y0, x1, y1, light) {
-  if (N > 40000) {
+  if (N > 2500) {
     drawOverviewBuckets(x0, y0, x1, y1, light);
     return;
   }
@@ -2115,7 +2163,7 @@ function draw() {
   }
   const pad = 90 / Math.max(zoom, 0.02);
   const x0 = wx(0) - pad, y0 = wy(0) - pad, x1 = wx(W) + pad, y1 = wy(H) + pad;
-  let overview = zoom < 0.07 || (N > 2000 && zoom < 0.24);
+  let overview = !indexReady || zoom < 0.07 || (N > 2000 && zoom < 0.24);
   let vis = null;
   if (!overview) {
     vis = cellsInView(x0, y0, x1, y1);
@@ -2441,6 +2489,12 @@ function showDetail(idx) {
     html += '<div class="field-label">' + esc(m[3]) + '</div>';
     html += '<div class="field-value">' + esc(m[5]) + '</div>';
   }
+  if (!adjOff) {
+    content.innerHTML = html;
+    panel.style.display = 'block';
+    requestDraw();
+    return;
+  }
   const start = adjOff[idx], end = adjOff[idx + 1];
   const nbrCount = end - start;
   if (nbrCount) {
@@ -2650,6 +2704,7 @@ function applySearch(raw) {
     requestDraw();
     return;
   }
+  if (!hay) return;
   const matched = [];
   let tagHit = false;
   let rowHit = false;
@@ -2818,12 +2873,6 @@ function parseBinary(buffer) {
   const ea = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
   const eb = new Uint32Array(buf.slice(o, o + e * 4)); o += e * 4;
   const ek = new Uint8Array(buf.slice(o, o + e)); o += e;
-  const eflat = new Uint32Array(e * 3);
-  for (let i = 0; i < e; i++) {
-    eflat[i * 3] = ea[i];
-    eflat[i * 3 + 1] = eb[i];
-    eflat[i * 3 + 2] = ek[i];
-  }
   let pi = null;
   let pnames = null;
   const dec = new TextDecoder();
@@ -2846,7 +2895,8 @@ function parseBinary(buffer) {
     o += len;
   }
   return {
-    n: n, x: x, y: y, r: r, g: g, c: c, l: labels, m: [], e: eflat,
+    n: n, x: x, y: y, r: r, g: g, c: c, l: labels, m: [], e: [],
+    ea: ea, eb: eb, ek: ek,
     tz: tz, te: te, tr: tr, gp: flags & 1, pi: pi, pnames: pnames
   };
 }
@@ -2859,10 +2909,21 @@ function applyPayload(data) {
   C = data.c instanceof Uint8Array ? data.c : Uint8Array.from(data.c || []);
   L = data.l || [];
   META = data.m || [];
-  EFLAT = data.e || [];
+  if (data.ea) {
+    EA = data.ea;
+    EB = data.eb;
+    EK = data.ek;
+    EFLAT = [];
+    E = EA.length;
+  } else {
+    EA = null;
+    EB = null;
+    EK = null;
+    EFLAT = data.e || [];
+    E = (EFLAT.length / 3) | 0;
+  }
   PINDEX = data.pi || null;
   PNAMES = data.pnames || null;
-  E = (EFLAT.length / 3) | 0;
   groupByProject = !!data.gp;
   hot = null;
   visMask = null;
@@ -2876,14 +2937,30 @@ function applyPayload(data) {
   document.getElementById('stat-z').textContent = data.tz || 0;
   document.getElementById('stat-e').textContent = data.te || 0;
   document.getElementById('stat-r').textContent = data.tr || 0;
-  buildIndex();
   clusterHot = -1;
   hideClusterTip();
+  buildGrid();
   fitted = false;
+  if (N < 4000) {
+    buildAdj();
+    buildHay();
+    indexReady = true;
+    resize();
+    requestDraw();
+    setTimeout(function() {
+      buildClusters();
+      requestDraw();
+    }, 0);
+    return;
+  }
+  indexReady = false;
   resize();
   requestDraw();
   setTimeout(function() {
+    buildAdj();
+    buildHay();
     buildClusters();
+    indexReady = true;
     requestDraw();
   }, 0);
 }
