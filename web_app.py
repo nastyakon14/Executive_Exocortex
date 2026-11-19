@@ -1873,6 +1873,18 @@ body {
 .project-card .sources-open { display: inline-flex; flex-direction: column; align-items: flex-start; margin: 0 18px 14px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card2); max-width: calc(100% - 36px); }
 .project-card .sources-open .menu-hint { max-width: 240px; }
 .src-board { margin-top: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 6px 8px 12px; }
+.src-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.src-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; transition: border-color .15s; }
+.src-card:hover { border-color: var(--accent); }
+.src-card-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; }
+.src-card-icon { font-size: 20px; flex-shrink: 0; }
+.src-card-info { min-width: 0; }
+.src-card-title { font-size: 14px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+.src-card-title a { color: var(--accent); text-decoration: none; }
+.src-card-title a:hover { text-decoration: underline; }
+.src-card-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.src-card-err { font-size: 11px; color: #ef4444; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+.src-card-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .src-head { display: flex; align-items: center; gap: 10px; margin: 0 0 6px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
 .src-head-label { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
 .src-cols, .tree-watch {
@@ -3758,145 +3770,174 @@ def _tracked(row: dict | None, item: str) -> bool:
 
 
 def _sources_tree_html(scope: dict) -> str:
+    """Лёгкий список источников: только БД-данные, без обхода ФС и HTTP.
+
+    Показывает плоский список зарегистрированных источников (папки, Confluence,
+    файлы, текст) с количеством проиндексированных элементов из Neo4j.
+    Все данные берутся из PostgreSQL + Neo4j — никаких os.walk / Confluence API.
+    """
     graph_id = scope["graph_id"]
+    slug = scope.get("slug") or ""
     try:
         rows = list_watch_sources(watch_only=False, graph_id=graph_id)
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
     ingested = _project_source_inputs(graph_id)
+    ingested_set = set(ingested)
+    statuses = _collect_source_statuses_cached(scope)
+
     folders = [row for row in rows if row.get("source_kind") == "folder"]
     pages = [row for row in rows if row.get("source_kind") == "confluence"]
     lone = [row for row in rows if row.get("source_kind") == "file"]
-    # Вычисляем файлы папок ОДИН раз — передаём и в statuses, и в рендеринг
-    folder_files_map: dict[int, list[str]] = {}
-    for row in folders:
-        folder_files_map[row["id"]] = _folder_files(row, ingested)
-    statuses = _collect_source_statuses(
-        scope, preloaded_ingested=ingested, preloaded_rows=rows,
-        preloaded_folder_files=folder_files_map,
-    )
-    folder_roots = [row.get("source_path") or "" for row in folders]
-    page_roots = {(row.get("source_path") or "").strip() for row in pages}
-    claimed_pages: set[str] = set()
-    for row in pages:
-        claimed_pages.update(_confluence_pages(row))
+
+    # Быстрый подсчёт файлов в папке из списка ingested (без обхода ФС)
+    def _count_in_folder(root: str) -> int:
+        prefix = os.path.abspath(root)
+        prefix_sep = prefix if prefix.endswith(os.sep) else prefix + os.sep
+        return sum(1 for s in ingested if not _is_url(s) and s != "text"
+                   and (os.path.abspath(s) == prefix or os.path.abspath(s).startswith(prefix_sep)))
+
+    # Количество Confluence-страниц из content_hash (без HTTP)
+    def _count_pages(row: dict) -> int:
+        known = _confluence_pages(row)
+        return len(known)
 
     chunks: list[str] = []
+
+    # --- Директории ---
     if folders:
-        chunks.append('<div class="src-section">Директории</div><ul class="src-tree">')
+        chunks.append('<div class="src-section">Директории</div>')
         for row in folders:
             root = row.get("source_path") or ""
-            files = folder_files_map.get(row["id"], [])
-            excluded = _excluded_items(row, "folder")
-            tree = _nest_files(root, files)
             title = os.path.basename(root.rstrip("\\/")) or root
-            chunks.append(_render_file_tree(
-                tree, "folder", root, excluded, bool(row.get("watch")), True, title, statuses=statuses,
-            ))
-        chunks.append("</ul>")
+            watched = bool(row.get("watch"))
+            n_files = _count_in_folder(root)
+            badge = _status_badge(root, statuses)
+            err = " ".join(str(row.get("last_error") or "").split())
+            err_html = f'<div class="src-card-err">{escape(err[:120])}</div>' if err else ""
+            chunks.append(
+                '<div class="src-card">'
+                f'<div class="src-card-main">'
+                f'<span class="src-card-icon">📁</span>'
+                f'<div class="src-card-info">'
+                f'<div class="src-card-title" title="{escape(root)}">{escape(title)}</div>'
+                f'<div class="src-card-meta">{n_files} файл(ов) в графе · {"отслеживается" if watched else "без отслеживания"}</div>'
+                f'{err_html}'
+                f'</div></div>'
+                f'<div class="src-card-actions">'
+                f'{badge}'
+                f'{_watch_box("folder", root, root, watched)}'
+                f'{_trash_box("folder", root, root, title, whole=True)}'
+                f'</div></div>'
+            )
 
+    # --- Confluence ---
     if pages:
         chunks.append('<div class="src-section">Страницы Confluence</div>')
-        notes = []
-        trees = []
-        # Загружаем деревья Confluence ПАРАЛЛЕЛЬНО
-        _CONFL_TREE_TIMEOUT = 15
-        confl_results: dict[int, tuple[dict, str | None]] = {}
-        with ThreadPoolExecutor(max_workers=min(len(pages), 4), thread_name_prefix="confl") as pool:
-            from concurrent.futures import as_completed
-            futs = {pool.submit(_confluence_nodes_safe, row): row for row in pages}
-            done = as_completed(futs, timeout=_CONFL_TREE_TIMEOUT)
-            try:
-                for fut in done:
-                    row = futs[fut]
-                    try:
-                        confl_results[row["id"]] = fut.result()
-                    except Exception as e:
-                        root = (row.get("source_path") or "").strip()
-                        confl_results[row["id"]] = (
-                            {"source_input": root, "title": _page_label(root), "children": []},
-                            f"Ошибка: {e}",
-                        )
-            except TimeoutError:
-                print(f"web_app confluence tree global timeout ({_CONFL_TREE_TIMEOUT}s)")
-            # Для не успевших — fallback на уже известные страницы
-            for fut, row in futs.items():
-                if row["id"] not in confl_results:
-                    root = (row.get("source_path") or "").strip()
-                    known = [p for p in _confluence_pages(row) if p]
-                    children = [{"source_input": p, "title": _page_label(p), "children": []} for p in known if p != root]
-                    confl_results[row["id"]] = (
-                        {"source_input": root, "title": _page_label(root), "children": children},
-                        "Confluence не ответил вовремя. Показаны уже загруженные страницы.",
-                    )
         for row in pages:
             root = (row.get("source_path") or "").strip()
-            node, note = confl_results.get(row["id"], (
-                {"source_input": root, "title": _page_label(root), "children": []}, None,
-            ))
-            if note and note not in notes:
-                notes.append(note)
-            excluded = _excluded_items(row, "confluence")
-            claimed_pages.update(_flatten_pages(node))
-            trees.append(_render_page_tree(node, root, excluded, bool(row.get("watch")), True, statuses=statuses))
-        if notes:
-            chunks.append('<p class="sources-warn">' + escape(notes[0]) + "</p>")
-        chunks.append('<ul class="src-tree">' + "".join(trees) + "</ul>")
+            title = _page_label(root)
+            watched = bool(row.get("watch"))
+            n_pages = _count_pages(row)
+            child = bool(row.get("extract_child"))
+            badge = _status_badge(root, statuses)
+            err = " ".join(str(row.get("last_error") or "").split())
+            err_html = f'<div class="src-card-err">{escape(err[:120])}</div>' if err else ""
+            meta = f'{n_pages} страниц(а) в графе'
+            if child:
+                meta += " · с дочерними"
+            chunks.append(
+                '<div class="src-card">'
+                f'<div class="src-card-main">'
+                f'<span class="src-card-icon">🌐</span>'
+                f'<div class="src-card-info">'
+                f'<div class="src-card-title"><a href="{escape(display_confluence_source(root))}" '
+                f'target="_blank" rel="noopener" title="{escape(root)}">{escape(title)}</a></div>'
+                f'<div class="src-card-meta">{meta}</div>'
+                f'{err_html}'
+                f'</div></div>'
+                f'<div class="src-card-actions">'
+                f'{badge}'
+                f'{_watch_box("confluence", root, root, watched)}'
+                f'{_trash_box("confluence", root, root, title, whole=True)}'
+                f'</div></div>'
+            )
 
-    loose_files = []
-    texts = []
+    # --- Файлы ---
+    file_items: list[tuple[str, str, bool]] = []
+    seen_paths: set[str] = set()
+    for row in lone:
+        path = os.path.abspath(row.get("source_path") or "")
+        if path and path not in seen_paths:
+            seen_paths.add(path)
+            file_items.append((path, os.path.basename(path), bool(row.get("watch"))))
+    folder_roots = [row.get("source_path") or "" for row in folders]
     for raw in ingested:
-        if raw in {"text", ""}:
-            texts.append(raw)
-            continue
-        if _is_url(raw):
-            if raw not in claimed_pages and raw not in page_roots:
-                loose_files.append(("confluence-orphan", raw))
+        if raw in {"text", ""} or _is_url(raw):
             continue
         if any(_under_root(raw, root) for root in folder_roots if root):
             continue
-        if any(os.path.abspath(raw) == os.path.abspath(row.get("source_path") or "") for row in lone):
-            continue
-        loose_files.append(("file", os.path.abspath(raw)))
-    for row in lone:
-        path = os.path.abspath(row.get("source_path") or "")
-        if path and ("file", path) not in loose_files:
-            loose_files.append(("saved", path))
+        path = os.path.abspath(raw)
+        if path not in seen_paths:
+            seen_paths.add(path)
+            file_items.append((path, os.path.basename(path) or path, False))
 
-    if loose_files or lone:
-        chunks.append('<div class="src-section">Файлы</div><ul class="src-tree">')
-        seen = set()
-        for row in lone:
-            path = os.path.abspath(row.get("source_path") or "")
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            chunks.append(_file_row(os.path.basename(path), "file", path, path, bool(row.get("watch")), statuses=statuses))
-        for kind, path in loose_files:
-            if kind != "file" or path in seen:
-                continue
-            seen.add(path)
-            chunks.append(_file_row(os.path.basename(path) or path, "file", path, path, False, statuses=statuses))
-        for kind, url in loose_files:
-            if kind != "confluence-orphan":
-                continue
-            chunks.append(_file_row(url, "confluence", url, url, False, "🌐", statuses=statuses))
-        chunks.append("</ul>")
+    if file_items:
+        chunks.append('<div class="src-section">Файлы</div>')
+        for path, name, watched in file_items:
+            badge = _status_badge(path, statuses)
+            chunks.append(
+                '<div class="src-card">'
+                f'<div class="src-card-main">'
+                f'<span class="src-card-icon">📄</span>'
+                f'<div class="src-card-info">'
+                f'<div class="src-card-title" title="{escape(path)}">{escape(name)}</div>'
+                f'<div class="src-card-meta">{escape(path)}</div>'
+                f'</div></div>'
+                f'<div class="src-card-actions">'
+                f'{badge}'
+                f'{_watch_box("file", path, path, watched)}'
+                f'{_trash_box("file", path, path, name)}'
+                f'</div></div>'
+            )
 
-    if texts:
-        chunks.append('<div class="src-section">Текст</div><ul class="src-tree">')
-        chunks.append('<li class="tree-leaf"><span class="tree-name">📝 Введённый текст</span></li>')
-        chunks.append("</ul>")
+    # --- Текст ---
+    has_text = any(s in {"text", ""} for s in ingested)
+    if has_text:
+        chunks.append('<div class="src-section">Текст</div>')
+        chunks.append(
+            '<div class="src-card">'
+            '<div class="src-card-main">'
+            '<span class="src-card-icon">📝</span>'
+            '<div class="src-card-info">'
+            '<div class="src-card-title">Введённый текст</div>'
+            '</div></div></div>'
+        )
+
+    # --- Orphan Confluence ---
+    page_roots = {(row.get("source_path") or "").strip() for row in pages}
+    claimed: set[str] = set()
+    for row in pages:
+        claimed.update(_confluence_pages(row))
+    for raw in ingested:
+        if _is_url(raw) and raw not in claimed and raw not in page_roots:
+            title = _page_label(raw)
+            chunks.append(
+                '<div class="src-card">'
+                f'<div class="src-card-main">'
+                f'<span class="src-card-icon">🌐</span>'
+                f'<div class="src-card-info">'
+                f'<div class="src-card-title">{escape(title)}</div>'
+                f'<div class="src-card-meta">{escape(raw)}</div>'
+                f'</div></div>'
+                f'<div class="src-card-actions">'
+                f'{_trash_box("confluence", raw, raw, title)}'
+                f'</div></div>'
+            )
 
     if not chunks:
         return '<p class="sources-empty">В проекте пока нет загруженных файлов, директорий и страниц.</p>'
-    return (
-        '<div class="src-board">'
-        '<div class="src-head"><span class="src-head-label">Источник</span>'
-        '<div class="src-cols"><span class="src-col">Статус</span><span class="src-col">Отслеживать</span><span class="src-col"></span></div></div>'
-        + "".join(chunks)
-        + "</div>"
-    )
+    return '<div class="src-list">' + "".join(chunks) + "</div>"
 
 
 def _known_items(row: dict, ingested: list[str]) -> list[str]:
