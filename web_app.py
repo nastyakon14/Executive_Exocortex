@@ -859,8 +859,23 @@ def _backfill_data_times(projects: list[dict]) -> list[dict]:
     return projects
 
 
+_sync_cache: tuple[float, list[dict]] | None = None
+_SYNC_TTL = 3.0
+
+
 def sync_projects_from_graph() -> list[dict]:
     """Подтягивает графы из Neo4j, чтобы старые данные не потерялись."""
+    global _sync_cache
+    now = time.monotonic()
+    if _sync_cache and now - _sync_cache[0] < _SYNC_TTL:
+        return _sync_cache[1]
+    result = _sync_projects_from_graph_impl()
+    _sync_cache = (now, result)
+    return result
+
+
+def _sync_projects_from_graph_impl() -> list[dict]:
+    """Реальная реализация без кеша."""
     try:
         graph_ids = linker.repository.list_graph_ids()
     except Exception as e:
@@ -926,7 +941,13 @@ def project_labels_map(projects: list[dict] | None = None) -> dict[str, str]:
     }
 
 
+def _invalidate_sync_cache():
+    global _sync_cache
+    _sync_cache = None
+
+
 def update_project(slug: str, **fields) -> dict | None:
+    _invalidate_sync_cache()
     with _state_lock:
         projects = _load_projects_unlocked()
         for item in projects:
@@ -938,6 +959,7 @@ def update_project(slug: str, **fields) -> dict | None:
 
 
 def remove_project(slug: str) -> dict | None:
+    _invalidate_sync_cache()
     with _state_lock:
         projects = _load_projects_unlocked()
         item = next((p for p in projects if p.get("slug") == slug), None)
@@ -3490,43 +3512,23 @@ def _flatten_pages(node: dict) -> list[str]:
     return found
 
 
-_CONFLUENCE_TREE_TIMEOUT = 15  # секунд на загрузку дерева Confluence
-
-
 def _confluence_nodes_safe(row: dict) -> tuple[dict, str | None]:
-    """Обёртка с таймаутом: если Confluence не ответил за N сек, отдаём уже известные страницы."""
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="confl") as pool:
-        fut = pool.submit(_confluence_nodes, row)
-        try:
-            return fut.result(timeout=_CONFLUENCE_TREE_TIMEOUT)
-        except FuturesTimeout:
-            fut.cancel()
-            root = (row.get("source_path") or "").strip()
-            known = [page for page in _confluence_pages(row) if page]
-            children = [
-                {"source_input": page, "title": _page_label(page), "children": []}
-                for page in known if page != root
-            ]
-            print(f"web_app confluence tree timeout ({_CONFLUENCE_TREE_TIMEOUT}s) for {root}")
-            return {
-                "source_input": root,
-                "title": _page_label(root),
-                "children": children,
-            }, f"Confluence не ответил за {_CONFLUENCE_TREE_TIMEOUT} сек. Показаны уже загруженные страницы."
-        except Exception as e:
-            root = (row.get("source_path") or "").strip()
-            print(f"web_app confluence tree error: {e}")
-            known = [page for page in _confluence_pages(row) if page]
-            children = [
-                {"source_input": page, "title": _page_label(page), "children": []}
-                for page in known if page != root
-            ]
-            return {
-                "source_input": root,
-                "title": _page_label(root),
-                "children": children,
-            }, "Ошибка загрузки дерева Confluence. Показаны уже загруженные страницы."
+    """Обёртка: при любой ошибке отдаёт уже известные страницы вместо краша."""
+    try:
+        return _confluence_nodes(row)
+    except Exception as e:
+        root = (row.get("source_path") or "").strip()
+        print(f"web_app confluence tree error: {e}")
+        known = [page for page in _confluence_pages(row) if page]
+        children = [
+            {"source_input": page, "title": _page_label(page), "children": []}
+            for page in known if page != root
+        ]
+        return {
+            "source_input": root,
+            "title": _page_label(root),
+            "children": children,
+        }, "Ошибка загрузки дерева Confluence. Показаны уже загруженные страницы."
 
 
 def _confluence_nodes(row: dict) -> tuple[dict, str | None]:
@@ -3656,6 +3658,7 @@ def _collect_source_statuses(
     *,
     preloaded_ingested: list[str] | None = None,
     preloaded_rows: list[dict] | None = None,
+    preloaded_folder_files: dict[int, list[str]] | None = None,
 ) -> dict[str, dict]:
     """Статус каждого источника: загружен, ошибка или идёт обработка."""
     slug = scope.get("slug") or ""
@@ -3721,6 +3724,7 @@ def _collect_source_statuses(
     if busy:
         for key in current_keys:
             statuses[key] = _status_view("progress", progress_title)
+    folder_files_map = preloaded_folder_files or {}
     for row in rows:
         if row.get("source_kind") != "folder":
             root = _status_key(row.get("source_path") or "")
@@ -3728,7 +3732,10 @@ def _collect_source_statuses(
                 statuses[root] = _status_view("idle")
             continue
         root = row.get("source_path") or ""
-        files = _folder_files(row, ingested)
+        row_id = row.get("id")
+        files = folder_files_map.get(row_id) if row_id else None
+        if files is None:
+            files = _folder_files(row, ingested)
         statuses[_status_key(root)] = _rollup_status([root, *files], statuses)
     return statuses
 
@@ -3757,10 +3764,17 @@ def _sources_tree_html(scope: dict) -> str:
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
     ingested = _project_source_inputs(graph_id)
-    statuses = _collect_source_statuses(scope, preloaded_ingested=ingested, preloaded_rows=rows)
     folders = [row for row in rows if row.get("source_kind") == "folder"]
     pages = [row for row in rows if row.get("source_kind") == "confluence"]
     lone = [row for row in rows if row.get("source_kind") == "file"]
+    # Вычисляем файлы папок ОДИН раз — передаём и в statuses, и в рендеринг
+    folder_files_map: dict[int, list[str]] = {}
+    for row in folders:
+        folder_files_map[row["id"]] = _folder_files(row, ingested)
+    statuses = _collect_source_statuses(
+        scope, preloaded_ingested=ingested, preloaded_rows=rows,
+        preloaded_folder_files=folder_files_map,
+    )
     folder_roots = [row.get("source_path") or "" for row in folders]
     page_roots = {(row.get("source_path") or "").strip() for row in pages}
     claimed_pages: set[str] = set()
@@ -3772,7 +3786,7 @@ def _sources_tree_html(scope: dict) -> str:
         chunks.append('<div class="src-section">Директории</div><ul class="src-tree">')
         for row in folders:
             root = row.get("source_path") or ""
-            files = _folder_files(row, ingested)
+            files = folder_files_map.get(row["id"], [])
             excluded = _excluded_items(row, "folder")
             tree = _nest_files(root, files)
             title = os.path.basename(root.rstrip("\\/")) or root
@@ -3785,9 +3799,41 @@ def _sources_tree_html(scope: dict) -> str:
         chunks.append('<div class="src-section">Страницы Confluence</div>')
         notes = []
         trees = []
+        # Загружаем деревья Confluence ПАРАЛЛЕЛЬНО
+        _CONFL_TREE_TIMEOUT = 15
+        confl_results: dict[int, tuple[dict, str | None]] = {}
+        with ThreadPoolExecutor(max_workers=min(len(pages), 4), thread_name_prefix="confl") as pool:
+            from concurrent.futures import as_completed
+            futs = {pool.submit(_confluence_nodes_safe, row): row for row in pages}
+            done = as_completed(futs, timeout=_CONFL_TREE_TIMEOUT)
+            try:
+                for fut in done:
+                    row = futs[fut]
+                    try:
+                        confl_results[row["id"]] = fut.result()
+                    except Exception as e:
+                        root = (row.get("source_path") or "").strip()
+                        confl_results[row["id"]] = (
+                            {"source_input": root, "title": _page_label(root), "children": []},
+                            f"Ошибка: {e}",
+                        )
+            except TimeoutError:
+                print(f"web_app confluence tree global timeout ({_CONFL_TREE_TIMEOUT}s)")
+            # Для не успевших — fallback на уже известные страницы
+            for fut, row in futs.items():
+                if row["id"] not in confl_results:
+                    root = (row.get("source_path") or "").strip()
+                    known = [p for p in _confluence_pages(row) if p]
+                    children = [{"source_input": p, "title": _page_label(p), "children": []} for p in known if p != root]
+                    confl_results[row["id"]] = (
+                        {"source_input": root, "title": _page_label(root), "children": children},
+                        "Confluence не ответил вовремя. Показаны уже загруженные страницы.",
+                    )
         for row in pages:
             root = (row.get("source_path") or "").strip()
-            node, note = _confluence_nodes_safe(row)
+            node, note = confl_results.get(row["id"], (
+                {"source_input": root, "title": _page_label(root), "children": []}, None,
+            ))
             if note and note not in notes:
                 notes.append(note)
             excluded = _excluded_items(row, "confluence")
@@ -6241,4 +6287,4 @@ def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("web_app:app", host="0.0.0.0", port=8006, reload=False)
+    uvicorn.run("web_app:app", host="0.0.0.0", port=8009, reload=False)

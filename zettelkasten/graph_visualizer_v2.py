@@ -219,13 +219,67 @@ def _excel_node_style(
 
 _LEAF = 11.0
 _GAP = 5.0
+_GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))  # ≈ 2.3999 rad ≈ 137.508°
 
 
 def _pack_members(radii: list[float], phase: float = 0.0, gap: float = _GAP) -> tuple[list[tuple[float, float]], float]:
-    """radii отсортированы по убыванию. Первый в центре. -> (смещения, радиус блока)."""
+    """Phyllotaxis-спираль: золотой угол + проверка пересечений.
+
+    radii отсортированы по убыванию. Первый в центре. -> (смещения, радиус блока).
+    Для малых/средних групп (<= 250) — спираль без видимых колец.
+    Для больших — кольца со сдвигом золотым углом.
+    """
     n = len(radii)
     if n == 0:
         return [], 0.0
+    offsets: list[tuple[float, float]] = [(0.0, 0.0)]
+    if n == 1:
+        return offsets, radii[0]
+    if n <= 250:
+        return _pack_spiral(radii, phase, gap)
+    return _pack_rings(radii, phase, gap)
+
+
+def _pack_spiral(radii: list[float], phase: float, gap: float) -> tuple[list[tuple[float, float]], float]:
+    """Золотой-угол спираль с проверкой пересечений. Вид как в Obsidian."""
+    n = len(radii)
+    offsets: list[tuple[float, float]] = [(0.0, 0.0)]
+    scale = (radii[0] + radii[1] + gap) * 0.95
+    outer = radii[0]
+    px = [0.0]
+    py = [0.0]
+    pr = [radii[0]]
+    for i in range(1, n):
+        r = radii[i]
+        ang = phase + i * _GOLDEN_ANGLE
+        dist = max(scale * math.sqrt(i * 0.62), radii[0] + r + gap)
+        x = dist * math.cos(ang)
+        y = dist * math.sin(ang)
+        for _ in range(35):
+            collision = False
+            for j in range(len(px)):
+                dx = x - px[j]
+                dy = y - py[j]
+                min_d = r + pr[j] + gap
+                if dx * dx + dy * dy < min_d * min_d:
+                    dist += gap * 0.4 + r * 0.15
+                    x = dist * math.cos(ang)
+                    y = dist * math.sin(ang)
+                    collision = True
+                    break
+            if not collision:
+                break
+        offsets.append((x, y))
+        px.append(x)
+        py.append(y)
+        pr.append(r)
+        outer = max(outer, dist + r)
+    return offsets, outer
+
+
+def _pack_rings(radii: list[float], phase: float, gap: float) -> tuple[list[tuple[float, float]], float]:
+    """Кольцевая раскладка со сдвигом золотым углом между кольцами (для 250+ элементов)."""
+    n = len(radii)
     offsets: list[tuple[float, float]] = [(0.0, 0.0)]
     inner = radii[0]
     two_pi = 2.0 * math.pi
@@ -252,7 +306,7 @@ def _pack_members(radii: list[float], phase: float = 0.0, gap: float = _GAP) -> 
             offsets.append((dist * math.cos(ang), dist * math.sin(ang)))
             cursor += span
         inner = dist + r0
-        phase += 0.9
+        phase += _GOLDEN_ANGLE
         i = j
     return offsets, inner
 
