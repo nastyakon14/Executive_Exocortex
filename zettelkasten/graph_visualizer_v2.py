@@ -2822,7 +2822,11 @@ async function readGraph(resp) {
     if (DATA_URL) {
       setLoad(0, 'Сервер собирает граф'); await paintLoad();
       const resp = await fetch(DATA_URL, { headers: { 'Accept': 'application/octet-stream, application/json' } });
-      if (!resp.ok) throw new Error('Не удалось загрузить граф (HTTP ' + resp.status + ')');
+      if (!resp.ok) {
+        let msg = 'HTTP ' + resp.status;
+        try { const j = await resp.clone().json(); if (j && j.error) msg = j.error; } catch(_){}
+        throw new Error(msg);
+      }
       data = await readGraph(resp);
     } else if (DATA_B64) {
       setLoad(20, 'Загрузка графа'); await paintLoad();
@@ -2832,7 +2836,14 @@ async function readGraph(resp) {
     }
     await applyPayload(data);
   } catch (err) {
-    setLoad(1, 'Ошибка загрузки графа: ' + (err && err.message ? err.message : err));
+    const msg = (err && err.message) ? err.message : String(err);
+    setLoad(1, 'Не удалось загрузить граф: ' + msg + '  ');
+    const retry = document.createElement('a');
+    retry.href = '#'; retry.textContent = 'Попробовать ещё раз';
+    retry.style.cssText = 'color:var(--accent,#60a5fa);text-decoration:underline;cursor:pointer';
+    retry.onclick = function(e) { e.preventDefault(); location.reload(); };
+    const bar = document.getElementById('load-bar');
+    if (bar) bar.parentElement.appendChild(retry);
   }
 })();
 })();

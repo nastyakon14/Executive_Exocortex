@@ -1166,6 +1166,8 @@ class ZettelRepository:
         print(self.get_graph_text(user_id))
         print("═" * 70 + "\n")
 
+    _OVERVIEW_MAX_ROWS = 150_000
+
     def export_overview_rows(
         self,
         user_ids: List[str],
@@ -1188,8 +1190,9 @@ class ZettelRepository:
                    z.thought_type AS thought_type,
                    left(coalesce(z.topic, ''), 32) AS topic,
                    parent.luhmann_id AS parent_luhmann
+            LIMIT $row_limit
             """,
-            {"user_ids": user_ids},
+            {"user_ids": user_ids, "row_limit": self._OVERVIEW_MAX_ROWS},
         )
         prefix_by_uid: Dict[str, str] = {}
         project_by_uid: Dict[str, str] = {}

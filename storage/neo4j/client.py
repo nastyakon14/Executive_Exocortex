@@ -64,6 +64,8 @@ class Neo4jClient:
             self._driver = GraphDatabase.driver(
                 self.uri,
                 auth=(self.user, self.password),
+                connection_timeout=15,
+                max_transaction_retry_time=60,
             )
             self._driver.verify_connectivity()
             print(f"[Neo4j] Подключено к {self.uri}")

@@ -6012,6 +6012,9 @@ def api_graph(slug: str, request: Request):
         )
 
 
+_OVERVIEW_THRESHOLD = 4_000
+
+
 def _build_graph_response(scope: dict, request: Request) -> Response:
     encoding = request.headers.get("accept-encoding", "")
     if scope["readonly"]:
@@ -6020,50 +6023,15 @@ def _build_graph_response(scope: dict, request: Request) -> Response:
     else:
         ids = (scope["graph_id"],)
         count = linker.repository.total_count(scope["graph_id"])
-    binary = count >= 25_000
-    use_gzip = (not binary) and "gzip" in encoding.lower()
     stamp = str(scope.get("data_updated_at") or "")
-    if int(count) >= 4_000:
-        key = (ids, int(count), stamp, "overview-click")
-        with _graph_cache_lock:
-            cached = _graph_cache.get(key)
-        if cached:
-            return Response(content=cached[0], headers=cached[1])
-        cache_file = _overview_cache_file(key)
-        if cache_file.exists():
-            body = cache_file.read_bytes()
-            headers = _overview_headers(body)
-            _remember_graph(key, body, headers)
-            return Response(content=body, headers=headers)
-        started = time.perf_counter()
-        print(f"[graph] быстрый вид, карточек {count}", flush=True)
-        if scope["readonly"]:
-            rows = linker.repository.export_overview_rows(
-                list(ids), scope.get("project_labels") or {}, prefix_luhmann=True,
-            )
-        else:
-            rows = linker.repository.export_overview_rows(list(ids))
-        body = build_overview_binary(rows)
-        headers = _overview_headers(body)
-        id_list = [str(row.get("zettel_id") or "") for row in rows]
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_file.with_suffix(".tmp")
-        temporary.write_bytes(body)
-        temporary.replace(cache_file)
-        ids_file = _overview_ids_file(key)
-        ids_tmp = ids_file.with_suffix(".tmp")
-        ids_tmp.write_text("\n".join(id_list), encoding="utf-8")
-        ids_tmp.replace(ids_file)
-        with _graph_cache_lock:
-            _overview_ids[key] = id_list
-        _remember_graph(key, body, headers)
-        print(
-            f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}, "
-            f"{time.perf_counter() - started:.1f} с",
-            flush=True,
-        )
-        return Response(content=body, headers=headers)
-    key = (ids, int(count), stamp, binary, use_gzip)
+
+    # Для графов >= 4000 карточек — всегда overview binary (лёгкий, с LIMIT)
+    if int(count) >= _OVERVIEW_THRESHOLD:
+        return _build_overview_response(scope, ids, int(count), stamp)
+
+    # Для малых графов — полный JSON
+    use_gzip = "gzip" in encoding.lower()
+    key = (ids, int(count), stamp, False, use_gzip)
     with _graph_cache_lock:
         cached = _graph_cache.get(key)
     if cached:
@@ -6077,12 +6045,92 @@ def _build_graph_response(scope: dict, request: Request) -> Response:
     payload = pack_graph_payload(data)
     body, headers = encode_graph_payload(payload, encoding)
     _remember_graph(key, body, headers)
-    if count >= 25_000:
-        print(
-            f"[graph] ответ {len(body) / 1_000_000:.1f} МБ, узлов {payload.get('n') or 0}, "
-            f"{time.perf_counter() - started:.1f} с",
-            flush=True,
+    return Response(content=body, headers=headers)
+
+
+def _build_overview_response(
+    scope: dict, ids: tuple, count: int, stamp: str,
+) -> Response:
+    """Строит обзорный бинарный граф с LIMIT из Neo4j. Кешируется на диск."""
+    key = (ids, count, stamp, "overview-click")
+    # 1. Кеш в памяти
+    with _graph_cache_lock:
+        cached = _graph_cache.get(key)
+    if cached:
+        return Response(content=cached[0], headers=cached[1])
+    # 2. Кеш на диске
+    cache_file = _overview_cache_file(key)
+    if cache_file.exists():
+        try:
+            body = cache_file.read_bytes()
+            headers = _overview_headers(body)
+            _remember_graph(key, body, headers)
+            return Response(content=body, headers=headers)
+        except Exception:
+            pass
+    # 3. Генерация
+    started = time.perf_counter()
+    print(f"[graph] overview, карточек {count}", flush=True)
+    try:
+        if scope["readonly"]:
+            rows = linker.repository.export_overview_rows(
+                list(ids), scope.get("project_labels") or {}, prefix_luhmann=True,
+            )
+        else:
+            rows = linker.repository.export_overview_rows(list(ids))
+    except Exception as e:
+        print(f"[graph] neo4j error: {e}", flush=True)
+        return JSONResponse(
+            {"error": f"Не удалось загрузить данные графа: {type(e).__name__}"},
+            status_code=500,
         )
+
+    if not rows:
+        return JSONResponse({"error": "Граф пуст"}, status_code=200)
+
+    truncated = len(rows) >= getattr(linker.repository, '_OVERVIEW_MAX_ROWS', 150_000)
+    if truncated:
+        print(f"[graph] LIMIT сработал: показано {len(rows)}, всего {count}", flush=True)
+
+    try:
+        body = build_overview_binary(rows)
+    except Exception as e:
+        print(f"[graph] layout error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": f"Ошибка построения раскладки: {type(e).__name__}"},
+            status_code=500,
+        )
+
+    headers = _overview_headers(body)
+    if truncated:
+        headers["x-graph-truncated"] = "1"
+        headers["x-graph-total"] = str(count)
+
+    # Записать в кеш
+    id_list = [str(row.get("zettel_id") or "") for row in rows]
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_file.with_suffix(".tmp")
+        temporary.write_bytes(body)
+        temporary.replace(cache_file)
+        ids_file = _overview_ids_file(key)
+        ids_tmp = ids_file.with_suffix(".tmp")
+        ids_tmp.write_text("\n".join(id_list), encoding="utf-8")
+        ids_tmp.replace(ids_file)
+    except Exception as e:
+        print(f"[graph] cache write warning: {e}", flush=True)
+
+    with _graph_cache_lock:
+        _overview_ids[key] = id_list
+    _remember_graph(key, body, headers)
+    elapsed = time.perf_counter() - started
+    print(
+        f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}"
+        f"{' (LIMIT)' if truncated else ''}, {elapsed:.1f} с",
+        flush=True,
+    )
     return Response(content=body, headers=headers)
 
 
