@@ -396,11 +396,149 @@ def _own_radius(kid_count: int) -> float:
     return _LEAF if not kid_count else _LEAF + min(9.0, 2.0 * math.log2(1 + kid_count))
 
 
+_FAST_LAYOUT_THRESHOLD = 50_000
+
+
 def _layout_graph(zs: list[dict]) -> tuple[list[tuple[float, float]], list[dict]]:
     """Позиции всех карточек (по индексу в zs) и области (проекты и крупные ветки)."""
     n = len(zs)
     if not n:
         return [], []
+    if n >= _FAST_LAYOUT_THRESHOLD:
+        return _layout_graph_fast(zs)
+    return _layout_graph_full(zs)
+
+
+def _layout_graph_fast(zs: list[dict]) -> tuple[list[tuple[float, float]], list[dict]]:
+    """Быстрая O(n) раскладка для больших графов (50K+).
+
+    Вместо рекурсивной упаковки кругами — группировка по корневым веткам
+    и размещение спиралью золотого угла внутри каждой группы.
+    """
+    n = len(zs)
+    idx_of: dict[str, int] = {}
+    for i, z in enumerate(zs):
+        idx_of[z["luhmann_id"]] = i
+
+    parent = [-1] * n
+    depth = [0] * n
+    root_of = list(range(n))
+    kids_count = [0] * n
+    for i, z in enumerate(zs):
+        p = z.get("parent_luhmann")
+        j = idx_of.get(p) if p else None
+        if j is not None and j != i:
+            parent[i] = j
+            kids_count[j] += 1
+
+    # BFS для глубины и корня
+    from collections import deque
+    roots = [i for i in range(n) if parent[i] < 0]
+    q: deque[int] = deque()
+    visited = bytearray(n)
+    children: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        if parent[i] >= 0:
+            children[parent[i]].append(i)
+    for r in roots:
+        visited[r] = 1
+        root_of[r] = r
+        q.append(r)
+    while q:
+        i = q.popleft()
+        for c in children[i]:
+            if not visited[c]:
+                visited[c] = 1
+                depth[c] = depth[i] + 1
+                root_of[c] = root_of[i]
+                q.append(c)
+    for i in range(n):
+        if not visited[i]:
+            roots.append(i)
+            root_of[i] = i
+
+    # Группируем по проекту → корневой ветке
+    proj_of = [_norm_project(z.get("project")) for z in zs]
+    by_proj: dict[str, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for i in range(n):
+        by_proj[proj_of[i]][root_of[i]].append(i)
+
+    pos: list[tuple[float, float]] = [(0.0, 0.0)] * n
+    regions: list[dict] = []
+
+    # Раскладка: проекты → ветки → узлы — всё спиралью
+    proj_names = sorted(by_proj.keys(), key=lambda p: -sum(len(v) for v in by_proj[p].values()))
+    proj_cx, proj_cy = 0.0, 0.0
+    proj_angle = 0.0
+    proj_idx = 0
+    spacing_node = 18.0
+    spacing_branch = 60.0
+
+    for proj_name in proj_names:
+        branches = by_proj[proj_name]
+        branch_roots = sorted(branches.keys(), key=lambda r: -len(branches[r]))
+        proj_total = sum(len(branches[r]) for r in branch_roots)
+        proj_r = math.sqrt(proj_total) * spacing_node * 0.6
+
+        if proj_idx > 0:
+            proj_angle += _GOLDEN_ANGLE
+            proj_dist = (math.sqrt(proj_idx) * proj_r * 1.3) + spacing_branch
+            proj_cx = proj_dist * math.cos(proj_angle)
+            proj_cy = proj_dist * math.sin(proj_angle)
+        proj_idx += 1
+
+        if len(proj_names) > 1:
+            regions.append({
+                "name": proj_name or "Без проекта",
+                "x": proj_cx, "y": proj_cy, "r": proj_r + 20.0,
+                "n": proj_total, "lv": 0, "proj": proj_name, "root": "",
+            })
+
+        branch_angle = 0.0
+        for bi, br in enumerate(branch_roots):
+            members = branches[br]
+            branch_size = len(members)
+            branch_r = math.sqrt(branch_size) * spacing_node * 0.5
+
+            if bi == 0:
+                bcx, bcy = proj_cx, proj_cy
+            else:
+                branch_angle += _GOLDEN_ANGLE
+                bdist = (math.sqrt(bi) * branch_r * 1.5) + spacing_branch * 0.5
+                bcx = proj_cx + bdist * math.cos(branch_angle)
+                bcy = proj_cy + bdist * math.sin(branch_angle)
+
+            if branch_size >= 60:
+                regions.append({
+                    "name": _node_title(zs[br])[:40] or zs[br]["luhmann_id"],
+                    "x": bcx, "y": bcy, "r": branch_r + 10.0,
+                    "n": branch_size, "lv": 1, "proj": proj_name,
+                    "root": zs[br]["luhmann_id"],
+                })
+
+            # Узлы внутри ветки: корень в центре, остальные по глубине спиралью
+            members_sorted = sorted(members, key=lambda i: (depth[i], i))
+            node_angle = bi * 0.618
+            for mi, i in enumerate(members_sorted):
+                if mi == 0:
+                    pos[i] = (bcx, bcy)
+                else:
+                    node_angle += _GOLDEN_ANGLE
+                    ndist = math.sqrt(mi) * spacing_node * 0.55
+                    pos[i] = (bcx + ndist * math.cos(node_angle),
+                              bcy + ndist * math.sin(node_angle))
+
+    regions.sort(key=lambda g: (-g.get("lv", 0), -g["n"]))
+    branch_regions = [g for g in regions if g.get("lv") == 1]
+    proj_regions = [g for g in regions if g.get("lv") == 0]
+    regions = proj_regions + branch_regions[:400]
+
+    return pos, regions
+
+
+def _layout_graph_full(zs: list[dict]) -> tuple[list[tuple[float, float]], list[dict]]:
+    """Полная раскладка с упаковкой кругами (для графов < 50K)."""
+    n = len(zs)
     idx_of: dict[str, int] = {}
     for i, z in enumerate(zs):
         idx_of[z["luhmann_id"]] = i

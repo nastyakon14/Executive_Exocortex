@@ -5946,7 +5946,7 @@ def _overview_headers(body: bytes) -> dict:
 
 
 def _remember_graph(key: tuple, body: bytes, headers: dict) -> None:
-    if len(body) > 80_000_000:
+    if len(body) > 250_000_000:
         return
     with _graph_cache_lock:
         if key not in _graph_cache and len(_graph_cache) >= 2:
@@ -5959,6 +5959,19 @@ def api_graph(slug: str, request: Request):
     scope = resolve_scope(slug)
     if not scope:
         return JSONResponse({"error": "Проект не найден"}, status_code=404)
+    try:
+        return _build_graph_response(scope, request)
+    except Exception as e:
+        print(f"[graph] ошибка построения графа: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": f"Не удалось построить граф: {type(e).__name__}"},
+            status_code=500,
+        )
+
+
+def _build_graph_response(scope: dict, request: Request) -> Response:
     encoding = request.headers.get("accept-encoding", "")
     if scope["readonly"]:
         ids = tuple(scope["graph_ids"])
