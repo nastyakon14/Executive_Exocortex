@@ -77,6 +77,15 @@ load_dotenv()
 
 app = FastAPI(title="BVA MindMap Web App")
 
+
+@app.on_event("startup")
+def _configure_thread_pool():
+    """Увеличиваем пул потоков для def-обработчиков, чтобы тяжёлые запросы
+    одного пользователя не блокировали остальных."""
+    loop = asyncio.get_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=40, thread_name_prefix="web"))
+
+
 create_database()
 create_tables()
 
@@ -2760,12 +2769,12 @@ def html_page(title: str, body: str, extra_js: str = "", show_theme_toggle: bool
 # ========== PROJECTS HUB ==========
 
 @app.get("/favicon.svg")
-async def favicon():
+def favicon():
     return Response(content=EXOCORTEX_LOGO_SVG, media_type="image/svg+xml")
 
 
 @app.get("/documentation.pdf")
-async def documentation_pdf():
+def documentation_pdf():
     path = _documentation_pdf_path()
     if not path.is_file():
         return HTMLResponse(
@@ -2786,7 +2795,7 @@ async def documentation_pdf():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def root(request: Request, msg: str = "", st: str = ""):
+def root(request: Request, msg: str = "", st: str = ""):
     projects = [with_live_ingest(p) for p in sync_projects_from_graph()]
     counts = {}
     total_all = 0
@@ -2958,7 +2967,7 @@ async def root(request: Request, msg: str = "", st: str = ""):
 
 
 @app.post("/projects/create")
-async def create_project(name: str = Form(""), description: str = Form("")):
+def create_project(name: str = Form(""), description: str = Form("")):
     title = " ".join((name or "").split())
     if not title:
         return RedirectResponse("/?msg=Введите название проекта&st=err", status_code=303)
@@ -2996,29 +3005,29 @@ async def create_project(name: str = Form(""), description: str = Form("")):
 
 
 @app.get("/home")
-async def home_legacy():
+def home_legacy():
     return RedirectResponse("/", status_code=303)
 
 
 @app.get("/login")
-async def login_legacy():
+def login_legacy():
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/login")
-async def login_legacy_post():
+def login_legacy_post():
     return RedirectResponse("/", status_code=303)
 
 
 @app.get("/logout")
-async def logout_legacy():
+def logout_legacy():
     return RedirectResponse("/", status_code=303)
 
 
 # ========== PROJECT HOME ==========
 
 @app.get("/p/{slug}", response_class=HTMLResponse)
-async def project_home(slug: str, msg: str = "", st: str = ""):
+def project_home(slug: str, msg: str = "", st: str = ""):
     scope = resolve_scope(slug)
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -3584,6 +3593,22 @@ def _source_keys_for(hint: str, keys: list[str]) -> list[str]:
     return [key for key in keys if os.path.basename(key.rstrip("\\/")) == base or key == text]
 
 
+_source_status_cache: dict[str, tuple[float, dict]] = {}
+_SOURCE_STATUS_TTL = 2.5
+
+
+def _collect_source_statuses_cached(scope: dict) -> dict[str, dict]:
+    """Кешированная версия: отдаёт результат мгновенно, если TTL не истёк."""
+    key = scope.get("graph_id") or ""
+    now = time.monotonic()
+    cached = _source_status_cache.get(key)
+    if cached and now - cached[0] < _SOURCE_STATUS_TTL:
+        return cached[1]
+    result = _collect_source_statuses(scope)
+    _source_status_cache[key] = (now, result)
+    return result
+
+
 def _collect_source_statuses(scope: dict) -> dict[str, dict]:
     """Статус каждого источника: загружен, ошибка или идёт обработка."""
     slug = scope.get("slug") or ""
@@ -3981,7 +4006,7 @@ def _delete_source_item_locked(scope: dict, kind: str, root: str, item: str) -> 
 
 
 @app.get("/p/{slug}/sources", response_class=HTMLResponse)
-async def project_sources(slug: str):
+def project_sources(slug: str):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4117,17 +4142,17 @@ async def project_sources(slug: str):
 
 
 @app.get("/p/{slug}/sources/status")
-async def project_source_status(slug: str):
+def project_source_status(slug: str):
     scope, err = _writable_scope(slug)
     if err:
         return JSONResponse({"ok": False, "error": "Проект недоступен"}, status_code=403)
-    items = _collect_source_statuses(scope)
+    items = _collect_source_statuses_cached(scope)
     busy = any(row.get("status") == "progress" for row in items.values())
     return JSONResponse({"ok": True, "busy": busy, "items": items})
 
 
 @app.post("/p/{slug}/sources/watch")
-async def project_source_watch(
+def project_source_watch(
     slug: str,
     kind: str = Form(""),
     root: str = Form(""),
@@ -4151,7 +4176,7 @@ async def project_source_watch(
 
 
 @app.post("/p/{slug}/sources/delete")
-async def project_source_delete(
+def project_source_delete(
     slug: str,
     kind: str = Form(""),
     root: str = Form(""),
@@ -4174,14 +4199,14 @@ async def project_source_delete(
 
 
 @app.get("/p/{slug}/progress.json")
-async def progress_json(slug: str):
+def progress_json(slug: str):
     if not get_project(slug):
         return JSONResponse({"active": False, "state": "idle"}, status_code=404)
     return JSONResponse(progress_payload(slug))
 
 
 @app.post("/p/{slug}/progress/{action}")
-async def progress_control(slug: str, action: str):
+def progress_control(slug: str, action: str):
     _scope, err = _writable_scope(slug)
     if err:
         return JSONResponse({"ok": False, "state": "idle"}, status_code=404)
@@ -4197,7 +4222,7 @@ async def progress_control(slug: str, action: str):
 
 
 @app.get("/p/{slug}/progress", response_class=HTMLResponse)
-async def progress_page(slug: str):
+def progress_page(slug: str):
     scope = resolve_scope(slug)
     if not scope or scope.get("readonly"):
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -4305,7 +4330,7 @@ async def progress_page(slug: str):
 
 
 @app.post("/p/{slug}/refresh")
-async def refresh_graph_now(slug: str):
+def refresh_graph_now(slug: str):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4350,7 +4375,7 @@ async def refresh_graph_now(slug: str):
 
 
 @app.post("/p/{slug}/edit")
-async def project_edit(
+def project_edit(
     slug: str,
     name: str = Form(""),
     description: str = Form(""),
@@ -4379,7 +4404,7 @@ async def project_edit(
 
 
 @app.post("/p/{slug}/rename")
-async def project_rename(slug: str, name: str = Form("")):
+def project_rename(slug: str, name: str = Form("")):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4401,7 +4426,7 @@ async def project_rename(slug: str, name: str = Form("")):
 
 
 @app.post("/p/{slug}/settings")
-async def project_settings(slug: str, description: str = Form("")):
+def project_settings(slug: str, description: str = Form("")):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4413,7 +4438,7 @@ async def project_settings(slug: str, description: str = Form("")):
 
 
 @app.post("/p/{slug}/archive")
-async def project_archive(slug: str, archived: str = Form("1")):
+def project_archive(slug: str, archived: str = Form("1")):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4424,7 +4449,7 @@ async def project_archive(slug: str, archived: str = Form("1")):
 
 
 @app.post("/p/{slug}/destroy")
-async def project_destroy(slug: str):
+def project_destroy(slug: str):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -4446,7 +4471,7 @@ async def project_destroy(slug: str):
 # ========== ADD ==========
 
 @app.get("/p/{slug}/add", response_class=HTMLResponse)
-async def add_page(slug: str, msg: str = "", st: str = ""):
+def add_page(slug: str, msg: str = "", st: str = ""):
     scope = resolve_scope(slug)
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -5213,7 +5238,7 @@ async def add_confluence(
 # ========== CONTOUR SEARCH ==========
 
 @app.get("/contour", response_class=HTMLResponse)
-async def contour_page(request: Request):
+def contour_page(request: Request):
     active = active_search_projects()
     counts = {}
     for p in active:
@@ -5503,13 +5528,17 @@ async def contour_api_search(request: Request):
         return JSONResponse({"error": err}, status_code=400)
     graph_ids = [p["graph_id"] for p in selected]
     labels = {p["graph_id"]: (p.get("name") or p["slug"]) for p in selected}
-    return JSONResponse(rag_search_payload(query, graph_ids, labels, "contour", _chat_history(data)))
+    history = _chat_history(data)
+    payload = await asyncio.to_thread(
+        rag_search_payload, query, graph_ids, labels, "contour", history,
+    )
+    return JSONResponse(payload)
 
 
 # ========== SEARCH (Chat style with formatting) ==========
 
 @app.get("/p/{slug}/search", response_class=HTMLResponse)
-async def search_page(slug: str):
+def search_page(slug: str):
     scope = resolve_scope(slug)
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -5665,22 +5694,29 @@ async def api_search(slug: str, request: Request):
     labels = scope.get("project_labels") or {}
     history = _chat_history(data)
     if scope["readonly"]:
-        payload = rag_search_payload(query, scope["graph_ids"], labels, slug, history)
+        payload = await asyncio.to_thread(
+            rag_search_payload, query, scope["graph_ids"], labels, slug, history,
+        )
         return JSONResponse(payload)
 
     graph_key = scope["graph_id"]
-    resp = graphrag.query(graph_key, query, history=history)
-    log_event(slug, query, "search_query", resp.answer)
-    formatted = format_llm_response(resp.answer)
-    used = resp.context.used_source_nodes(resp.answer)
-    meta = f"⏱ {resp.processing_time_ms}ms · {len(used)} источник(ов)"
-    input_sources = collect_input_sources(used, labels)
-    return JSONResponse({
-        "answer_html": formatted,
-        "meta": meta,
-        "sources": [],
-        "input_sources": input_sources,
-    })
+
+    def _do_search():
+        resp = graphrag.query(graph_key, query, history=history)
+        log_event(slug, query, "search_query", resp.answer)
+        formatted = format_llm_response(resp.answer)
+        used = resp.context.used_source_nodes(resp.answer)
+        meta = f"⏱ {resp.processing_time_ms}ms · {len(used)} источник(ов)"
+        input_sources = collect_input_sources(used, labels)
+        return {
+            "answer_html": formatted,
+            "meta": meta,
+            "sources": [],
+            "input_sources": input_sources,
+        }
+
+    result = await asyncio.to_thread(_do_search)
+    return JSONResponse(result)
 
 
 # ========== VIEW ==========
@@ -5694,7 +5730,7 @@ def _graph_page(request: Request, user_label: str, data_url: str, back_url: str 
 
 
 @app.get("/p/{slug}/view", response_class=HTMLResponse)
-async def view_page(slug: str, request: Request):
+def view_page(slug: str, request: Request):
     scope = resolve_scope(slug)
     if not scope:
         return RedirectResponse("/?msg=Проект не найден&st=err", status_code=303)
@@ -5792,7 +5828,7 @@ def _remember_graph(key: tuple, body: bytes, headers: dict) -> None:
 
 
 @app.get("/p/{slug}/api/graph")
-async def api_graph(slug: str, request: Request):
+def api_graph(slug: str, request: Request):
     scope = resolve_scope(slug)
     if not scope:
         return JSONResponse({"error": "Проект не найден"}, status_code=404)
@@ -5874,7 +5910,7 @@ def _overview_key(scope: dict, ids: tuple, count: int) -> tuple:
 
 
 @app.get("/p/{slug}/api/graph/node/{index}")
-async def api_graph_node(slug: str, index: int):
+def api_graph_node(slug: str, index: int):
     scope = resolve_scope(slug)
     if not scope:
         return JSONResponse({"error": "Проект не найден"}, status_code=404)
@@ -5946,7 +5982,7 @@ async def api_graph_node(slug: str, index: int):
 # ========== DELETE (Card-based) ==========
 
 @app.get("/p/{slug}/delete", response_class=HTMLResponse)
-async def delete_page(slug: str, msg: str = "", st: str = ""):
+def delete_page(slug: str, msg: str = "", st: str = ""):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -5976,7 +6012,7 @@ async def delete_page(slug: str, msg: str = "", st: str = ""):
 
 
 @app.post("/p/{slug}/delete/search", response_class=HTMLResponse)
-async def delete_search(slug: str, q: str = Form("")):
+def delete_search(slug: str, q: str = Form("")):
     scope, err = _writable_scope(slug)
     if err:
         return err
@@ -6101,7 +6137,7 @@ async def delete_search(slug: str, q: str = Form("")):
 
 
 @app.post("/p/{slug}/delete/confirm")
-async def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
+def delete_confirm(slug: str, token: str = Form(""), idx: int = Form(0)):
     scope, err = _writable_scope(slug)
     if err:
         return err
