@@ -1889,6 +1889,9 @@ button.tree-dir-name { border: none; background: transparent; padding: 0; cursor
 .src-tree ul[hidden] { display: none; }
 .sources-warn { margin: 8px 12px 4px; color: var(--muted); font-size: 13px; line-height: 1.4; }
 .tree-empty, .sources-empty { color: var(--muted); font-size: 13px; padding: 10px 12px; }
+.sources-loading { text-align: center; padding: 48px 16px; color: var(--muted); }
+.sources-loading .spinner { width: 32px; height: 32px; margin: 0 auto 12px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .sources-note { color: var(--text2); font-size: 13px; line-height: 1.5; margin: 0 0 16px; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
 .src-section { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 16px 12px 4px; }
 .progress-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px 16px 16px; }
@@ -3487,6 +3490,45 @@ def _flatten_pages(node: dict) -> list[str]:
     return found
 
 
+_CONFLUENCE_TREE_TIMEOUT = 15  # секунд на загрузку дерева Confluence
+
+
+def _confluence_nodes_safe(row: dict) -> tuple[dict, str | None]:
+    """Обёртка с таймаутом: если Confluence не ответил за N сек, отдаём уже известные страницы."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="confl") as pool:
+        fut = pool.submit(_confluence_nodes, row)
+        try:
+            return fut.result(timeout=_CONFLUENCE_TREE_TIMEOUT)
+        except FuturesTimeout:
+            fut.cancel()
+            root = (row.get("source_path") or "").strip()
+            known = [page for page in _confluence_pages(row) if page]
+            children = [
+                {"source_input": page, "title": _page_label(page), "children": []}
+                for page in known if page != root
+            ]
+            print(f"web_app confluence tree timeout ({_CONFLUENCE_TREE_TIMEOUT}s) for {root}")
+            return {
+                "source_input": root,
+                "title": _page_label(root),
+                "children": children,
+            }, f"Confluence не ответил за {_CONFLUENCE_TREE_TIMEOUT} сек. Показаны уже загруженные страницы."
+        except Exception as e:
+            root = (row.get("source_path") or "").strip()
+            print(f"web_app confluence tree error: {e}")
+            known = [page for page in _confluence_pages(row) if page]
+            children = [
+                {"source_input": page, "title": _page_label(page), "children": []}
+                for page in known if page != root
+            ]
+            return {
+                "source_input": root,
+                "title": _page_label(root),
+                "children": children,
+            }, "Ошибка загрузки дерева Confluence. Показаны уже загруженные страницы."
+
+
 def _confluence_nodes(row: dict) -> tuple[dict, str | None]:
     """Живое дерево страниц. Если Confluence недоступен — уже загруженные страницы."""
     from app.handlers.confluence import confluence_page_tree
@@ -3609,21 +3651,32 @@ def _collect_source_statuses_cached(scope: dict) -> dict[str, dict]:
     return result
 
 
-def _collect_source_statuses(scope: dict) -> dict[str, dict]:
+def _collect_source_statuses(
+    scope: dict,
+    *,
+    preloaded_ingested: list[str] | None = None,
+    preloaded_rows: list[dict] | None = None,
+) -> dict[str, dict]:
     """Статус каждого источника: загружен, ошибка или идёт обработка."""
     slug = scope.get("slug") or ""
     graph_id = scope.get("graph_id") or ""
     statuses: dict[str, dict] = {}
-    ingested = []
-    rows = []
-    try:
-        ingested = _project_source_inputs(graph_id) if graph_id else []
-    except Exception as e:
-        print(f"web_app source status warning: {e}")
-    try:
-        rows = list_watch_sources(watch_only=False, graph_id=graph_id) if graph_id else []
-    except Exception as e:
-        print(f"web_app source status warning: {e}")
+    if preloaded_ingested is not None:
+        ingested = preloaded_ingested
+    else:
+        ingested = []
+        try:
+            ingested = _project_source_inputs(graph_id) if graph_id else []
+        except Exception as e:
+            print(f"web_app source status warning: {e}")
+    if preloaded_rows is not None:
+        rows = preloaded_rows
+    else:
+        rows = []
+        try:
+            rows = list_watch_sources(watch_only=False, graph_id=graph_id) if graph_id else []
+        except Exception as e:
+            print(f"web_app source status warning: {e}")
     for item in ingested:
         key = _status_key(item)
         if key:
@@ -3704,7 +3757,7 @@ def _sources_tree_html(scope: dict) -> str:
     except Exception as e:
         return f'<p class="sources-empty">Не удалось прочитать источники: {escape(str(e))}</p>'
     ingested = _project_source_inputs(graph_id)
-    statuses = _collect_source_statuses(scope)
+    statuses = _collect_source_statuses(scope, preloaded_ingested=ingested, preloaded_rows=rows)
     folders = [row for row in rows if row.get("source_kind") == "folder"]
     pages = [row for row in rows if row.get("source_kind") == "confluence"]
     lone = [row for row in rows if row.get("source_kind") == "file"]
@@ -3734,7 +3787,7 @@ def _sources_tree_html(scope: dict) -> str:
         trees = []
         for row in pages:
             root = (row.get("source_path") or "").strip()
-            node, note = _confluence_nodes(row)
+            node, note = _confluence_nodes_safe(row)
             if note and note not in notes:
                 notes.append(note)
             excluded = _excluded_items(row, "confluence")
@@ -4017,7 +4070,12 @@ def project_sources(slug: str):
             <h1>Источники</h1>
         </div>
         <p class="sources-note">Галочка включает ночное и ручное обновление только для отмеченных файлов и страниц. Корзина убирает источник из проекта вместе с карточками и связями. Файл на диске и страница Confluence остаются на месте.</p>
-        {_sources_tree_html(scope)}
+        <div id="sourcesTreeSlot">
+            <div class="sources-loading">
+                <div class="spinner"></div>
+                <p>Загрузка источников…</p>
+            </div>
+        </div>
     </div>
     <div class="modal-overlay" id="deleteSourceModal">
         <div class="modal-box">
@@ -4136,9 +4194,32 @@ def project_sources(slug: str):
     document.addEventListener('visibilitychange', function() {
         if (!document.hidden) refreshSourceStatus();
     });
-    scheduleSourceStatus();
-    """ % (json.dumps(slug), json.dumps(slug), json.dumps(slug))
+
+    (async function loadSourcesTree() {
+        const slot = document.getElementById('sourcesTreeSlot');
+        try {
+            const resp = await fetch('/p/' + encodeURIComponent(%s) + '/sources/tree');
+            if (!resp.ok) throw new Error(resp.statusText);
+            const html = await resp.text();
+            slot.innerHTML = html;
+        } catch (e) {
+            slot.innerHTML = '<p class="sources-empty">Не удалось загрузить дерево источников. Попробуйте обновить страницу.</p>';
+        }
+        scheduleSourceStatus();
+    })();
+    """ % (json.dumps(slug), json.dumps(slug), json.dumps(slug), json.dumps(slug))
     return HTMLResponse(html_page("Источники", body, js))
+
+
+@app.get("/p/{slug}/sources/tree", response_class=HTMLResponse)
+def project_sources_tree(slug: str):
+    """Отдаёт HTML-фрагмент дерева источников (вызывается через AJAX)."""
+    scope, err = _writable_scope(slug)
+    if err:
+        return HTMLResponse(
+            '<p class="sources-empty">Проект недоступен</p>', status_code=403,
+        )
+    return HTMLResponse(_sources_tree_html(scope))
 
 
 @app.get("/p/{slug}/sources/status")
