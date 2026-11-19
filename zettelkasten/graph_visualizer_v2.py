@@ -36,16 +36,16 @@ from storage.neo4j.repository import ZettelRepository
 
 
 _BRANCH_PALETTE = [
-    {"bg": "#D4A055", "border": "#B8862E"},
-    {"bg": "#72B862", "border": "#529842"},
-    {"bg": "#C46888", "border": "#A44868"},
-    {"bg": "#9078C8", "border": "#7058A8"},
-    {"bg": "#C89848", "border": "#A87828"},
-    {"bg": "#68A898", "border": "#488878"},
-    {"bg": "#C87858", "border": "#A85838"},
-    {"bg": "#78A878", "border": "#588858"},
-    {"bg": "#D48068", "border": "#B46048"},
-    {"bg": "#88B848", "border": "#689828"},
+    {"bg": "#a78bfa", "border": "#7c3aed"},
+    {"bg": "#34d399", "border": "#059669"},
+    {"bg": "#f472b6", "border": "#db2777"},
+    {"bg": "#60a5fa", "border": "#2563eb"},
+    {"bg": "#fbbf24", "border": "#d97706"},
+    {"bg": "#2dd4bf", "border": "#0d9488"},
+    {"bg": "#fb923c", "border": "#ea580c"},
+    {"bg": "#a3e635", "border": "#65a30d"},
+    {"bg": "#f87171", "border": "#dc2626"},
+    {"bg": "#818cf8", "border": "#4f46e5"},
 ]
 
 _EXCEL_TYPES = frozenset({"excel_sheet", "excel_column", "excel_value", "excel_row"})
@@ -1385,7 +1385,7 @@ _GRAPH_JS_TEMPLATE = r"""
 'use strict';
 const DATA_URL = __DATA_URL__;
 const DATA_B64 = __DATA_B64__;
-const PAL = [["#D4A055","#B8862E"],["#72B862","#529842"],["#C46888","#A44868"],["#9078C8","#7058A8"],["#C89848","#A87828"],["#68A898","#488878"],["#C87858","#A85838"],["#78A878","#588858"],["#D48068","#B46048"],["#88B848","#689828"]];
+const PAL = [["#a78bfa","#7c3aed"],["#34d399","#059669"],["#f472b6","#db2777"],["#60a5fa","#2563eb"],["#fbbf24","#d97706"],["#2dd4bf","#0d9488"],["#fb923c","#ea580c"],["#a3e635","#65a30d"],["#f87171","#dc2626"],["#818cf8","#4f46e5"]];
 const $ = function (id) { return document.getElementById(id); };
 const wrap = $('graph-wrap'), canvas = $('graph'), ctx = canvas.getContext('2d', { alpha: false });
 const DOT = 12, MAX_DETAIL = 6500;
@@ -1410,6 +1410,7 @@ let hayLocal = null;
 const FULL = new Map();
 const infoCache = new Map();
 let raf = 0, flyId = 0;
+let _bgGrad = null, _bgW = 0, _bgH = 0;
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; });
@@ -1614,6 +1615,7 @@ function resize() {
   W = wrap.clientWidth; H = wrap.clientHeight;
   canvas.width = Math.floor(W * dpr); canvas.height = Math.floor(H * dpr);
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  _bgGrad = null;
   if (!fitted && N) fit();
   requestDraw();
 }
@@ -1623,26 +1625,36 @@ function drawNode(i, alpha, ring) {
   const x = sx(ix(i)), y = sy(iy(i));
   if (x < -30 || y < -30 || x > W + 30 || y > H + 30) return;
   const r = screenRadius(i);
-  ctx.globalAlpha = G[i] === 1 ? alpha * 0.68 : alpha;
+  const isTag = G[i] === 1;
+  ctx.globalAlpha = isTag ? alpha * 0.68 : alpha;
+  if (!LIGHT && r >= 4 && alpha > 0.3 && !isTag) {
+    ctx.globalAlpha = alpha * 0.15;
+    ctx.beginPath(); ctx.arc(x, y, r + 4, 0, 6.2832);
+    ctx.fillStyle = fillOf(i); ctx.fill();
+    ctx.globalAlpha = isTag ? alpha * 0.68 : alpha;
+  }
   ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832);
   ctx.fillStyle = fillOf(i); ctx.fill();
-  ctx.lineWidth = ring ? 2 : 1; ctx.strokeStyle = ring ? '#2563eb' : strokeOf(i); ctx.stroke();
+  ctx.lineWidth = ring ? 2.4 : (r > 10 ? 1.5 : 1);
+  ctx.strokeStyle = ring ? '#60a5fa' : strokeOf(i); ctx.stroke();
 }
 function drawLabel(i, alpha) {
   const text = L[i];
   if (!text) return false;
   const r = screenRadius(i);
-  const tx = sx(ix(i)), ty = sy(iy(i)) + r + 3;
+  const tx = sx(ix(i)), ty = sy(iy(i)) + r + 4;
   const tw = ctx.measureText(text).width;
-  const box = { x: tx - tw / 2 - 4, y: ty - 1, w: tw + 8, h: 16 };
+  const box = { x: tx - tw / 2 - 5, y: ty - 2, w: tw + 10, h: 18 };
   if (overlaps(labelBoxes, box)) return false;
   labelBoxes.push(box);
-  hitLabels.push({ i: i, x: box.x - 2, y: box.y - 2, w: box.w + 4, h: box.h + 4 });
+  hitLabels.push({ i: i, x: box.x - 3, y: box.y - 3, w: box.w + 6, h: box.h + 6 });
   ctx.globalAlpha = Math.max(alpha, 0.92);
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  ctx.fillStyle = LIGHT ? 'rgba(248,250,252,0.94)' : 'rgba(15,23,42,0.9)';
-  roundBox(box.x, box.y, box.w, box.h, 4); ctx.fill();
-  ctx.fillStyle = LIGHT ? '#0f172a' : '#f8fafc';
+  ctx.fillStyle = LIGHT ? 'rgba(248,250,252,0.96)' : 'rgba(15,23,42,0.88)';
+  roundBox(box.x, box.y, box.w, box.h, 5); ctx.fill();
+  ctx.lineWidth = 0.5; ctx.strokeStyle = LIGHT ? 'rgba(148,163,184,0.3)' : 'rgba(71,85,105,0.4)';
+  ctx.stroke();
+  ctx.fillStyle = LIGHT ? '#1e293b' : '#e2e8f0';
   ctx.fillText(text, tx, ty);
   return true;
 }
@@ -1671,10 +1683,11 @@ function drawRegions() {
       const g = REGIONS[k];
       if (g.lv !== lv || !regionVisible(g)) continue;
       const pal = PAL[g.c % PAL.length], sr = g.r * zoom, active = hoverRegion === k;
-      ctx.globalAlpha = active ? 0.14 : (lv === 0 ? 0.05 : 0.06);
+      ctx.globalAlpha = active ? 0.1 : (lv === 0 ? 0.03 : 0.04);
       ctx.beginPath(); ctx.arc(sx(g.x), sy(g.y), sr, 0, 6.2832); ctx.fillStyle = pal[0]; ctx.fill();
-      ctx.globalAlpha = active ? 0.75 : (lv === 0 ? 0.4 : 0.26);
-      ctx.lineWidth = lv === 0 ? 1.8 : 1.1; ctx.strokeStyle = pal[1]; ctx.stroke();
+      ctx.globalAlpha = active ? 0.6 : (lv === 0 ? 0.25 : 0.15);
+      ctx.lineWidth = lv === 0 ? 1.4 : 0.8; ctx.setLineDash(lv === 0 ? [8, 6] : [4, 4]);
+      ctx.strokeStyle = pal[1]; ctx.stroke(); ctx.setLineDash([]);
     }
   }
 }
@@ -1761,25 +1774,38 @@ function drawOverview(x0, y0, x1, y1) {
     const id = bx + by * cols;
     if (dotPick[id] < 0) dotPick[id] = i;
   }
-  const outline = LIGHT ? '#ffffff' : '#0b1220';
-  ctx.lineWidth = 1.3; ctx.strokeStyle = outline;
+  ctx.lineWidth = 1;
   for (let id = 0; id < dotPick.length; id++) {
     const i = dotPick[id];
     if (i < 0) continue;
-    ctx.globalAlpha = (hotOn && !hot[i] ? 0.28 : 0.92) * (G[i] === 1 ? 0.7 : 1);
-    ctx.beginPath(); ctx.arc(sx(X[i]), sy(Y[i]), overviewRadius(i), 0, 6.2832);
-    ctx.fillStyle = fillOf(i); ctx.fill(); ctx.stroke();
+    const or = overviewRadius(i), ox = sx(X[i]), oy = sy(Y[i]);
+    const a = (hotOn && !hot[i] ? 0.28 : 0.92) * (G[i] === 1 ? 0.7 : 1);
+    if (!LIGHT && a > 0.5 && G[i] !== 1) {
+      ctx.globalAlpha = a * 0.12;
+      ctx.beginPath(); ctx.arc(ox, oy, or + 3, 0, 6.2832);
+      ctx.fillStyle = fillOf(i); ctx.fill();
+    }
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.arc(ox, oy, or, 0, 6.2832);
+    ctx.fillStyle = fillOf(i); ctx.fill();
+    ctx.strokeStyle = strokeOf(i); ctx.stroke();
   }
   if (hotOn) {
     for (let k = 0; k < hotList.length && k < 6000; k++) {
       const i = hotList[k];
       if (!nodeVisible(i)) continue;
-      const x = sx(ix(i)), y = sy(iy(i));
-      if (x < -20 || y < -20 || x > W + 20 || y > H + 20) continue;
+      const hx = sx(ix(i)), hy = sy(iy(i));
+      if (hx < -20 || hy < -20 || hx > W + 20 || hy > H + 20) continue;
+      const hr = hot[i] === 2 ? 7 : 4.5;
+      if (!LIGHT) {
+        ctx.globalAlpha = hot[i] === 2 ? 0.3 : 0.15;
+        ctx.beginPath(); ctx.arc(hx, hy, hr + 5, 0, 6.2832);
+        ctx.fillStyle = hot[i] === 2 ? '#60a5fa' : fillOf(i); ctx.fill();
+      }
       ctx.globalAlpha = 1; ctx.beginPath();
-      ctx.arc(x, y, hot[i] === 2 ? 7 : 4.5, 0, 6.2832);
+      ctx.arc(hx, hy, hr, 0, 6.2832);
       ctx.fillStyle = fillOf(i); ctx.fill();
-      ctx.lineWidth = hot[i] === 2 ? 2.4 : 1.4; ctx.strokeStyle = hot[i] === 2 ? '#2563eb' : strokeOf(i); ctx.stroke();
+      ctx.lineWidth = hot[i] === 2 ? 2.4 : 1.4; ctx.strokeStyle = hot[i] === 2 ? '#60a5fa' : strokeOf(i); ctx.stroke();
     }
   }
   // подписи самых крупных карточек
@@ -1831,11 +1857,11 @@ function drawDetail(vis, x0, y0, x1, y1) {
         path.moveTo(ax, ay); path.lineTo(bx, by); drawn++;
       }
     }
-    ctx.lineWidth = 0.8; ctx.setLineDash([]);
-    ctx.globalAlpha = hotOn ? 0.14 : 0.3; ctx.strokeStyle = LIGHT ? '#64748b' : '#94a3b8'; ctx.stroke(pN);
-    ctx.globalAlpha = 0.22; ctx.strokeStyle = LIGHT ? '#94a3b8' : '#64748b'; ctx.setLineDash([6, 4]); ctx.stroke(pT);
-    ctx.globalAlpha = 0.5; ctx.strokeStyle = '#c026d3'; ctx.lineWidth = 1.2; ctx.stroke(pB);
-    ctx.globalAlpha = 0.9; ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.4; ctx.setLineDash([]); ctx.stroke(pF);
+    ctx.lineWidth = 0.9; ctx.setLineDash([]);
+    ctx.globalAlpha = hotOn ? 0.12 : (LIGHT ? 0.25 : 0.35); ctx.strokeStyle = LIGHT ? '#94a3b8' : '#475569'; ctx.stroke(pN);
+    ctx.globalAlpha = 0.18; ctx.strokeStyle = LIGHT ? '#94a3b8' : '#334155'; ctx.setLineDash([6, 4]); ctx.stroke(pT);
+    ctx.globalAlpha = 0.6; ctx.strokeStyle = '#c026d3'; ctx.lineWidth = 1.2; ctx.stroke(pB);
+    ctx.globalAlpha = 1; ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 1.6; ctx.setLineDash([]); ctx.stroke(pF);
   }
   for (let v = 0; v < vis.length; v++) {
     const i = vis[v];
@@ -1871,15 +1897,27 @@ function drawSelection() {
   if (selected < 0 || !nodeVisible(selected)) return;
   const x = sx(ix(selected)), y = sy(iy(selected));
   if (x < -20 || y < -20 || x > W + 20 || y > H + 20) return;
-  ctx.globalAlpha = 1; ctx.lineWidth = 2.4; ctx.strokeStyle = '#2563eb';
-  ctx.beginPath(); ctx.arc(x, y, Math.max(9, screenRadius(selected) + 4), 0, 6.2832); ctx.stroke();
+  const sr = Math.max(10, screenRadius(selected) + 5);
+  if (!LIGHT) {
+    ctx.globalAlpha = 0.2; ctx.beginPath(); ctx.arc(x, y, sr + 6, 0, 6.2832);
+    ctx.fillStyle = '#60a5fa'; ctx.fill();
+  }
+  ctx.globalAlpha = 1; ctx.lineWidth = 2.4; ctx.strokeStyle = '#60a5fa';
+  ctx.beginPath(); ctx.arc(x, y, sr, 0, 6.2832); ctx.stroke();
 }
 function draw() {
   LIGHT = document.body.classList.contains('light-theme');
   hitLabels = []; regionHits = []; labelBoxes = [];
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.globalAlpha = 1;
-  ctx.fillStyle = LIGHT ? '#f8fafc' : '#0b1220';
+  if (!_bgGrad || _bgW !== W || _bgH !== H) {
+    _bgW = W; _bgH = H;
+    const cx = W / 2, cy = H / 2, r = Math.max(W, H) * 0.7;
+    _bgGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    if (LIGHT) { _bgGrad.addColorStop(0, '#f1f5f9'); _bgGrad.addColorStop(1, '#e2e8f0'); }
+    else { _bgGrad.addColorStop(0, '#111827'); _bgGrad.addColorStop(1, '#030712'); }
+  }
+  ctx.fillStyle = _bgGrad;
   ctx.fillRect(0, 0, W, H);
   if (!N) {
     ctx.fillStyle = LIGHT ? '#6b7280' : '#94a3b8'; ctx.font = '16px Arial';
@@ -1978,14 +2016,14 @@ function hit(px, py) {
   let best = -1, bestD = 1e12;
   if (dotPick) {
     const bx = (px / DOT) | 0, by = (py / DOT) | 0;
-    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+    for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
       const cx = bx + ox, cy = by + oy;
       if (cx < 0 || cy < 0 || cx >= dotCols) continue;
       const id = cx + cy * dotCols;
       if (id < 0 || id >= dotPick.length) continue;
       const i = dotPick[id];
       if (i < 0) continue;
-      const dx = sx(X[i]) - px, dy = sy(Y[i]) - py, d2 = dx * dx + dy * dy, r = overviewRadius(i) + 4;
+      const dx = sx(X[i]) - px, dy = sy(Y[i]) - py, d2 = dx * dx + dy * dy, r = overviewRadius(i) + 8;
       if (d2 <= r * r && d2 < bestD) { best = i; bestD = d2; }
     }
     return best;
@@ -1993,7 +2031,7 @@ function hit(px, py) {
   for (let c = 0; c < lastVis.length; c++) {
     const i = lastVis[c];
     if (!nodeVisible(i)) continue;
-    const dx = sx(ix(i)) - px, dy = sy(iy(i)) - py, d2 = dx * dx + dy * dy, r = Math.max(screenRadius(i), 9) + 3;
+    const dx = sx(ix(i)) - px, dy = sy(iy(i)) - py, d2 = dx * dx + dy * dy, r = Math.max(screenRadius(i), 12) + 5;
     if (d2 <= r * r && d2 < bestD) { best = i; bestD = d2; }
   }
   return best;

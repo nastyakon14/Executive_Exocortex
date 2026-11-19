@@ -323,11 +323,16 @@ def page_plain_text(page_id: str) -> str:
 
 
 def get_child_pages(page_id: str, max_depth: int = 5, current_depth: int = 0, seen: set | None = None) -> list:
-    """Рекурсивно получает id всех дочерних страниц."""
+    """Рекурсивно получает дочерние страницы с датами последней правки.
+
+    Возвращает list[dict] с ключами ``page_id``, ``title``, ``version_when``.
+    ``expand="version"`` передаётся в API, чтобы дата правки приходила
+    вместе со списком потомков — без лишних HTTP-вызовов.
+    """
     if current_depth >= max_depth:
         return []
     seen = seen if seen is not None else set()
-    child_ids = []
+    children: list[dict] = []
     start = 0
     limit = 50
     try:
@@ -337,6 +342,7 @@ def get_child_pages(page_id: str, max_depth: int = 5, current_depth: int = 0, se
                 type="page",
                 start=start,
                 limit=limit,
+                expand="version",
             )
             batch = _as_page_list(raw)
             if not batch:
@@ -346,15 +352,20 @@ def get_child_pages(page_id: str, max_depth: int = 5, current_depth: int = 0, se
                 if not child_id or child_id in seen:
                     continue
                 seen.add(child_id)
-                child_ids.append(child_id)
-                child_ids.extend(get_child_pages(child_id, max_depth, current_depth + 1, seen))
+                version_when = ((child.get("version") or {}).get("when") or "").strip() or None
+                children.append({
+                    "page_id": child_id,
+                    "title": (child.get("title") or "").strip() or child_id,
+                    "version_when": version_when,
+                })
+                children.extend(get_child_pages(child_id, max_depth, current_depth + 1, seen))
             if len(batch) < limit:
                 break
             start += limit
-        return child_ids
+        return children
     except Exception as e:
         print(f"Ошибка при получении дочерних страниц для {page_id}: {e}")
-        return child_ids
+        return children
 
 
 def list_confluence_pages(url: str, extract_child: bool = False, max_depth: int = 5) -> tuple[list[dict], str | None]:
@@ -374,11 +385,13 @@ def list_confluence_pages(url: str, extract_child: bool = False, max_depth: int 
         "is_parent": True,
     }]
     if extract_child:
-        for child_id in get_child_pages(page_id, max_depth=max_depth, seen={page_id}):
+        for child in get_child_pages(page_id, max_depth=max_depth, seen={page_id}):
             pages.append({
-                "page_id": child_id,
-                "source_input": child_page_source(child_id, parent_source),
+                "page_id": child["page_id"],
+                "source_input": child_page_source(child["page_id"], parent_source),
                 "is_parent": False,
+                "title": child.get("title"),
+                "version_when": child.get("version_when"),
             })
     return pages, None
 
@@ -495,15 +508,15 @@ def get_confluence_page_content(
         
         # Если нужны дочерние страницы
         if extract_child:
-            child_ids = get_child_pages(page_id, max_depth=max_depth)
+            children = get_child_pages(page_id, max_depth=max_depth)
             
-            if child_ids:
+            if children:
                 result_parts.append(f"\n\n{'#'*80}")
-                result_parts.append(f"НАЙДЕНО ДОЧЕРНИХ СТРАНИЦ: {len(child_ids)}")
+                result_parts.append(f"НАЙДЕНО ДОЧЕРНИХ СТРАНИЦ: {len(children)}")
                 result_parts.append(f"{'#'*80}\n")
                 
-                for idx, child_id in enumerate(child_ids, 1):
-                    child_page = parse_confluence_page(child_id)
+                for idx, child in enumerate(children, 1):
+                    child_page = parse_confluence_page(child["page_id"])
                     
                     result_parts.append(f"\n{'='*80}")
                     result_parts.append(f"ДОЧЕРНЯЯ СТРАНИЦА #{idx}: {child_page['title']}")

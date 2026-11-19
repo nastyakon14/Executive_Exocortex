@@ -11,6 +11,19 @@ from app.handlers.confluence import (
 from auto_refresh.folder_checker import db_moment, format_stamp, log_date_check, parse_watch_state
 
 
+def _parse_version_when(raw: str | None) -> datetime | None:
+    """Парсит строку version.when из Confluence API в aware UTC datetime."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def _utc(remote: datetime) -> datetime:
     if remote.tzinfo is None:
         return remote.replace(tzinfo=timezone.utc)
@@ -90,15 +103,19 @@ def _check_child_pages(url: str, source: dict) -> dict:
             print(f"[auto_refresh] страница «{title}»: отменена при загрузке. пропуск.")
             continue
         watched += 1
-        try:
-            remote, fetched = get_page_version_info_by_id(page["page_id"])
-            remote = _utc(remote)
-            if fetched:
-                title = fetched
-                page["title"] = fetched
-        except Exception as e:
-            print(f"[auto_refresh] страница «{title}»: не удалось прочитать дату версии ({e}). пропуск.")
-            continue
+        # version_when уже получен при обходе дерева — без лишних HTTP-вызовов
+        remote = _parse_version_when(page.get("version_when"))
+        if remote is None:
+            # fallback: отдельный запрос (для корневой страницы или старого формата)
+            try:
+                remote, fetched = get_page_version_info_by_id(page["page_id"])
+                remote = _utc(remote)
+                if fetched:
+                    title = fetched
+                    page["title"] = fetched
+            except Exception as e:
+                print(f"[auto_refresh] страница «{title}»: не удалось прочитать дату версии ({e}). пропуск.")
+                continue
         need = db_at is None or remote > db_at
         log_date_check("страница", str(title), remote, db_at, need, db_label)
         if need:
