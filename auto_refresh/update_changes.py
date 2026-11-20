@@ -540,6 +540,7 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                 else 0.0
             )
         )
+        _CHECK_TIMEOUT = 120  # макс. секунд на проверку всех источников
         probes: dict[int, tuple[str, dict, dict]] = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
             jobs = {}
@@ -547,12 +548,22 @@ def refresh_project(slug: str, manage_status: bool = True) -> dict:
                 jobs[pool.submit(check_folder_changes, src)] = ("folder", src)
             for src in pages:
                 jobs[pool.submit(check_confluence_change, src)] = ("confluence", src)
-            for fut in as_completed(jobs):
-                kind, src = jobs[fut]
-                try:
-                    probes[src["id"]] = (kind, src, fut.result())
-                except Exception as e:
-                    probes[src["id"]] = (kind, src, {"error": str(e), "changed": False, "files": [], "stale": []})
+            try:
+                for fut in as_completed(jobs, timeout=_CHECK_TIMEOUT):
+                    kind, src = jobs[fut]
+                    try:
+                        probes[src["id"]] = (kind, src, fut.result())
+                    except Exception as e:
+                        probes[src["id"]] = (kind, src, {"error": str(e), "changed": False, "files": [], "stale": []})
+            except TimeoutError:
+                print(f"[auto_refresh] проверка источников превысила {_CHECK_TIMEOUT}с, пропускаем оставшиеся")
+            # Для не успевших — ставим ошибку таймаута
+            for fut, (kind, src) in jobs.items():
+                if src["id"] not in probes:
+                    probes[src["id"]] = (kind, src, {
+                        "error": f"Проверка не завершилась за {_CHECK_TIMEOUT} сек",
+                        "changed": False, "files": [], "stale": [],
+                    })
 
         _publish_refresh_plan(slug, probes, lone_files)
         if not _has_refresh_actions(probes, lone_files):
