@@ -1166,7 +1166,10 @@ class ZettelRepository:
         print(self.get_graph_text(user_id))
         print("═" * 70 + "\n")
 
-    _OVERVIEW_MAX_ROWS = 150_000
+    # Больше не ограничиваем обзорный граф: отдаём все карточки выбранных
+    # проектов. Память ограничена потоковым чтением из Neo4j и компактным
+    # бинарным форматом ответа, а не «обрезанием» набора узлов.
+    _OVERVIEW_MAX_ROWS: Optional[int] = None
 
     def export_overview_rows(
         self,
@@ -1178,8 +1181,7 @@ class ZettelRepository:
         if not user_ids:
             return []
         labels = labels or {}
-        rows = self.client.execute_read(
-            """
+        query = """
             MATCH (z:Zettel)
             WHERE z.user_id IN $user_ids
             OPTIONAL MATCH (z)-[:CHILD_OF]->(parent:Zettel)
@@ -1190,10 +1192,8 @@ class ZettelRepository:
                    z.thought_type AS thought_type,
                    left(coalesce(z.topic, ''), 32) AS topic,
                    parent.luhmann_id AS parent_luhmann
-            LIMIT $row_limit
-            """,
-            {"user_ids": user_ids, "row_limit": self._OVERVIEW_MAX_ROWS},
-        )
+            """
+        params = {"user_ids": user_ids}
         prefix_by_uid: Dict[str, str] = {}
         project_by_uid: Dict[str, str] = {}
         if prefix_luhmann:
@@ -1201,8 +1201,8 @@ class ZettelRepository:
                 label = re.sub(r"\s+", " ", labels.get(uid, uid)).strip() or uid
                 prefix_by_uid[uid] = label[:18]
                 project_by_uid[uid] = label[:80]
-        zettels = []
-        for row in rows:
+
+        def make_zettel(row: Dict[str, Any]) -> Dict[str, Any]:
             uid = row.get("user_id") or ""
             luhmann = row.get("luhmann_id") or ""
             parent_luhmann = row.get("parent_luhmann") or ""
@@ -1211,15 +1211,19 @@ class ZettelRepository:
                 luhmann = f"{short}/{luhmann}"
                 if parent_luhmann:
                     parent_luhmann = f"{short}/{parent_luhmann}"
-            zettels.append({
+            return {
                 "zettel_id": row["zettel_id"],
                 "luhmann_id": luhmann,
                 "parent_luhmann": parent_luhmann,
                 "thought_type": row.get("thought_type") or "",
                 "topic": row.get("topic") or "",
                 "project": project_by_uid.get(uid, "") if prefix_luhmann else "",
-            })
-        return zettels
+            }
+
+        read_mapped = getattr(self.client, "read_mapped", None)
+        if read_mapped:
+            return read_mapped(query, params, make_zettel)
+        return [make_zettel(row) for row in self.client.execute_read(query, params)]
 
     def read_card_detail(self, zettel_id: str) -> Optional[Dict[str, Any]]:
         """Одна карточка и её родитель с детьми — для правой панели."""

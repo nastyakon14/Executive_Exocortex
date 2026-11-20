@@ -40,7 +40,6 @@ class Neo4jClient:
             if password is not None
             else (settings.neo4j_password or os.getenv("NEO4J_PASSWORD", ""))
         )
-        print(self.password)
         self.database = (
             database
             or settings.neo4j_database
@@ -113,17 +112,36 @@ class Neo4jClient:
         parameters: Dict[str, Any] = None,
         write: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Выполняет Cypher-запрос и возвращает результат."""
+        """Выполняет Cypher-запрос и возвращает результат.
+
+        Dict-ы собираем прямо в транзакции: иначе для больших выборок в памяти
+        одновременно лежат и Record-объекты, и копии словарей.
+        """
+        def run(tx):
+            return [dict(record) for record in tx.run(query, parameters or {})]
+
         with self.session() as session:
             if write:
-                result = session.execute_write(
-                    lambda tx: list(tx.run(query, parameters or {}))
-                )
-            else:
-                result = session.execute_read(
-                    lambda tx: list(tx.run(query, parameters or {}))
-                )
-            return [dict(record) for record in result]
+                return session.execute_write(run)
+            return session.execute_read(run)
+
+    def read_mapped(
+        self,
+        query: str,
+        parameters: Dict[str, Any],
+        mapper,
+    ) -> List[Any]:
+        """Читает запрос и сразу преобразует каждую строку mapper-ом.
+
+        Промежуточные Record/dict не накапливаются: для обзорного графа это
+        заметно снижает пиковую память на сотнях тысяч карточек. В отличие от
+        ручного session.run, execute_read сохраняет ретраи транзиентных ошибок.
+        """
+        def run(tx):
+            return [mapper(dict(record)) for record in tx.run(query, parameters or {})]
+
+        with self.session() as session:
+            return session.execute_read(run)
 
     def execute_write(self, query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         return self.execute_query(query, parameters, write=True)

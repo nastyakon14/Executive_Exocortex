@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import gc
+import gzip
 import hashlib
 import json
 import os
@@ -82,8 +83,21 @@ app = FastAPI(title="BVA MindMap Web App")
 def _configure_thread_pool():
     """Увеличиваем пул потоков для def-обработчиков, чтобы тяжёлые запросы
     одного пользователя не блокировали остальных."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=40, thread_name_prefix="web"))
+    loop.set_exception_handler(_quiet_transport_errors)
+
+
+def _quiet_transport_errors(loop, context):
+    """Windows/Proactor шумит ConnectionResetError, когда браузер закрыл вкладку
+    или оборвал долгий запрос. Это не ошибка приложения — не засоряем консоль."""
+    exc = context.get("exception")
+    message = str(context.get("message") or "")
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return
+    if "_call_connection_lost" in message or "ConnectionResetError" in message:
+        return
+    loop.default_exception_handler(context)
 
 
 create_database()
@@ -1393,6 +1407,39 @@ def rag_search_payload(
         "sources": sources,
         "input_sources": collect_input_sources(used, labels),
     }
+
+
+def _llm_env_hint() -> str:
+    base = os.getenv("LLM_BASE_URL") or "(LLM_BASE_URL не задан)"
+    key = os.getenv("LLM_API_KEY") or ""
+    key_state = "ключ задан" if key else "LLM_API_KEY НЕ задан"
+    return f"{base}, {key_state}"
+
+
+def _rag_error_message(exc: Exception) -> str:
+    """Понятное сообщение вместо голого 500, когда RAG/LLM недоступен."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    text = " ".join(str(exc).split())[:400]
+    hint = _llm_env_hint()
+    if status in (401, 403):
+        return f"LLM отклонил ключ (HTTP {status}). Проверьте LLM_API_KEY и LLM_BASE_URL в .env. Сейчас: {hint}."
+    if status == 404:
+        return f"Модель не найдена на LLM-сервере (HTTP 404). Проверьте GRAPHRAG_MODEL_NAME. Сейчас: {hint}."
+    if status == 429:
+        return "LLM вернул лимит запросов (HTTP 429). Подождите минуту и повторите."
+    if status and status >= 500:
+        return f"LLM-сервер ответил ошибкой HTTP {status}. Повторите позже. Сейчас: {hint}."
+    low = text.lower()
+    if "timeout" in low or "timed out" in low:
+        return f"LLM не ответил за отведённое время. Увеличьте LLM_TIMEOUT в .env. Сейчас: {hint}."
+    if "connection" in low or "connect" in low:
+        return f"Нет связи с LLM. Проверьте интернет, прокси и LLM_BASE_URL. Сейчас: {hint}."
+    if "api key" in low or "authentication" in low or "unauthorized" in low:
+        return f"LLM отклонил ключ. Проверьте LLM_API_KEY в .env. Сейчас: {hint}."
+    return f"Ошибка RAG: {text or exc.__class__.__name__}. Сейчас: {hint}."
 
 
 def _release_mem() -> None:
@@ -5856,9 +5903,13 @@ async def contour_api_search(request: Request):
     graph_ids = [p["graph_id"] for p in selected]
     labels = {p["graph_id"]: (p.get("name") or p["slug"]) for p in selected}
     history = _chat_history(data)
-    payload = await asyncio.to_thread(
-        rag_search_payload, query, graph_ids, labels, "contour", history,
-    )
+    try:
+        payload = await asyncio.to_thread(
+            rag_search_payload, query, graph_ids, labels, "contour", history,
+        )
+    except Exception as e:
+        print(f"web_app rag error: {e}")
+        return JSONResponse({"error": _rag_error_message(e)}, status_code=502)
     return JSONResponse(payload)
 
 
@@ -6021,9 +6072,13 @@ async def api_search(slug: str, request: Request):
     labels = scope.get("project_labels") or {}
     history = _chat_history(data)
     if scope["readonly"]:
-        payload = await asyncio.to_thread(
-            rag_search_payload, query, scope["graph_ids"], labels, slug, history,
-        )
+        try:
+            payload = await asyncio.to_thread(
+                rag_search_payload, query, scope["graph_ids"], labels, slug, history,
+            )
+        except Exception as e:
+            print(f"web_app rag error: {e}")
+            return JSONResponse({"error": _rag_error_message(e)}, status_code=502)
         return JSONResponse(payload)
 
     graph_key = scope["graph_id"]
@@ -6042,7 +6097,11 @@ async def api_search(slug: str, request: Request):
             "input_sources": input_sources,
         }
 
-    result = await asyncio.to_thread(_do_search)
+    try:
+        result = await asyncio.to_thread(_do_search)
+    except Exception as e:
+        print(f"web_app rag error: {e}")
+        return JSONResponse({"error": _rag_error_message(e)}, status_code=502)
     return JSONResponse(result)
 
 
@@ -6096,12 +6155,14 @@ def view_page(slug: str, request: Request):
 _graph_cache: dict[tuple, tuple[bytes, dict]] = {}
 _graph_cache_lock = threading.Lock()
 _overview_ids: dict[tuple, list[str]] = {}
+_overview_pos: dict[tuple, dict[str, int]] = {}
 
 
 def _drop_graph_cache() -> None:
     with _graph_cache_lock:
         _graph_cache.clear()
         _overview_ids.clear()
+        _overview_pos.clear()
     folder = Path("data/graph_cache")
     if folder.exists():
         shutil.rmtree(folder, ignore_errors=True)
@@ -6130,6 +6191,20 @@ def _load_overview_ids(key: tuple) -> list[str]:
     return ids
 
 
+def _overview_positions(key: tuple, id_list: list[str]) -> dict[str, int]:
+    """Индекс zettel_id → позиция в графе. Строится один раз на снимок."""
+    with _graph_cache_lock:
+        cached = _overview_pos.get(key)
+    if cached is not None:
+        return cached
+    positions = {zid: i for i, zid in enumerate(id_list)}
+    with _graph_cache_lock:
+        if key not in _overview_pos and len(_overview_pos) >= 2:
+            _overview_pos.pop(next(iter(_overview_pos)))
+        _overview_pos[key] = positions
+    return positions
+
+
 def _card_title(topic: str, content: str) -> str:
     text = " ".join((topic or "").split())
     if text:
@@ -6143,6 +6218,22 @@ def _overview_headers(body: bytes) -> dict:
         "cache-control": "no-store",
         "x-graph-size": str(len(body)),
     }
+
+
+def _overview_response(body: bytes, accept_encoding: str = "") -> Response:
+    """Отдаёт бинарный граф, сжимая передачу при поддержке браузером.
+
+    x-graph-size остаётся размером распакованных данных: fetch распаковывает
+    gzip прозрачно, и прогресс загрузки на клиенте считается по этим байтам.
+    """
+    headers = _overview_headers(body)
+    if "gzip" in (accept_encoding or "").lower() and len(body) > 8_000:
+        level = 1 if len(body) > 1_500_000 else 4
+        packed = gzip.compress(body, compresslevel=level)
+        headers["content-encoding"] = "gzip"
+        headers["vary"] = "Accept-Encoding"
+        return Response(content=packed, headers=headers)
+    return Response(content=body, headers=headers)
 
 
 def _remember_graph(key: tuple, body: bytes, headers: dict) -> None:
@@ -6184,9 +6275,9 @@ def _build_graph_response(scope: dict, request: Request) -> Response:
         count = linker.repository.total_count(scope["graph_id"])
     stamp = str(scope.get("data_updated_at") or "")
 
-    # Для графов >= 4000 карточек — всегда overview binary (лёгкий, с LIMIT)
+    # Для графов >= 4000 карточек — компактный overview binary.
     if int(count) >= _OVERVIEW_THRESHOLD:
-        return _build_overview_response(scope, ids, int(count), stamp)
+        return _build_overview_response(scope, ids, int(count), stamp, encoding)
 
     # Для малых графов — полный JSON
     use_gzip = "gzip" in encoding.lower()
@@ -6208,15 +6299,15 @@ def _build_graph_response(scope: dict, request: Request) -> Response:
 
 
 def _build_overview_response(
-    scope: dict, ids: tuple, count: int, stamp: str,
+    scope: dict, ids: tuple, count: int, stamp: str, accept_encoding: str = "",
 ) -> Response:
-    """Строит обзорный бинарный граф с LIMIT из Neo4j. Кешируется на диск."""
-    key = (ids, count, stamp, "overview-click")
+    """Строит обзорный бинарный граф по всем карточкам выбранных проектов. Кешируется на диск."""
+    key = _overview_key(scope, ids, count)
     # 1. Кеш в памяти
     with _graph_cache_lock:
         cached = _graph_cache.get(key)
     if cached:
-        return Response(content=cached[0], headers=cached[1])
+        return _overview_response(cached[0], accept_encoding)
     # 2. Кеш на диске
     cache_file = _overview_cache_file(key)
     if cache_file.exists():
@@ -6224,7 +6315,7 @@ def _build_overview_response(
             body = cache_file.read_bytes()
             headers = _overview_headers(body)
             _remember_graph(key, body, headers)
-            return Response(content=body, headers=headers)
+            return _overview_response(body, accept_encoding)
         except Exception:
             pass
     # 3. Генерация
@@ -6247,10 +6338,6 @@ def _build_overview_response(
     if not rows:
         return JSONResponse({"error": "Граф пуст"}, status_code=200)
 
-    truncated = len(rows) >= getattr(linker.repository, '_OVERVIEW_MAX_ROWS', 150_000)
-    if truncated:
-        print(f"[graph] LIMIT сработал: показано {len(rows)}, всего {count}", flush=True)
-
     try:
         body = build_overview_binary(rows)
     except Exception as e:
@@ -6263,9 +6350,6 @@ def _build_overview_response(
         )
 
     headers = _overview_headers(body)
-    if truncated:
-        headers["x-graph-truncated"] = "1"
-        headers["x-graph-total"] = str(count)
 
     # Записать в кеш
     id_list = [str(row.get("zettel_id") or "") for row in rows]
@@ -6276,7 +6360,10 @@ def _build_overview_response(
         temporary.replace(cache_file)
         ids_file = _overview_ids_file(key)
         ids_tmp = ids_file.with_suffix(".tmp")
-        ids_tmp.write_text("\n".join(id_list), encoding="utf-8")
+        with ids_tmp.open("w", encoding="utf-8") as fh:
+            for zid in id_list:
+                fh.write(zid)
+                fh.write("\n")
         ids_tmp.replace(ids_file)
     except Exception as e:
         print(f"[graph] cache write warning: {e}", flush=True)
@@ -6286,15 +6373,18 @@ def _build_overview_response(
     _remember_graph(key, body, headers)
     elapsed = time.perf_counter() - started
     print(
-        f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}"
-        f"{' (LIMIT)' if truncated else ''}, {elapsed:.1f} с",
+        f"[graph] готово {len(body) / 1_000_000:.1f} МБ, узлов {len(rows)}, {elapsed:.1f} с",
         flush=True,
     )
-    return Response(content=body, headers=headers)
+    return _overview_response(body, accept_encoding)
+
+
+_OVERVIEW_CACHE_TAG = "overview-full-v2"
 
 
 def _overview_key(scope: dict, ids: tuple, count: int) -> tuple:
-    return (ids, int(count), str(scope.get("data_updated_at") or ""), "overview-click")
+    # Тег версии сбрасывает старые усечённые кеши после снятия LIMIT.
+    return (ids, int(count), str(scope.get("data_updated_at") or ""), _OVERVIEW_CACHE_TAG)
 
 
 @app.get("/p/{slug}/api/graph/node/{index}")
@@ -6310,13 +6400,14 @@ def api_graph_node(slug: str, index: int):
         ids = (scope["graph_id"],)
         count = linker.repository.total_count(scope["graph_id"])
         allowed = {scope["graph_id"]}
-    id_list = _load_overview_ids(_overview_key(scope, ids, count))
+    key = _overview_key(scope, ids, count)
+    id_list = _load_overview_ids(key)
     if index < 0 or index >= len(id_list):
         return JSONResponse({"error": "Карточка не найдена"}, status_code=404)
     row = linker.repository.read_card_detail(id_list[index])
     if not row or row.get("user_id") not in allowed:
         return JSONResponse({"error": "Карточка не найдена"}, status_code=404)
-    pos = {zid: i for i, zid in enumerate(id_list)}
+    pos = _overview_positions(key, id_list)
     children = row.get("children") or []
     neighbors = []
     parent_id = row.get("parent_id") or ""

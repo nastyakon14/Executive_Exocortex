@@ -797,6 +797,8 @@ def _append_excel_bridges(zs: list, ea: array.array, eb: array.array, ek: array.
 def _append_project_bridges(zs: list, entities: list, raw_edges: list, id_index: dict,
                             ea: array.array, eb: array.array, ek: array.array) -> None:
     """Проекты с общим тегом соединяются парой карточек (пунктир между островами)."""
+    if not entities and not any(z.get("tags") for z in zs):
+        return
     project_of: dict[str, str] = {}
     for z in zs:
         name = _norm_project(z.get("project"))
@@ -865,7 +867,9 @@ def _edge_limit(n: int) -> int:
         return 2_000_000
     if n < 150_000:
         return 500_000
-    return 900_000
+    # Бюджет растёт вместе с числом узлов: структурные рёбра (дерево, мосты,
+    # связи проектов) больше не могут быть обрезаны на больших графах.
+    return max(900_000, n + 250_000)
 
 
 def _thin_edges(ea, eb, ek, limit: int):
@@ -875,8 +879,10 @@ def _thin_edges(ea, eb, ek, limit: int):
         return ea, eb, ek
     keep = bytearray(total)
     used = 0
+    # 0 — CHILD_OF, 3 — мосты Excel, 4 — связи между проектами.
+    # Их нельзя терять: иначе часть узлов останется без структуры.
     for i in range(total):
-        if ek[i] in (0, 3, 4) and used < limit:
+        if ek[i] in (0, 3, 4):
             keep[i] = 1
             used += 1
     room = max(0, limit - used)
@@ -936,6 +942,9 @@ def _pack_graph(graph_data: Dict[str, Any], derive_tree_edges: bool = False) -> 
 
     if full_meta:
         lim_topic, lim_content, lim_quote, lim_preview = 180, 480, 360, 120
+    project_norm_cache: dict[Any, str] = {}
+    project_color_cache: dict[str, int] = {}
+    label_depth = 3 if label_mode == 1 else 1
     for i, z in enumerate(zs):
         lid = z["luhmann_id"]
         tt = z.get("thought_type") or ""
@@ -943,17 +952,24 @@ def _pack_graph(graph_data: Dict[str, Any], derive_tree_edges: bool = False) -> 
         content = z.get("content") or ""
         depth = depth_by.get(lid, 0)
         root = root_of(lid)
-        project = _norm_project(z.get("project"))
+        raw_project = z.get("project")
+        project = project_norm_cache.get(raw_project)
+        if project is None:
+            project = _norm_project(raw_project)
+            project_norm_cache[raw_project] = project
         group, radius, color = _excel_node_style(tt, lid, parent_by, color_index, root, depth)
         if project:
-            color = _palette_index(project)
-        if tt in _EXCEL_TYPES:
+            pc = project_color_cache.get(project)
+            if pc is None:
+                pc = _palette_index(project)
+                project_color_cache[project] = pc
+            color = pc
+        if tt in ("excel_sheet", "excel_column"):
             label = _excel_label(tt, topic, content)
+        elif not label_mode or depth <= label_depth:
+            label = _excel_label(tt, topic, content) if tt in _EXCEL_TYPES else _node_label(topic.strip() or content)
         else:
-            label = _node_label(topic.strip() or content)
-        if label_mode and tt not in ("excel_sheet", "excel_column"):
-            if depth > (3 if label_mode == 1 else 1):
-                label = ""
+            label = ""
         px, py = pos[i]
         xs.append(px)
         ys.append(py)

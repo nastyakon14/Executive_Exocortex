@@ -673,7 +673,7 @@ def _edge_limit(n: int) -> int:
         return 2_000_000
     if n < 150_000:
         return 500_000
-    return 900_000
+    return max(900_000, n + 250_000)
 
 
 def _thin_edges(ea, eb, ek, limit: int):
@@ -684,7 +684,7 @@ def _thin_edges(ea, eb, ek, limit: int):
     keep = bytearray(total)
     used = 0
     for i in range(total):
-        if ek[i] in (0, 3, 4) and used < limit:
+        if ek[i] in (0, 3, 4):
             keep[i] = 1
             used += 1
     room = max(0, limit - used)
