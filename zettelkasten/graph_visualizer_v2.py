@@ -1432,17 +1432,21 @@ _GRAPH_CSS = r"""
   #load-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: #f8fafc; }
   #load-caption { font-size: 13px; color: #cbd5e1; text-align: center; max-width: 320px; }
   #detail-panel { position: absolute; top: 64px; right: 16px; width: 360px; max-height: calc(100vh - 100px); background: rgba(15, 23, 42, 0.98); border: 1px solid #334155; border-radius: 12px; padding: 18px; overflow-y: auto; z-index: 10; display: none; }
-  #detail-nav { display: flex; align-items: center; gap: 6px; margin: -6px 0 8px; }
-  #detail-nav button { width: 32px; height: 28px; border: 1px solid #334155; background: rgba(255,255,255,.06); color: #e2e8f0; border-radius: 6px; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-  #detail-nav button:hover:not(:disabled) { background: rgba(96,165,250,.25); }
-  #detail-nav button:disabled { opacity: 0.3; cursor: default; }
+  #detail-nav { display: flex; align-items: center; gap: 6px; margin: -6px 0 10px; }
+  #detail-nav button { width: 34px; height: 30px; border: 1px solid #334155; background: rgba(255,255,255,.06); color: #e2e8f0; border-radius: 8px; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .12s, border-color .12s, color .12s, transform .08s; }
+  #detail-nav button:not(:disabled) { border-color: #3b82f6; color: #93c5fd; background: rgba(59,130,246,.16); }
+  #detail-nav button:hover:not(:disabled) { background: rgba(96,165,250,.32); border-color: #60a5fa; }
+  #detail-nav button:active:not(:disabled) { transform: scale(.94); }
+  #detail-nav button:disabled { opacity: 0.32; cursor: default; }
+  #nav-pos { font-size: 11px; color: #94a3b8; letter-spacing: .04em; min-width: 34px; text-align: center; }
   #detail-nav #detail-close { margin-left: auto; }
   #detail-panel h2 { color: #e2e8f0; margin: 0 0 8px 0; font-size: 16px; line-height: 1.3; word-break: break-word; }
   #detail-panel .field { margin: 8px 0; }
   #detail-panel .field-label { color: #94a3b8; font-size: 12px; margin-bottom: 2px; }
   #detail-panel .field-value { color: #e2e8f0; font-size: 13px; line-height: 1.5; word-break: break-word; white-space: pre-wrap; }
   #detail-panel a { color: #93c5fd; word-break: break-all; }
-  #detail-close { position: absolute; top: 10px; right: 14px; cursor: pointer; color: #94a3b8; font-size: 22px; line-height: 1; }
+  #detail-close { cursor: pointer; color: #94a3b8; font-size: 22px; line-height: 1; padding: 0 2px; }
+  #detail-close:hover { color: #e2e8f0; }
   #detail-panel .group-title { color: #94a3b8; font-size: 12px; margin: 12px 0 4px; }
   #detail-panel .neighbor-item { padding: 7px 10px; margin: 4px 0; background: rgba(255,255,255,0.05); border-radius: 6px; cursor: pointer; font-size: 13px; color: #e2e8f0; word-break: break-word; display: flex; gap: 6px; align-items: baseline; }
   #detail-panel .neighbor-item:hover { background: rgba(59,130,246,0.2); }
@@ -1488,7 +1492,9 @@ _GRAPH_CSS = r"""
   body.light-theme #legend { background: rgba(255,255,255,0.96); border: 1px solid #e5e7eb; }
   body.light-theme #legend h3 { color: #374151; }
   body.light-theme #detail-nav button { background: #f3f4f6; border-color: #d1d5db; color: #374151; }
+  body.light-theme #detail-nav button:not(:disabled) { background: #eff6ff; border-color: #3b82f6; color: #1d4ed8; }
   body.light-theme #detail-nav button:hover:not(:disabled) { background: #dbeafe; }
+  body.light-theme #nav-pos { color: #6b7280; }
   body.light-theme #detail-panel { background: #ffffff; border: 1px solid #e5e7eb; }
   body.light-theme #detail-panel h2, body.light-theme #detail-panel .field-value { color: #1f2937; }
   body.light-theme #detail-panel .field-label, body.light-theme #detail-panel .group-title, body.light-theme #graph-hint { color: #6b7280; }
@@ -1573,8 +1579,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <div id="detail-panel">
   <div id="detail-nav">
-    <button id="nav-back" title="Назад" disabled>&larr;</button>
-    <button id="nav-fwd" title="Вперёд" disabled>&rarr;</button>
+    <button id="nav-back" title="Назад (Alt+←)" disabled>&larr;</button>
+    <button id="nav-fwd" title="Вперёд (Alt+→)" disabled>&rarr;</button>
+    <span id="nav-pos"></span>
     <span id="detail-close">&times;</span>
   </div>
   <div id="detail-content"></div>
@@ -2366,7 +2373,19 @@ function renderPanel(idx, info, opts) {
   html += sourceHtml(info.source);
   if (info.quote) html += '<div class="field"><div class="field-label">Абзац в источнике</div><div class="field-value">' + esc(info.quote) + '</div></div>';
   if (info.content) html += '<hr/><div class="field-value">' + esc(info.content) + '</div>';
-  const items = (info.neighbors && info.neighbors.length) ? info.neighbors : localNeighborItems(idx);
+  const rawItems = (info.neighbors && info.neighbors.length) ? info.neighbors : localNeighborItems(idx);
+  const items = rawItems.map(function (it) {
+    const arrow = it.arrow || '';
+    let rel = it.rel || '';
+    if (!rel) {
+      if (arrow.indexOf('←') === 0) rel = 'parent';
+      else if (arrow.indexOf('→') === 0) rel = 'child';
+      else if (arrow.indexOf('#') === 0) rel = 'tag';
+      else if (arrow.indexOf('↔') === 0) rel = 'related';
+      else rel = 'related';
+    }
+    return { i: it.i, t: it.t || it.title || '', rel: rel, arrow: arrow };
+  });
   if (items.length) {
     const groups = {};
     items.forEach(function (it) { (groups[it.rel] = groups[it.rel] || []).push(it); });
@@ -2398,9 +2417,10 @@ function navPush(idx) {
   navUpdate();
 }
 function navUpdate() {
-  const b = $('nav-back'), f = $('nav-fwd');
+  const b = $('nav-back'), f = $('nav-fwd'), pos = $('nav-pos');
   if (b) b.disabled = navPos <= 0;
   if (f) f.disabled = navPos >= navHistory.length - 1;
+  if (pos) pos.textContent = navHistory.length > 1 ? (navPos + 1) + ' / ' + navHistory.length : '';
 }
 function navGo(dir) {
   const next = navPos + dir;
@@ -2715,6 +2735,8 @@ wrap.addEventListener('dblclick', function (e) {
 window.addEventListener('keydown', function (e) {
   if (e.key === '/' && document.activeElement !== searchInput) { e.preventDefault(); searchInput.focus(); searchInput.select(); }
   else if (e.key === 'Escape' && document.activeElement !== searchInput) { if (selected >= 0) closeDetail(); }
+  else if (e.altKey && e.key === 'ArrowLeft' && selected >= 0) { e.preventDefault(); navGo(-1); }
+  else if (e.altKey && e.key === 'ArrowRight' && selected >= 0) { e.preventDefault(); navGo(1); }
 });
 $('detail-close').addEventListener('click', closeDetail);
 $('nav-back').addEventListener('click', function() { navGo(-1); });
