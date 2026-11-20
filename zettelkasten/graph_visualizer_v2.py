@@ -2366,7 +2366,7 @@ function renderPanel(idx, info, opts) {
   html += sourceHtml(info.source);
   if (info.quote) html += '<div class="field"><div class="field-label">Абзац в источнике</div><div class="field-value">' + esc(info.quote) + '</div></div>';
   if (info.content) html += '<hr/><div class="field-value">' + esc(info.content) + '</div>';
-  const items = info.neighbors || localNeighborItems(idx);
+  const items = (info.neighbors && info.neighbors.length) ? info.neighbors : localNeighborItems(idx);
   if (items.length) {
     const groups = {};
     items.forEach(function (it) { (groups[it.rel] = groups[it.rel] || []).push(it); });

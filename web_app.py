@@ -1874,21 +1874,21 @@ body {
 .project-card .sources-open .menu-hint { max-width: 240px; }
 .src-board { margin-top: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 6px 8px 12px; }
 .src-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
-.src-card { display: flex; align-items: center; gap: 12px; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; transition: border-color .15s; }
+.src-card { display: flex; flex-direction: column; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; transition: border-color .15s; }
 .src-card:hover { border-color: var(--accent); }
+.src-card-head { display: flex; align-items: center; gap: 12px; width: 100%; }
 .src-card-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; }
 .src-card-icon { font-size: 20px; flex-shrink: 0; }
-.src-card-info { min-width: 0; }
-.src-card-title { font-size: 14px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+.src-card-info { flex: 1; min-width: 0; }
+.src-card-title { font-size: 14px; font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src-card-title a { color: var(--accent); text-decoration: none; }
 .src-card-title a:hover { text-decoration: underline; }
 .src-card-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.src-card-err { font-size: 11px; color: #ef4444; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+.src-card-err { font-size: 11px; color: #ef4444; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src-card-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.src-card-head { display: flex; align-items: center; gap: 12px; }
 .src-parent > .src-card-head .src-card-main { cursor: pointer; }
 .src-parent > .src-card-head .src-card-main:hover { opacity: 0.85; }
-.src-caret { font-size: 10px; color: var(--muted); transition: transform .15s; margin-right: 2px; display: inline-block; }
+.src-caret { font-size: 10px; color: var(--muted); transition: transform .15s; margin-right: 2px; display: inline-block; flex-shrink: 0; }
 .src-card.open > .src-card-head .src-caret { transform: rotate(90deg); }
 .src-children { padding: 4px 0 4px 38px; border-top: 1px solid var(--border); margin-top: 8px; }
 .src-child { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 8px; min-height: 30px; }
